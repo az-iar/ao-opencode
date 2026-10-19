@@ -306,24 +306,71 @@ export default Plugin.define({
     const dispatchMode = configuredDispatch === "off" || configuredDispatch === "false" ? "off" : configuredDispatch === "herdr" ? "herdr" : configuredDispatch === "session" ? "session" : process.env.HERDR_ENV === "1" ? "herdr" : "session"
     let credentials = loadCredentials(credentialsFile)
     let refreshing: Promise<Credentials> | undefined
+    const refreshLock = `${credentialsFile}.lock`
+    const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+    const acquireRefreshLock = async () => {
+      for (let i = 0; i < 150; i++) {
+        try {
+          writeFileSync(refreshLock, JSON.stringify({ pid: process.pid, created: Date.now() }) + "\n", { flag: "wx", mode: 0o600 })
+          return () => {
+            try {
+              unlinkSync(refreshLock)
+            } catch {}
+          }
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err
+          try {
+            if (Date.now() - statSync(refreshLock).mtimeMs > 30_000) unlinkSync(refreshLock)
+          } catch {}
+          await delay(100)
+        }
+      }
+      throw new Error("timed out waiting for the Office token refresh lock")
+    }
 
     // The bearer for every Office call: the API token from the environment, or
-    // the OAuth access token, refreshed shortly before it expires. Concurrent
-    // callers share one refresh, because the refresh token rotates.
+    // the OAuth access token. Re-read the shared file so worktree agents see a
+    // token another process refreshed, and refresh under a cross-process lock
+    // because the refresh token rotates.
     const bearer = async (): Promise<string | undefined> => {
       if (process.env.AGENT_OFFICE_TOKEN) return process.env.AGENT_OFFICE_TOKEN
+      credentials ??= loadCredentials(credentialsFile)
       if (!credentials) return undefined
+      const disk = loadCredentials(credentialsFile)
+      if (disk && disk.access_token !== credentials.access_token && disk.expires_at > Date.now()) credentials = disk
       if (credentials.expires_at - Date.now() < REFRESH_EARLY_MS) {
-        refreshing ??= tokenRequest(credentials.client_id, { grant_type: "refresh_token", refresh_token: credentials.refresh_token })
-          .then((next) => {
-            credentials = next
-            saveCredentials(credentialsFile, next)
-            return next
-          })
-          .finally(() => {
-            refreshing = undefined
-          })
-        credentials = await refreshing
+        refreshing ??= (async () => {
+          const release = await acquireRefreshLock()
+          try {
+            const latest = loadCredentials(credentialsFile)
+            if (latest && latest.expires_at - Date.now() >= REFRESH_EARLY_MS) {
+              credentials = latest
+              return latest
+            }
+            const base = latest ?? credentials!
+            try {
+              const next = await tokenRequest(base.client_id, { grant_type: "refresh_token", refresh_token: base.refresh_token })
+              credentials = next
+              saveCredentials(credentialsFile, next)
+              return next
+            } catch (err) {
+              // Another process may have rotated the token between our read and refresh.
+              const raced = loadCredentials(credentialsFile)
+              if (raced && raced.access_token !== base.access_token && raced.expires_at > Date.now()) {
+                credentials = raced
+                return raced
+              }
+              throw err
+            }
+          } finally {
+            release()
+          }
+        })()
+        try {
+          credentials = await refreshing
+        } finally {
+          refreshing = undefined
+        }
       }
       return credentials.access_token
     }
