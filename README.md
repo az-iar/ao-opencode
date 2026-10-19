@@ -4,15 +4,14 @@
 
 ## Install
 
-One file, no build step, no dependencies:
-
 ```sh
-mkdir -p ~/.config/opencode/plugins
-curl -fsSo ~/.config/opencode/plugins/ao-opencode.ts \
-  https://raw.githubusercontent.com/az-iar/ao-opencode/main/index.ts
+opencode plugin add github:az-iar/ao-opencode     # OpenCode 1.20+
+opencode plugin github:az-iar/ao-opencode -g      # OpenCode 1.19
 ```
 
-For one project only, put it in `.opencode/plugins/` instead.
+That adds `github:az-iar/ao-opencode` to the `plugin` list of your `opencode.json` and installs it. Drop `-g` to install for the current project only. Upgrading to a version installed before 2026-10-19 needs the stale copy cleared first: `rm -rf ~/.cache/opencode/npm/git-ao-opencode-*` (`~/.cache/opencode/packages/github:az-iar` on 1.19), then restart OpenCode.
+
+The plugin is also a single file: copy `index.ts` into `~/.config/opencode/plugins/` and it loads with no install.
 
 ## Connect
 
