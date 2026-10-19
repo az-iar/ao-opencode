@@ -296,6 +296,8 @@ export default Plugin.define({
       console.warn(`[agent-office] ${message}${extra ? ` ${JSON.stringify(extra)}` : ""}`)
     }
     const life = new AbortController()
+    const locationKey = createHash("sha256").update(ctx.location.directory).digest("hex").slice(0, 16)
+    const sessionStoreKey = `last-session:${locationKey}`
 
     const credentialsFile = credentialsPath(ctx.location.directory, ctx.location.project?.canonical)
     const dispatchDir = join(dirname(credentialsFile), "dispatch")
@@ -436,12 +438,12 @@ export default Plugin.define({
       if (found) rememberSession(found)
       return found
     }
-    void ctx.storage.get("last-session").then((id) => {
+    void ctx.storage.get(sessionStoreKey).then((id) => {
       if (typeof id === "string" && !lastSessionID) lastSessionID = id
     }).catch(() => {})
     const rememberSession = (sessionID: string) => {
       lastSessionID = sessionID
-      void ctx.storage.set("last-session", sessionID).catch(() => {})
+      void ctx.storage.set(sessionStoreKey, sessionID).catch(() => {})
     }
     const notify = (sessionID: string | undefined, text: string) => {
       if (!sessionID) return
@@ -623,11 +625,11 @@ export default Plugin.define({
       const freshAssigned = assigned.filter((item) => !seenAssigned.has(itemKey(item, "task")))
 
       if (!pollPrimed) {
-        for (const item of messages) seenMessages.add(itemKey(item, "message"))
         for (const item of tasks) seenTasks.add(itemKey(item, "task"))
         for (const item of assigned) seenAssigned.add(itemKey(item, "task"))
+        freshTasks.length = 0
+        freshAssigned.length = 0
         pollPrimed = true
-        return
       }
       if (!live || (freshMessages.length === 0 && freshTasks.length === 0 && freshAssigned.length === 0)) return
 
@@ -747,6 +749,8 @@ export default Plugin.define({
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: life.signal })) {
+          const directory = (event as any).location?.directory
+          if (directory && directory !== ctx.location.directory) continue
           void ensureConnected()
           switch (event.type) {
             case "session.status": {
@@ -768,7 +772,7 @@ export default Plugin.define({
             case "session.deleted":
               if (lastSessionID === event.data.sessionID) {
                 lastSessionID = undefined
-                void ctx.storage.remove("last-session").catch(() => {})
+                void ctx.storage.remove(sessionStoreKey).catch(() => {})
               }
               stop(event.data.sessionID)
               settleChild(event.data.sessionID)

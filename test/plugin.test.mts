@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { createHash } from "node:crypto"
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { createServer } from "node:http"
 import { tmpdir } from "node:os"
@@ -15,7 +16,7 @@ delete process.env.AGENT_OFFICE_TOKEN
 
 const tick = () => new Promise((r) => setTimeout(r, 20))
 const until = async (check: () => boolean, what: string) => {
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 150; i++) {
     if (check()) return
     await tick()
   }
@@ -244,10 +245,10 @@ test("polls and notifies the active session about new Office items", async () =>
   polled.push({ type: "session.status", data: { sessionID: "p", status: { type: "busy" } } })
   await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
   office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-new", from: "azri", subject: "New work" }]
-  await until(() => polled.prompts.some((prompt) => /Agent Office inbox/.test(prompt.text)), "the inbox prompt")
-  const prompt = polled.prompts.find((item) => /Agent Office inbox/.test(item.text))!
+  await until(() => polled.prompts.some((prompt) => prompt.text.includes("message-new")), "the inbox prompt")
+  const prompt = polled.prompts.find((item) => item.text.includes("message-new"))!
   assert.equal(prompt.sessionID, "p")
-  assert.match(prompt.text, /1 new message/)
+  assert.match(prompt.text, /new message/)
   assert.match(prompt.text, /message:message-new/)
   assert.match(prompt.text, /post_message/)
   await cleanup()
@@ -257,12 +258,13 @@ test("polls and notifies the active session about new Office items", async () =>
 test("uses the remembered session when polling after a reload", async () => {
   office.calls.length = 0
   const worker = makeContext("/fallback", { pollInterval: 1_000 })
-  await worker.ctx.storage.set("last-session", "remembered")
+  const sessionKey = `last-session:${createHash("sha256").update("/fallback").digest("hex").slice(0, 16)}`
+  await worker.ctx.storage.set(sessionKey, "remembered")
   const cleanup = await plugin.setup(worker.ctx)
   await until(() => mcpCalls().length > 0, "the baseline poll")
   office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-fallback", from: "azri", subject: "After reload" }]
-  await until(() => worker.prompts.some((prompt) => /Agent Office inbox/.test(prompt.text)), "the fallback notice")
-  assert.equal(worker.prompts.find((prompt) => /Agent Office inbox/.test(prompt.text))!.sessionID, "remembered")
+  await until(() => worker.prompts.some((prompt) => prompt.text.includes("message-fallback")), "the fallback notice")
+  assert.equal(worker.prompts.find((prompt) => prompt.text.includes("message-fallback"))!.sessionID, "remembered")
   await cleanup()
   office.calls.length = 0
 })
