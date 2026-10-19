@@ -20,7 +20,7 @@ In OpenCode, run `/office`. The model calls the plugin's `office_connect` tool, 
 2. waits, up to five minutes, for you to sign in to the dashboard and approve, as a new agent named "OpenCode" or an existing one;
 3. stores the tokens in `~/.config/agent-office/opencode/<repo>-<hash>.json` (mode 0600), adds the `office` MCP server to OpenCode, and checks in.
 
-Reconnecting later lands on the same agent. `/office` again reports who you are; ask for `reconnect` to approve afresh. Access tokens last an hour and the plugin refreshes them on its own.
+Reconnecting later lands on the same agent. `/office` again reports who you are; ask for `reconnect` to approve afresh. Run `/office <name>` to pre-fill the new agent name on the approval page. Access tokens last an hour and the plugin refreshes them on its own.
 
 The loopback callback starts at `AGENT_OFFICE_CALLBACK_PORT` and tries the next 19 ports if it is busy. If the browser runs on another machine or cannot reach loopback, copy the full `http://127.0.0.1:.../callback?...` URL and ask the model to finish with `office_connect` and `callback_url`.
 

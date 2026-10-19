@@ -790,11 +790,14 @@ export default Plugin.define({
         name: "office",
         description: "Connect to Agent Office",
         execute: async ({ sessionID, prompt, delivery }) => {
-          const request = "Connect this OpenCode to Agent Office with the office_connect tool and tell me what it returned."
+          const requested = prompt.text.trim()
+          const request = requested
+            ? `Connect this OpenCode to Agent Office with the office_connect tool using agent_name ${JSON.stringify(requested)} and tell me what it returned.`
+            : "Connect this OpenCode to Agent Office with the office_connect tool and tell me what it returned."
           await ctx.session.prompt({
             ...prompt,
             sessionID,
-            text: prompt.text.trim() ? `${request} ${prompt.text}` : request,
+            text: request,
             delivery,
           })
         },
@@ -805,17 +808,18 @@ export default Plugin.define({
       editor.add({
         name: "office_connect",
         description:
-          "Connect OpenCode to Agent Office. Opens the browser for the Office admin to approve, stores the tokens and adds the office MCP tools (checkin, tasks, messages, journal, decisions). Already connected: reports who you are. `reconnect` starts a fresh approval. Paste the full callback URL as `callback_url` to finish an approval manually.",
+          "Connect OpenCode to Agent Office. Opens the browser for the Office admin to approve, stores the tokens and adds the office MCP tools (checkin, tasks, messages, journal, decisions). Already connected: reports who you are. `reconnect` starts a fresh approval. `agent_name` pre-fills a new Office agent name. Paste the full callback URL as `callback_url` to finish an approval manually.",
         input: {
           type: "object",
           properties: {
             reconnect: { type: "boolean", description: "force a new OAuth approval" },
+            agent_name: { type: "string", description: "Office agent name to pre-fill when approving a new agent" },
             callback_url: { type: "string", description: "the full http://127.0.0.1:.../callback?... URL from the browser when it cannot reach the loopback listener" },
           },
           additionalProperties: false,
         },
         async execute(input, toolCtx) {
-          const { reconnect, callback_url } = input as { reconnect?: boolean; callback_url?: string }
+          const { reconnect, callback_url, agent_name } = input as { reconnect?: boolean; callback_url?: string; agent_name?: string }
           if (callback_url) {
             const before = loadCredentials(credentialsFile)?.access_token
             const result = completeCallback(callback_url)
@@ -828,8 +832,9 @@ export default Plugin.define({
             if (!next || next.access_token === before) return { content: `${result.message}, but no new credentials were saved. Run /office again.` }
             credentials = next
             connected = undefined
-          } else if (reconnect || !(await bearer())) {
-            credentials = await authorize((url) => void toolCtx.progress({ title: "Approve OpenCode in the browser", metadata: { url } }), clientName)
+          } else if (agent_name?.trim() || reconnect || !(await bearer())) {
+            const approvalName = agent_name?.trim() ? agent_name.trim().slice(0, 80) : clientName
+            credentials = await authorize((url) => void toolCtx.progress({ title: `Approve ${approvalName} in the browser`, metadata: { url } }), approvalName)
             saveCredentials(credentialsFile, credentials)
             connected = undefined
           }
