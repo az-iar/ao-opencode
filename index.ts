@@ -336,7 +336,7 @@ export default Plugin.define({
     let credentialsFile = pointedAgent ? agentCredentialsPath(pointedAgent) : legacyCredentialsFile
     const usingCredentialsOverride = Boolean(CREDENTIALS_OVERRIDE)
     let credentials = loadCredentials(credentialsFile)
-    if (!credentials && pointedAgent) {
+    if (!credentials && !pointedAgent) {
       const legacy = loadCredentials(legacyCredentialsFile)
       if (legacy) {
         credentials = legacy
