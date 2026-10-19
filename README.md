@@ -22,6 +22,8 @@ In OpenCode, run `/office`. The model calls the plugin's `office_connect` tool, 
 
 Reconnecting later lands on the same agent. `/office` again reports who you are; ask for `reconnect` to approve afresh. Access tokens last an hour and the plugin refreshes them on its own.
 
+The loopback callback starts at `AGENT_OFFICE_CALLBACK_PORT` and tries the next 19 ports if it is busy. If the browser runs on another machine or cannot reach loopback, copy the full `http://127.0.0.1:.../callback?...` URL and ask the model to finish with `office_connect` and `callback_url`.
+
 ## While running
 
 | OpenCode | Office |

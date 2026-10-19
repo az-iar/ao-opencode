@@ -160,6 +160,7 @@ test("registers the /office command and the office_connect tool", async () => {
   assert.match(harness.prompts.at(-1).text, /^Connect this OpenCode to Agent Office with the office_connect tool and tell me what it returned\. please$/)
   assert.equal(harness.tools[0].name, "office_connect")
   assert.equal(harness.tools[0].input.properties.reconnect.type, "boolean")
+  assert.equal(harness.tools[0].input.properties.callback_url.type, "string")
 })
 
 test("not connected: events report nothing and no MCP server is added", async () => {

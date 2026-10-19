@@ -28,8 +28,9 @@ import { basename, dirname, join } from "node:path"
 const OFFICE = (process.env.AGENT_OFFICE_URL ?? "https://office.byma.tech").replace(/\/+$/, "")
 const CREDENTIALS_OVERRIDE = process.env.AGENT_OFFICE_OPENCODE_CREDENTIALS
 const CREDENTIALS_DIR = join(homedir(), ".config", "agent-office", "opencode")
-const CALLBACK_PORT = Number(process.env.AGENT_OFFICE_CALLBACK_PORT ?? 41997)
-const CALLBACK = `http://127.0.0.1:${CALLBACK_PORT}/callback`
+const CALLBACK_BASE_PORT = Number(process.env.AGENT_OFFICE_CALLBACK_PORT ?? 41997)
+const CALLBACK_TRIES = 20
+const callbackUrl = (port: number) => `http://127.0.0.1:${port}/callback`
 const SCOPES = "office:read office:write office:events"
 const HEARTBEAT_MS = 90_000
 const REFRESH_EARLY_MS = 5 * 60_000
@@ -40,6 +41,36 @@ const MAX_DISPATCHES = 2
 const DISPATCH_STALE_MS = 6 * 60 * 60_000
 
 type Credentials = { office: string; client_id: string; access_token: string; refresh_token: string; expires_at: number }
+
+type PendingCallback = { resolve: (code: string) => void; reject: (err: Error) => void; close: () => void }
+
+// A pasted callback URL can finish an approval without the browser reaching
+// the loopback listener, which matters on remote machines and headless hosts.
+const pendingCallbacks = new Map<string, PendingCallback>()
+
+function completeCallback(raw: string): { handled: boolean; ok: boolean; message: string } {
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    return { handled: false, ok: false, message: "that is not a valid URL" }
+  }
+  const state = url.searchParams.get("state")
+  if (!state) return { handled: false, ok: false, message: "the URL has no state" }
+  const pending = pendingCallbacks.get(state)
+  if (!pending) return { handled: false, ok: false, message: "no pending approval matches this URL; run /office again" }
+
+  const code = url.searchParams.get("code")
+  const error = url.searchParams.get("error_description") ?? url.searchParams.get("error")
+  pendingCallbacks.delete(state)
+  pending.close()
+  if (error || !code) {
+    pending.reject(new Error(`Office authorization failed: ${error ?? "no code"}`))
+    return { handled: true, ok: false, message: `approval failed: ${error ?? "no code"}` }
+  }
+  pending.resolve(code)
+  return { handled: true, ok: true, message: "callback accepted; finishing the Office connection" }
+}
 
 // A stable key for the pending items the Office returns, so polling can tell
 // what is new without depending on one exact id field.
@@ -130,13 +161,13 @@ async function tokenRequest(client_id: string, form: Record<string, string>): Pr
   return { office: OFFICE, client_id, access_token: body.access_token, refresh_token: body.refresh_token, expires_at: Date.now() + body.expires_in * 1000 }
 }
 
-async function registerClient(): Promise<string> {
+async function registerClient(callback: string): Promise<string> {
   const res = await fetch(`${OFFICE}/oauth/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       client_name: "OpenCode",
-      redirect_uris: [CALLBACK],
+      redirect_uris: [callback],
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       token_endpoint_auth_method: "none",
@@ -156,55 +187,104 @@ function openBrowser(url: string) {
   } catch {}
 }
 
-// Waits on the loopback callback for the authorization code of this state.
-function awaitCode(state: string): Promise<string> {
+// Binds a loopback callback for this state, falling back to the next free port
+// when another OpenCode plugin instance already holds the preferred one.
+function listenForCode(state: string): Promise<{ port: number; code: Promise<string>; close: () => void }> {
   return new Promise((resolve, reject) => {
-    const server = createServer((req, res) => {
-      const url = new URL(req.url ?? "/", CALLBACK)
-      if (url.pathname !== "/callback" || url.searchParams.get("state") !== state) {
-        res.writeHead(404).end()
+    const attempt = (offset: number) => {
+      if (offset >= CALLBACK_TRIES) {
+        reject(new Error(`cannot listen on ports ${CALLBACK_BASE_PORT}-${CALLBACK_BASE_PORT + CALLBACK_TRIES - 1}`))
         return
       }
-      const code = url.searchParams.get("code")
-      const error = url.searchParams.get("error_description") ?? url.searchParams.get("error")
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" })
-      res.end(`<!doctype html><title>Agent Office</title><p>${code ? "OpenCode is connected to Agent Office. You can close this tab." : `Not connected: ${error}`}</p>`)
-      server.close()
-      clearTimeout(timer)
-      code ? resolve(code) : reject(new Error(`Office authorization failed: ${error}`))
-    })
-    const timer = setTimeout(() => {
-      server.close()
-      reject(new Error("timed out waiting for the approval in the browser"))
-    }, APPROVAL_TIMEOUT_MS)
-    server.on("error", (err) => {
-      clearTimeout(timer)
-      reject(new Error(`cannot listen on ${CALLBACK}: ${err.message}`))
-    })
-    server.listen(CALLBACK_PORT, "127.0.0.1")
+      const port = CALLBACK_BASE_PORT + offset
+      const callback = callbackUrl(port)
+      let resolveCode!: (code: string) => void
+      let rejectCode!: (err: Error) => void
+      const code = new Promise<string>((resolve, reject) => {
+        resolveCode = resolve
+        rejectCode = reject
+      })
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const server = createServer((req, res) => {
+        const result = completeCallback(`http://127.0.0.1:${port}${req.url ?? "/"}`)
+        if (!result.handled) {
+          res.writeHead(404).end()
+          return
+        }
+        res.writeHead(result.ok ? 200 : 400, { "Content-Type": "text/html; charset=utf-8" })
+        res.end(`<!doctype html><title>Agent Office</title><p>${result.ok ? "OpenCode is connected to Agent Office. You can close this tab." : `Not connected: ${result.message}`}</p>`)
+      })
+      server.once("error", (err: NodeJS.ErrnoException) => {
+        clearTimeout(timer)
+        if (!server.listening && err.code === "EADDRINUSE") {
+          attempt(offset + 1)
+          return
+        }
+        if (!settled) {
+          settled = true
+          pendingCallbacks.delete(state)
+          rejectCode(new Error(`cannot listen on ${callback}: ${err.message}`))
+        }
+      })
+      server.listen(port, "127.0.0.1", () => {
+        if (settled) return
+        timer = setTimeout(() => {
+          if (settled) return
+          settled = true
+          pendingCallbacks.delete(state)
+          server.close()
+          rejectCode(new Error("timed out waiting for the approval in the browser"))
+        }, APPROVAL_TIMEOUT_MS)
+        pendingCallbacks.set(state, {
+          resolve: resolveCode,
+          reject: rejectCode,
+          close: () => {
+            clearTimeout(timer)
+            server.close()
+          },
+        })
+        resolve({
+          port,
+          code,
+          close: () => {
+            pendingCallbacks.delete(state)
+            clearTimeout(timer)
+            server.close()
+          },
+        })
+      })
+    }
+    attempt(0)
   })
 }
 
 async function authorize(onUrl: (url: string) => void): Promise<Credentials> {
-  const client_id = await registerClient()
   const verifier = randomBytes(32).toString("base64url")
   const state = randomBytes(16).toString("base64url")
-  const url = new URL(`${OFFICE}/oauth/authorize`)
-  url.search = new URLSearchParams({
-    response_type: "code",
-    client_id,
-    redirect_uri: CALLBACK,
-    scope: SCOPES,
-    state,
-    code_challenge: createHash("sha256").update(verifier).digest("base64url"),
-    code_challenge_method: "S256",
-    resource: `${OFFICE}/mcp`,
-  }).toString()
-  const pending = awaitCode(state)
-  onUrl(url.href)
-  openBrowser(url.href)
-  const code = await pending
-  return tokenRequest(client_id, { grant_type: "authorization_code", code, redirect_uri: CALLBACK, code_verifier: verifier })
+  const listener = await listenForCode(state)
+  const callback = callbackUrl(listener.port)
+  try {
+    const client_id = await registerClient(callback)
+    const url = new URL(`${OFFICE}/oauth/authorize`)
+    url.search = new URLSearchParams({
+      response_type: "code",
+      client_id,
+      redirect_uri: callback,
+      scope: SCOPES,
+      state,
+      code_challenge: createHash("sha256").update(verifier).digest("base64url"),
+      code_challenge_method: "S256",
+      resource: `${OFFICE}/mcp`,
+    }).toString()
+    onUrl(url.href)
+    openBrowser(url.href)
+    const code = await listener.code
+    return tokenRequest(client_id, { grant_type: "authorization_code", code, redirect_uri: callback, code_verifier: verifier })
+  } catch (err) {
+    listener.close()
+    throw err
+  }
 }
 
 export default Plugin.define({
@@ -584,15 +664,30 @@ export default Plugin.define({
       editor.add({
         name: "office_connect",
         description:
-          "Connect OpenCode to Agent Office. Opens the browser for the Office admin to approve, stores the tokens and adds the office MCP tools (checkin, tasks, messages, journal, decisions). Already connected: reports who you are. `reconnect` starts a fresh approval.",
+          "Connect OpenCode to Agent Office. Opens the browser for the Office admin to approve, stores the tokens and adds the office MCP tools (checkin, tasks, messages, journal, decisions). Already connected: reports who you are. `reconnect` starts a fresh approval. Paste the full callback URL as `callback_url` to finish an approval manually.",
         input: {
           type: "object",
-          properties: { reconnect: { type: "boolean", description: "force a new OAuth approval" } },
+          properties: {
+            reconnect: { type: "boolean", description: "force a new OAuth approval" },
+            callback_url: { type: "string", description: "the full http://127.0.0.1:.../callback?... URL from the browser when it cannot reach the loopback listener" },
+          },
           additionalProperties: false,
         },
         async execute(input, toolCtx) {
-          const { reconnect } = input as { reconnect?: boolean }
-          if (reconnect || !(await bearer())) {
+          const { reconnect, callback_url } = input as { reconnect?: boolean; callback_url?: string }
+          if (callback_url) {
+            const before = loadCredentials(credentialsFile)?.access_token
+            const result = completeCallback(callback_url)
+            if (!result.handled || !result.ok) return { content: result.message }
+            let next = loadCredentials(credentialsFile)
+            for (let i = 0; i < 100 && (!next || next.access_token === before); i++) {
+              await new Promise((resolve) => setTimeout(resolve, 200))
+              next = loadCredentials(credentialsFile)
+            }
+            if (!next || next.access_token === before) return { content: `${result.message}, but no new credentials were saved. Run /office again.` }
+            credentials = next
+            connected = undefined
+          } else if (reconnect || !(await bearer())) {
             credentials = await authorize((url) => void toolCtx.progress({ title: "Approve OpenCode in the browser", metadata: { url } }))
             saveCredentials(credentialsFile, credentials)
             connected = undefined
