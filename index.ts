@@ -1,7 +1,8 @@
 // Agent Office plugin for OpenCode (https://opencode.ai/docs/plugins/).
 //
-//   /office            connects: OAuth in the browser, Azri approves, tokens are
-//                      stored, and the Office MCP tools appear in OpenCode.
+//   /office [name]     connects: OAuth in the browser, Azri approves, the token
+//                      is stored under the agent name, and the Office MCP tools
+//                      appear in OpenCode. The name pre-fills a new agent.
 //   while running      `working` while any session runs, a heartbeat every
 //                      90 s, `idle` once every session is quiet; `blocked` is
 //                      never overridden. New assigned tasks are dispatched to
@@ -9,12 +10,11 @@
 //
 //   AGENT_OFFICE_URL                   dashboard origin, default https://office.byma.tech
 //   AGENT_OFFICE_TOKEN                 an agent API token instead of OAuth (optional)
-//   AGENT_OFFICE_OPENCODE_CREDENTIALS  exact credentials file, overrides the per-repo default
-//   AGENT_OFFICE_TOKEN_SCOPE           repo (default), folder, or global
+//   AGENT_OFFICE_OPENCODE_CREDENTIALS  exact credentials file, overrides agent-scoped storage
 //   AGENT_OFFICE_CALLBACK_PORT         loopback port for the OAuth callback, default 41997
 //   AGENT_OFFICE_POLL_MS               inbox poll interval, default 60000
 //   AGENT_OFFICE_AUTODISPATCH          on (default), off, herdr, or session
-//   AGENT_OFFICE_CLIENT_NAME           OAuth client name; defaults to a per-repo name
+//   AGENT_OFFICE_CLIENT_NAME           OAuth client name; defaults to the folder name
 //
 // Tokens are never logged.
 
@@ -29,6 +29,8 @@ import { basename, dirname, join } from "node:path"
 const OFFICE = (process.env.AGENT_OFFICE_URL ?? "https://office.byma.tech").replace(/\/+$/, "")
 const CREDENTIALS_OVERRIDE = process.env.AGENT_OFFICE_OPENCODE_CREDENTIALS
 const CREDENTIALS_DIR = join(homedir(), ".config", "agent-office", "opencode")
+const AGENTS_DIR = join(CREDENTIALS_DIR, "agents")
+const POINTERS_DIR = join(CREDENTIALS_DIR, "workspaces")
 const CALLBACK_BASE_PORT = Number(process.env.AGENT_OFFICE_CALLBACK_PORT ?? 41997)
 const CALLBACK_TRIES = 20
 const callbackUrl = (port: number) => `http://127.0.0.1:${port}/callback`
@@ -143,6 +145,29 @@ function loadCredentials(path: string): Credentials | undefined {
   } catch {
     return undefined
   }
+}
+
+export function agentCredentialsPath(slug: string): string {
+  const safe = slug.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "agent"
+  return join(AGENTS_DIR, `${safe}.json`)
+}
+
+export function agentPointerPath(directory: string): string {
+  return join(POINTERS_DIR, `${createHash("sha256").update(directory).digest("hex").slice(0, 16)}.json`)
+}
+
+function loadAgentPointer(path: string): string | undefined {
+  try {
+    const value = JSON.parse(readFileSync(path, "utf8")) as { agent?: string }
+    return typeof value.agent === "string" ? value.agent : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function saveAgentPointer(path: string, slug: string) {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+  writeFileSync(path, JSON.stringify({ agent: slug }, null, 2) + "\n", { mode: 0o600 })
 }
 
 function saveCredentials(path: string, c: Credentials) {
@@ -299,32 +324,49 @@ export default Plugin.define({
     const life = new AbortController()
     const locationKey = createHash("sha256").update(ctx.location.directory).digest("hex").slice(0, 16)
     const sessionStoreKey = `last-session:${locationKey}`
-    const tokenScope = process.env.AGENT_OFFICE_TOKEN_SCOPE ?? "repo"
-    const credentialKey = tokenScope === "folder" ? ctx.location.directory : tokenScope === "global" ? "global" : (ctx.location.project?.canonical ?? ctx.location.directory)
-    const clientName = process.env.AGENT_OFFICE_CLIENT_NAME ?? (tokenScope === "global" ? "OpenCode" : `OpenCode (${basename(credentialKey)} ${createHash("sha256").update(credentialKey).digest("hex").slice(0, 6)})`)
+    const clientName = process.env.AGENT_OFFICE_CLIENT_NAME ?? (basename(ctx.location.directory) || "OpenCode")
 
-    const credentialsFile = credentialsPath(ctx.location.directory, ctx.location.project?.canonical)
-    const dispatchDir = join(dirname(credentialsFile), "dispatch")
-    const noticeDir = join(dirname(credentialsFile), "notices")
+    const legacyCredentialsFile = credentialsPath(ctx.location.directory, ctx.location.project?.canonical)
+    const pointerFile = agentPointerPath(ctx.location.directory)
+    const pointedAgent = CREDENTIALS_OVERRIDE ? undefined : loadAgentPointer(pointerFile)
+    let credentialsFile = pointedAgent ? agentCredentialsPath(pointedAgent) : legacyCredentialsFile
+    const usingCredentialsOverride = Boolean(CREDENTIALS_OVERRIDE)
+    let credentials = loadCredentials(credentialsFile)
+    if (!credentials && pointedAgent) {
+      const legacy = loadCredentials(legacyCredentialsFile)
+      if (legacy) {
+        credentials = legacy
+        credentialsFile = legacyCredentialsFile
+      }
+    }
+    const adoptAgent = (slug?: string) => {
+      if (usingCredentialsOverride || !slug) return
+      const target = agentCredentialsPath(slug)
+      if (credentials) saveCredentials(target, credentials)
+      credentialsFile = target
+      saveAgentPointer(pointerFile, slug)
+    }
+    let refreshing: Promise<Credentials> | undefined
+    const refreshLockPath = () => `${credentialsFile}.lock`
+    const dispatchDir = join(dirname(legacyCredentialsFile), "dispatch", locationKey)
+    const noticeDir = join(dirname(legacyCredentialsFile), "notices", locationKey)
     const configuredDispatch = String(ctx.options.autoDispatch ?? process.env.AGENT_OFFICE_AUTODISPATCH ?? "on").toLowerCase()
     const dispatchMode = configuredDispatch === "off" || configuredDispatch === "false" ? "off" : configuredDispatch === "herdr" ? "herdr" : configuredDispatch === "session" ? "session" : process.env.HERDR_ENV === "1" ? "herdr" : "session"
-    let credentials = loadCredentials(credentialsFile)
-    let refreshing: Promise<Credentials> | undefined
-    const refreshLock = `${credentialsFile}.lock`
     const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
     const acquireRefreshLock = async () => {
+      const lock = refreshLockPath()
       for (let i = 0; i < 150; i++) {
         try {
-          writeFileSync(refreshLock, JSON.stringify({ pid: process.pid, created: Date.now() }) + "\n", { flag: "wx", mode: 0o600 })
+          writeFileSync(lock, JSON.stringify({ pid: process.pid, created: Date.now() }) + "\n", { flag: "wx", mode: 0o600 })
           return () => {
             try {
-              unlinkSync(refreshLock)
+              unlinkSync(lock)
             } catch {}
           }
         } catch (err) {
           if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err
           try {
-            if (Date.now() - statSync(refreshLock).mtimeMs > 30_000) unlinkSync(refreshLock)
+            if (Date.now() - statSync(lock).mtimeMs > 30_000) unlinkSync(lock)
           } catch {}
           await delay(100)
         }
@@ -769,6 +811,7 @@ export default Plugin.define({
       try {
         if (!(await bearer())) return
         const me = await checkin()
+        adoptAgent(me.agent?.slug)
         lastPollAt = Date.now()
         lastPollError = undefined
         await observePending(me.pending, true)
@@ -840,6 +883,7 @@ export default Plugin.define({
           }
           await ensureConnected()
           const me = await checkin()
+          adoptAgent(me.agent?.slug)
           await observePending(me.pending, false)
           const pending = me.pending ?? {}
           return {
@@ -858,7 +902,8 @@ export default Plugin.define({
                 location: ctx.location.directory,
                 canonical: ctx.location.project?.canonical,
                 credentialsFile,
-                tokenScope,
+                tokenStorage: usingCredentialsOverride ? "override" : "agent",
+                agentPointer: pointerFile,
                 clientName,
                 plugin: ctx.app.version,
                 mode: dispatchMode,

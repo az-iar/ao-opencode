@@ -126,6 +126,8 @@ function makeContext(directory = "/home/x/agent-office", options: Record<string,
 
 let plugin: any
 let credentialsPath: (directory: string, canonical?: string, override?: string, scope?: string) => string
+let agentCredentialsPath: (slug: string) => string
+let agentPointerPath: (directory: string) => string
 let harness: ReturnType<typeof makeContext>
 let cleanupFirst: (() => Promise<void>) | undefined
 const warnings: string[] = []
@@ -134,9 +136,11 @@ const originalWarn = console.warn
 before(async () => {
   process.env.AGENT_OFFICE_URL = (await office.listen()) + "/"
   console.warn = (...args: unknown[]) => void warnings.push(args.join(" "))
-  const { default: definition, credentialsPath: deriveCredentials } = await import("../index.ts")
+  const { default: definition, credentialsPath: deriveCredentials, agentCredentialsPath: deriveAgentCredentials, agentPointerPath: deriveAgentPointer } = await import("../index.ts")
   plugin = definition
   credentialsPath = deriveCredentials
+  agentCredentialsPath = deriveAgentCredentials
+  agentPointerPath = deriveAgentPointer
   harness = makeContext()
   cleanupFirst = await plugin.setup(harness.ctx)
 })
@@ -148,6 +152,13 @@ after(async () => {
 
 test("defines the agent-office plugin", () => {
   assert.equal(plugin.id, "agent-office")
+})
+
+test("tokens are stored per agent", () => {
+  assert.match(agentCredentialsPath("ao-oc"), /\/agent-office\/opencode\/agents\/ao-oc\.json$/)
+  assert.equal(agentCredentialsPath("a/b"), agentCredentialsPath("a-b"))
+  assert.equal(agentPointerPath("/work/repo"), agentPointerPath("/work/repo"))
+  assert.notEqual(agentPointerPath("/work/repo"), agentPointerPath("/work/other"))
 })
 
 test("credentials are scoped per repo, not per folder", () => {
@@ -200,7 +211,7 @@ test("/office: OAuth with PKCE, stored tokens, MCP server added", async () => {
   const register = office.calls.find((c) => c.path === "/oauth/register")!
   const token = office.calls.find((c) => c.path === "/oauth/token")!
   assert.deepEqual(register.body.redirect_uris, ["http://127.0.0.1:45124/callback"])
-  assert.match(register.body.client_name, /^OpenCode \(agent-office /)
+  assert.match(register.body.client_name, /^agent-office$/)
   assert.equal(token.body.grant_type, "authorization_code")
   assert.equal(token.body.code, "code-1")
   assert.equal(token.body.client_id, "client-1")

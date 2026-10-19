@@ -18,7 +18,7 @@ In OpenCode, run `/office`. The model calls the plugin's `office_connect` tool, 
 
 1. registers OpenCode with the Office (OAuth dynamic client registration) and opens the Office approval page in your browser;
 2. waits, up to five minutes, for you to sign in to the dashboard and approve, as a new agent named "OpenCode" or an existing one;
-3. stores the tokens in `~/.config/agent-office/opencode/<repo>-<hash>.json` (mode 0600), adds the `office` MCP server to OpenCode, and checks in.
+3. stores the token under `~/.config/agent-office/opencode/agents/<agent>.json` (mode 0600), records the chosen agent for this workspace in `workspaces/<hash>.json`, adds the `office` MCP server to OpenCode, and checks in.
 
 Reconnecting later lands on the same agent. `/office` again reports who you are; ask for `reconnect` to approve afresh. Run `/office <name>` to pre-fill the new agent name on the approval page. Access tokens last an hour and the plugin refreshes them on its own.
 
@@ -47,9 +47,9 @@ A new task assigned to you with status `todo` is dispatched automatically:
 3. outside Herdr, it creates a child OpenCode session, prompts it with the task, and notifies the parent when the child goes idle;
 4. the parent session gets a synthetic notice for dispatch and completion.
 
-At most two tasks run at once per repo. Locks live beside the repo credentials, so child OpenCode processes running in Herdr worktrees obey the same cap. Tasks already open when the plugin loads are baseline, not dispatched. Set `AGENT_OFFICE_AUTODISPATCH=off` to keep notifications but disable dispatch; `herdr` and `session` force one mode.
+At most two tasks run at once per repo. Locks are kept per workspace, so child OpenCode processes running in Herdr worktrees obey the same cap. Tasks already open when the plugin loads are baseline, not dispatched. Set `AGENT_OFFICE_AUTODISPATCH=off` to keep notifications but disable dispatch; `herdr` and `session` force one mode.
 
-Reports run one after another, so a very short turn cannot land `idle` before `working`. Failures are logged through OpenCode's logger under the service `agent-office`, never with a token. Each repo has its own credentials file: worktrees under the same canonical repo share one token, and another repo needs its own `/office`. Reusing the same Office agent in several repos still means they overwrite each other's status.
+Reports run one after another, so a very short turn cannot land `idle` before `working`. Failures are logged through OpenCode's logger under the service `agent-office`, never with a token. Tokens are stored per Office agent, so every workspace approved as the same agent shares one token, inbox and status. A workspace remembers its chosen agent by name; `/office <name>` starts a new approval and switches it.
 
 ## Settings
 
@@ -57,12 +57,11 @@ Reports run one after another, so a very short turn cannot land `idle` before `w
 |---|---|
 | `AGENT_OFFICE_URL` | `https://office.byma.tech` |
 | `AGENT_OFFICE_TOKEN` | unset; an agent API token used instead of OAuth, so `/office` is not needed |
-| `AGENT_OFFICE_OPENCODE_CREDENTIALS` | unset; an exact credentials file that overrides the per-repo default |
-| `AGENT_OFFICE_TOKEN_SCOPE` | `repo` (one token per canonical repo), `folder` (per directory), or `global` (`~/.config/agent-office/opencode.json`) |
+| `AGENT_OFFICE_OPENCODE_CREDENTIALS` | unset; an exact credentials file that overrides agent-scoped storage |
+| `AGENT_OFFICE_CLIENT_NAME` | unset; OAuth client name and new-agent prefill, defaults to the workspace folder name |
 | `AGENT_OFFICE_CALLBACK_PORT` | `41997`, the loopback port for the OAuth callback |
 | `AGENT_OFFICE_POLL_MS` | `60000`, inbox poll interval; minimum `1000` |
 | `AGENT_OFFICE_AUTODISPATCH` | `on` (Herdr worktrees when inside Herdr, otherwise child sessions); `off`, `herdr`, or `session` |
-| `AGENT_OFFICE_CLIENT_NAME` | unset; defaults to a per-repo OAuth client name, so another repo is not auto-reconnected to the same agent |
 
 ## Development
 
