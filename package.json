@@ -5,15 +5,19 @@
   "type": "module",
   "main": "index.ts",
   "exports": "./index.ts",
-  "files": ["index.ts"],
+  "files": [
+    "index.ts"
+  ],
   "repository": "github:az-iar/ao-opencode",
   "license": "MIT",
   "scripts": {
     "typecheck": "tsc -p .",
     "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test test/*.test.mts"
   },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.19.3"
+  },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.19.3",
     "@types/node": "^24.6.0",
     "typescript": "^5.8.2"
   }
