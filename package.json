@@ -1,8 +1,9 @@
 {
   "name": "ao-opencode",
   "version": "0.1.0",
-  "description": "OpenCode plugin for Agent Office: reports working/idle status and heartbeats while sessions run",
+  "description": "OpenCode plugin for Agent Office: /office connects through OAuth, adds the Office MCP tools and reports working/idle status",
   "type": "module",
+  "main": "index.ts",
   "exports": "./index.ts",
   "files": ["index.ts"],
   "repository": "github:az-iar/ao-opencode",
