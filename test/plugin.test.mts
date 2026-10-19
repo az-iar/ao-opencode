@@ -244,10 +244,12 @@ test("polls and notifies the active session about new Office items", async () =>
   polled.push({ type: "session.status", data: { sessionID: "p", status: { type: "busy" } } })
   await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
   office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-new", from: "azri", subject: "New work" }]
-  await until(() => polled.synthetics.length > 0, "the poll notification")
-  assert.equal(polled.synthetics[0].sessionID, "p")
-  assert.match(polled.synthetics[0].text, /1 new unread message/)
-  assert.match(polled.synthetics[0].text, /message:message-new/)
+  await until(() => polled.prompts.some((prompt) => /Agent Office inbox/.test(prompt.text)), "the inbox prompt")
+  const prompt = polled.prompts.find((item) => /Agent Office inbox/.test(item.text))!
+  assert.equal(prompt.sessionID, "p")
+  assert.match(prompt.text, /1 new message/)
+  assert.match(prompt.text, /message:message-new/)
+  assert.match(prompt.text, /post_message/)
   await cleanup()
   office.calls.length = 0
 })
@@ -259,9 +261,8 @@ test("uses the remembered session when polling after a reload", async () => {
   const cleanup = await plugin.setup(worker.ctx)
   await until(() => mcpCalls().length > 0, "the baseline poll")
   office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-fallback", from: "azri", subject: "After reload" }]
-  await until(() => worker.synthetics.length > 0, "the fallback notice")
-  assert.equal(worker.synthetics[0].sessionID, "remembered")
-  assert.equal(worker.synthetics[0].description, "Agent Office")
+  await until(() => worker.prompts.some((prompt) => /Agent Office inbox/.test(prompt.text)), "the fallback notice")
+  assert.equal(worker.prompts.find((prompt) => /Agent Office inbox/.test(prompt.text))!.sessionID, "remembered")
   await cleanup()
   office.calls.length = 0
 })

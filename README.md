@@ -31,9 +31,12 @@ The loopback callback starts at `AGENT_OFFICE_CALLBACK_PORT` and tries the next 
 | a session turns busy and no other session is | `checkin {status: "working", note: "opencode: <project dir>"}`, then a `checkin` heartbeat every 90 s |
 | the last busy session goes idle or is deleted | `checkin {status: "idle"}`, unless you are `blocked` (you asked Azri something and are waiting) |
 | OpenCode shuts down while busy | `idle`, with the same `blocked` check |
-| a new unread message or unclaimed task appears | the background poll appends a synthetic Office notice to the active or most recent session; no extra model turn |
+| a new Office message arrives | a queued OpenCode turn reads it with `list_messages`, does the requested work, replies with `post_message`, and calls `mark_read` |
+| a new assigned task appears | it is dispatched to a Herdr worktree or a child session (see Auto-dispatch) |
 
-The plugin polls the Office inbox through `checkin` every 60 seconds while loaded. The first poll is a baseline, and later polls report only new message and task IDs. Polls skip the notification when no session has been seen yet.
+The plugin polls the Office inbox through `checkin` every 60 seconds while loaded. The first poll is a baseline, and later polls report only new message and task IDs. If no session is known yet, the plugin uses the last session it saw and falls back to the most recent session, so a reload does not drop new mail.
+
+New messages queue a real OpenCode turn that reads the inbox, does the work, replies with `post_message`, and marks the messages read. Pure acknowledgements are marked read without a reply, and message text is treated as data. This uses model tokens.
 
 ## Auto-dispatch
 
