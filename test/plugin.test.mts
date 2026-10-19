@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { createServer } from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { after, before, test } from "node:test"
@@ -172,6 +173,9 @@ test("not connected: events report nothing and no MCP server is added", async ()
 })
 
 test("/office: OAuth with PKCE, stored tokens, MCP server added", async () => {
+  // Another plugin instance already holds the preferred callback port.
+  const blocker = createServer((_req, res) => res.writeHead(204).end())
+  await new Promise<void>((resolve) => blocker.listen(45123, "127.0.0.1", resolve))
   let authorizeUrl = ""
   const result = harness.tools[0].execute({}, { progress: async (m: any) => (authorizeUrl = m.metadata.url) })
   await until(() => authorizeUrl !== "", "the authorization URL")
@@ -181,11 +185,12 @@ test("/office: OAuth with PKCE, stored tokens, MCP server added", async () => {
   const landing = await fetch(back.headers.get("location")!)
   assert.match(await landing.text(), /connected/)
   const response = await result
+  await new Promise<void>((resolve) => blocker.close(() => resolve()))
   assert.match(response.content, /^Connected to Agent Office as @opencode \(OpenCode\)\. Open tasks: 1, unclaimed team tasks: 0, unread messages: 2\./)
 
   const register = office.calls.find((c) => c.path === "/oauth/register")!
   const token = office.calls.find((c) => c.path === "/oauth/token")!
-  assert.deepEqual(register.body.redirect_uris, ["http://127.0.0.1:45123/callback"])
+  assert.deepEqual(register.body.redirect_uris, ["http://127.0.0.1:45124/callback"])
   assert.equal(token.body.grant_type, "authorization_code")
   assert.equal(token.body.code, "code-1")
   assert.equal(token.body.client_id, "client-1")
