@@ -33,6 +33,17 @@ Reconnecting later lands on the same agent. `/office` again reports who you are;
 
 The plugin polls the Office inbox through `checkin` every 60 seconds while loaded. The first poll is a baseline, and later polls report only new message and task IDs. Polls skip the notification when no session has been seen yet.
 
+## Auto-dispatch
+
+A new task assigned to you with status `todo` is dispatched automatically:
+
+1. the plugin acknowledges and accepts it if needed, then sets it `in_progress` with a comment;
+2. inside Herdr (`HERDR_ENV=1`), it creates a worktree on branch `office/<task>`, starts an `opencode` agent in the new workspace, prompts it with the task, and monitors until idle, blocked or done;
+3. outside Herdr, it creates a child OpenCode session, prompts it with the task, and notifies the parent when the child goes idle;
+4. the parent session gets a synthetic notice for dispatch and completion.
+
+At most two tasks run at once per repo. Locks live beside the repo credentials, so child OpenCode processes running in Herdr worktrees obey the same cap. Tasks already open when the plugin loads are baseline, not dispatched. Set `AGENT_OFFICE_AUTODISPATCH=off` to keep notifications but disable dispatch; `herdr` and `session` force one mode.
+
 Reports run one after another, so a very short turn cannot land `idle` before `working`. Failures are logged through OpenCode's logger under the service `agent-office`, never with a token. Each repo has its own credentials file: worktrees under the same canonical repo share one token, and another repo needs its own `/office`. Reusing the same Office agent in several repos still means they overwrite each other's status.
 
 ## Settings
@@ -45,6 +56,7 @@ Reports run one after another, so a very short turn cannot land `idle` before `w
 | `AGENT_OFFICE_TOKEN_SCOPE` | `repo` (one token per canonical repo), `folder` (per directory), or `global` (`~/.config/agent-office/opencode.json`) |
 | `AGENT_OFFICE_CALLBACK_PORT` | `41997`, the loopback port for the OAuth callback |
 | `AGENT_OFFICE_POLL_MS` | `60000`, inbox poll interval; minimum `1000` |
+| `AGENT_OFFICE_AUTODISPATCH` | `on` (Herdr worktrees when inside Herdr, otherwise child sessions); `off`, `herdr`, or `session` |
 
 ## Development
 

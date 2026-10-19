@@ -25,10 +25,13 @@ const mcpCalls = () => office.calls.filter((c) => c.path === "/mcp").map((c) => 
 // The V2 plugin context, reduced to the domains this plugin uses. Transforms
 // run immediately and again on reload, like the real registries.
 function makeContext(directory = "/home/x/agent-office", options: Record<string, unknown> = {}) {
+  const pluginOptions = { autoDispatch: "session", ...options }
   const tools: any[] = []
   const commands: any[] = []
   const prompts: any[] = []
   const synthetics: any[] = []
+  const created: any[] = []
+  let child = 0
   const servers = new Map<string, any>()
   const transforms: ((editor: any) => void)[] = []
   const queue: any[] = []
@@ -45,7 +48,7 @@ function makeContext(directory = "/home/x/agent-office", options: Record<string,
   const ctx: any = {
     app: { name: "opencode", version: "2.0.11", channel: "latest" },
     location: { directory, project: { id: "project", directory, canonical: directory } },
-    options,
+    options: pluginOptions,
     tool: {
       transform: async (callback: (editor: any) => void) => {
         callback({ list: () => tools, get: (id: string) => tools.find((tool) => tool.name === id), add: (tool: any) => tools.push(tool), update: () => {}, remove: () => {}, namespace: () => {} })
@@ -69,6 +72,11 @@ function makeContext(directory = "/home/x/agent-office", options: Record<string,
       },
     },
     session: {
+      create: async (input: any) => {
+        const session = { id: `child-${++child}`, ...input }
+        created.push(session)
+        return session
+      },
       prompt: async (prompt: any) => void prompts.push(prompt),
       synthetic: async (message: any) => void synthetics.push(message),
     },
@@ -97,6 +105,7 @@ function makeContext(directory = "/home/x/agent-office", options: Record<string,
     commands,
     prompts,
     synthetics,
+    created,
     servers,
     push: (event: any) => {
       queue.push(event)
@@ -226,6 +235,26 @@ test("polls and notifies the active session about new Office items", async () =>
   assert.equal(polled.synthetics[0].sessionID, "p")
   assert.match(polled.synthetics[0].text, /1 new unread message/)
   assert.match(polled.synthetics[0].text, /message:message-new/)
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("dispatches a new assigned todo task to a subagent session", async () => {
+  office.calls.length = 0
+  const worker = makeContext("/worker", { pollInterval: 1_000 })
+  const cleanup = await plugin.setup(worker.ctx)
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+  await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
+  office.state.openTasks = [...office.state.openTasks, { id: "task-dispatch", title: "Fix it", status: "todo" }]
+  await until(() => worker.created.length > 0, "the child session")
+  assert.equal(worker.created[0].parentID, "parent")
+  assert.match(worker.prompts.at(-1).text, /task-dispatch/)
+  assert.ok(office.calls.some((c) => c.body?.params?.name === "update_task" && c.body.params.arguments?.status === "in_progress"))
+
+  worker.synthetics.length = 0
+  worker.push({ type: "session.idle", data: { sessionID: worker.created[0].id } })
+  await until(() => worker.synthetics.some((message) => /subagent session/.test(message.text)), "the completion notice")
   await cleanup()
   office.calls.length = 0
 })
