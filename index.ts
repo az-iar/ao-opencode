@@ -420,9 +420,32 @@ export default Plugin.define({
     }
 
     const targetSession = () => [...busy].filter((id) => !id.startsWith("herdr:") && !dispatchedSessions.has(id)).at(-1) ?? lastSessionID
+    let resolvingTarget: Promise<string | undefined> | undefined
+    const targetSessionAsync = async () => {
+      const known = targetSession()
+      if (known) return known
+      const list = (ctx.session as any).list
+      if (typeof list !== "function") return undefined
+      resolvingTarget ??= list({ directory: ctx.location.directory, order: "desc", limit: 1 })
+        .then((page: any) => page?.data?.find((session: any) => !session.parentID)?.id as string | undefined)
+        .catch(() => undefined)
+        .finally(() => {
+          resolvingTarget = undefined
+        })
+      const found = await resolvingTarget
+      if (found) rememberSession(found)
+      return found
+    }
+    void ctx.storage.get("last-session").then((id) => {
+      if (typeof id === "string" && !lastSessionID) lastSessionID = id
+    }).catch(() => {})
+    const rememberSession = (sessionID: string) => {
+      lastSessionID = sessionID
+      void ctx.storage.set("last-session", sessionID).catch(() => {})
+    }
     const notify = (sessionID: string | undefined, text: string) => {
       if (!sessionID) return
-      void ctx.session.synthetic({ sessionID, text }).catch((err) => warn("could not notify the session", { error: String(err) }))
+      void ctx.session.synthetic({ sessionID, text, description: "Agent Office" }).catch((err) => warn("could not notify the session", { error: String(err) }))
     }
 
     // One lock per dispatched task, shared by every OpenCode process using this
@@ -539,8 +562,8 @@ export default Plugin.define({
 
     const dispatchTask = async (id: string) => {
       let held = false
+      const parent = await targetSessionAsync()
       try {
-        const parent = targetSession()
         if (!parent) return
         const detail = await call("get_task", { task_id: id }).catch(() => undefined)
         const task = detail?.task ?? detail
@@ -555,7 +578,7 @@ export default Plugin.define({
         }
       } catch (err) {
         warn("could not dispatch Office task", { task: id, error: String(err) })
-        notify(targetSession(), `Could not dispatch Office task ${id}: ${String(err)}`)
+        notify(parent, `Could not dispatch Office task ${id}: ${String(err)}`)
       } finally {
         if (!held) {
           releaseDispatch(id)
@@ -566,7 +589,13 @@ export default Plugin.define({
     }
 
     const pumpDispatch = () => {
-      if (life.signal.aborted || dispatchMode === "off" || !targetSession()) return
+      if (life.signal.aborted || dispatchMode === "off") return
+      if (!targetSession()) {
+        void targetSessionAsync().then((id) => {
+          if (id) pumpDispatch()
+        })
+        return
+      }
       for (const id of [...backlog]) {
         if (dispatching.size >= MAX_DISPATCHES) return
         const acquired = acquireDispatch(id)
@@ -585,7 +614,7 @@ export default Plugin.define({
 
     // Polling reports only new items. The first successful checkin is a
     // baseline: existing unread mail is already visible through checkin.
-    const observePending = (pending: any, live: boolean) => {
+    const observePending = async (pending: any, live: boolean) => {
       const messages: any[] = Array.isArray(pending?.unread_messages) ? pending.unread_messages : []
       const tasks: any[] = Array.isArray(pending?.unclaimed_team_tasks) ? pending.unclaimed_team_tasks : []
       const assigned: any[] = Array.isArray(pending?.open_tasks) ? pending.open_tasks : []
@@ -602,7 +631,7 @@ export default Plugin.define({
       }
       if (!live || (freshMessages.length === 0 && freshTasks.length === 0 && freshAssigned.length === 0)) return
 
-      const sessionID = targetSession()
+      const sessionID = await targetSessionAsync()
       if (!sessionID) return // keep the items unseen until a session can see them
 
       for (const item of freshMessages) seenMessages.add(itemKey(item, "message"))
@@ -632,7 +661,7 @@ export default Plugin.define({
       try {
         if (!(await bearer())) return
         const me = await checkin()
-        observePending(me.pending, true)
+        await observePending(me.pending, true)
       } catch (err) {
         warn("could not poll the Office inbox", { error: String(err) })
       }
@@ -643,6 +672,7 @@ export default Plugin.define({
     pollTimer = setInterval(() => void poll(), pollInterval)
     pollTimer.unref()
     void poll()
+    void targetSessionAsync()
 
     await ctx.command.transform((editor) => {
       editor.add({
@@ -694,7 +724,7 @@ export default Plugin.define({
           }
           await ensureConnected()
           const me = await checkin()
-          observePending(me.pending, false)
+          await observePending(me.pending, false)
           const pending = me.pending ?? {}
           return {
             content: `Connected to Agent Office as @${me.agent?.slug} (${me.agent?.name}). Open tasks: ${pending.open_tasks?.length ?? 0}, unclaimed team tasks: ${pending.unclaimed_team_tasks?.length ?? 0}, unread messages: ${pending.unread_messages?.length ?? 0}. The office MCP tools are available; call checkin first.`,
@@ -710,7 +740,7 @@ export default Plugin.define({
           switch (event.type) {
             case "session.status": {
               const child = dispatchedSessions.has(event.data.sessionID)
-              if (!child) lastSessionID = event.data.sessionID
+              if (!child) rememberSession(event.data.sessionID)
               if (event.data.status.type === "idle") {
                 stop(event.data.sessionID)
                 settleChild(event.data.sessionID)
@@ -719,13 +749,16 @@ export default Plugin.define({
             }
             case "session.idle": {
               const child = dispatchedSessions.has(event.data.sessionID)
-              if (!child) lastSessionID = event.data.sessionID
+              if (!child) rememberSession(event.data.sessionID)
               stop(event.data.sessionID)
               settleChild(event.data.sessionID)
               break
             }
             case "session.deleted":
-              if (lastSessionID === event.data.sessionID) lastSessionID = undefined
+              if (lastSessionID === event.data.sessionID) {
+                lastSessionID = undefined
+                void ctx.storage.remove("last-session").catch(() => {})
+              }
               stop(event.data.sessionID)
               settleChild(event.data.sessionID)
               break

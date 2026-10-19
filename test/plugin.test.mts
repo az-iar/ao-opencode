@@ -32,6 +32,7 @@ function makeContext(directory = "/home/x/agent-office", options: Record<string,
   const prompts: any[] = []
   const synthetics: any[] = []
   const created: any[] = []
+  const stored = new Map<string, any>()
   let child = 0
   const servers = new Map<string, any>()
   const transforms: ((editor: any) => void)[] = []
@@ -50,6 +51,11 @@ function makeContext(directory = "/home/x/agent-office", options: Record<string,
     app: { name: "opencode", version: "2.0.11", channel: "latest" },
     location: { directory, project: { id: "project", directory, canonical: directory } },
     options: pluginOptions,
+    storage: {
+      get: async (key: string) => stored.get(key),
+      set: async (key: string, value: any) => void stored.set(key, value),
+      remove: async (key: string) => void stored.delete(key),
+    },
     tool: {
       transform: async (callback: (editor: any) => void) => {
         callback({ list: () => tools, get: (id: string) => tools.find((tool) => tool.name === id), add: (tool: any) => tools.push(tool), update: () => {}, remove: () => {}, namespace: () => {} })
@@ -73,6 +79,7 @@ function makeContext(directory = "/home/x/agent-office", options: Record<string,
       },
     },
     session: {
+      list: async () => ({ data: created.filter((session) => !session.parentID).slice(-1), cursor: {} }),
       create: async (input: any) => {
         const session = { id: `child-${++child}`, ...input }
         created.push(session)
@@ -241,6 +248,20 @@ test("polls and notifies the active session about new Office items", async () =>
   assert.equal(polled.synthetics[0].sessionID, "p")
   assert.match(polled.synthetics[0].text, /1 new unread message/)
   assert.match(polled.synthetics[0].text, /message:message-new/)
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("uses the remembered session when polling after a reload", async () => {
+  office.calls.length = 0
+  const worker = makeContext("/fallback", { pollInterval: 1_000 })
+  await worker.ctx.storage.set("last-session", "remembered")
+  const cleanup = await plugin.setup(worker.ctx)
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-fallback", from: "azri", subject: "After reload" }]
+  await until(() => worker.synthetics.length > 0, "the fallback notice")
+  assert.equal(worker.synthetics[0].sessionID, "remembered")
+  assert.equal(worker.synthetics[0].description, "Agent Office")
   await cleanup()
   office.calls.length = 0
 })
