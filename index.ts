@@ -13,7 +13,7 @@
 //
 // Tokens are never logged.
 
-import { tool, type Plugin } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
 import { spawn } from "node:child_process"
 import { createHash, randomBytes } from "node:crypto"
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
@@ -136,151 +136,187 @@ async function authorize(onUrl: (url: string) => void): Promise<Credentials> {
   return tokenRequest(client_id, { grant_type: "authorization_code", code, redirect_uri: CALLBACK, code_verifier: verifier })
 }
 
-export const AgentOfficePlugin: Plugin = async ({ client, worktree }) => {
-  const log = async (level: "warn" | "info", message: string, extra?: Record<string, unknown>) => {
-    await client.app.log({ body: { service: "agent-office", level, message, extra } }).catch(() => {})
-  }
-
-  let credentials = loadCredentials()
-
-  // The bearer for every Office call: the API token from the environment, or
-  // the OAuth access token, refreshed shortly before it expires.
-  const bearer = async (): Promise<string | undefined> => {
-    if (process.env.AGENT_OFFICE_TOKEN) return process.env.AGENT_OFFICE_TOKEN
-    if (!credentials) return undefined
-    if (credentials.expires_at - Date.now() < REFRESH_EARLY_MS) {
-      credentials = await tokenRequest(credentials.client_id, { grant_type: "refresh_token", refresh_token: credentials.refresh_token })
-      saveCredentials(credentials)
+export default Plugin.define({
+  id: "agent-office",
+  async setup(ctx) {
+    // Tokens are never part of a log line; errors only carry status codes,
+    // messages from the Office and the names of the calls that failed.
+    const warn = (message: string, extra?: Record<string, unknown>) => {
+      console.warn(`[agent-office] ${message}${extra ? ` ${JSON.stringify(extra)}` : ""}`)
     }
-    return credentials.access_token
-  }
 
-  const call = async (name: string, args: Record<string, unknown> = {}) => {
-    const token = await bearer()
-    if (!token) throw new Error("not connected to Agent Office: run /office")
-    const res = await fetch(`${OFFICE}/mcp`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        Accept: "application/json, text/event-stream",
-        "MCP-Protocol-Version": MCP_PROTOCOL,
-        "Mcp-Method": "tools/call",
-      },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "tools/call",
-        params: { name, arguments: args, _meta: { "io.modelcontextprotocol/protocolVersion": MCP_PROTOCOL } },
-      }),
-      signal: AbortSignal.timeout(15_000),
-    })
-    if (!res.ok) throw new Error(`Office ${name}: HTTP ${res.status}`)
-    const body = (await res.json()) as { result?: { isError?: boolean; structuredContent?: Record<string, any>; content?: { text?: string }[] }; error?: { message: string } }
-    if (body.error) throw new Error(`Office ${name}: ${body.error.message}`)
-    if (body.result?.isError) throw new Error(`Office ${name}: ${body.result.content?.[0]?.text ?? "tool error"}`)
-    return body.result?.structuredContent ?? {}
-  }
+    let credentials = loadCredentials()
 
-  // Hands OpenCode the office MCP server with the current access token, and
-  // again whenever the token is refreshed.
-  let refreshTimer: ReturnType<typeof setTimeout> | undefined
-  const connectMcp = async () => {
-    const token = await bearer()
-    if (!token) return
-    await client.mcp.add({
-      body: { name: "office", config: { type: "remote", url: `${OFFICE}/mcp`, oauth: false, headers: { Authorization: `Bearer ${token}` } } },
-    })
-    clearTimeout(refreshTimer)
-    if (credentials && !process.env.AGENT_OFFICE_TOKEN) {
-      const delay = Math.max(credentials.expires_at - Date.now() - REFRESH_EARLY_MS, 10_000)
-      refreshTimer = setTimeout(() => connectMcp().catch((err) => log("warn", "could not refresh the Office connection", { error: String(err) })), delay)
-      refreshTimer.unref()
-    }
-  }
-  let connected: Promise<void> | undefined
-  const ensureConnected = () => (connected ??= connectMcp().catch((err) => log("warn", "could not connect the Office MCP server", { error: String(err) })))
-
-  const note = `opencode: ${basename(worktree)}`
-  const busy = new Set<string>()
-  let heartbeat: ReturnType<typeof setInterval> | undefined
-  let queue = Promise.resolve()
-
-  // Reports run one after another so a short turn cannot land idle before working.
-  const report = (status: "working" | "idle") => {
-    queue = queue.then(async () => {
-      try {
-        if (!(await bearer())) return
-        if (status === "idle" && (await call("checkin")).agent?.work_status === "blocked") return
-        await call("checkin", { status, note })
-      } catch (err) {
-        await log("warn", `could not report ${status}`, { error: String(err) })
+    // The bearer for every Office call: the API token from the environment, or
+    // the OAuth access token, refreshed shortly before it expires.
+    const bearer = async (): Promise<string | undefined> => {
+      if (process.env.AGENT_OFFICE_TOKEN) return process.env.AGENT_OFFICE_TOKEN
+      if (!credentials) return undefined
+      if (credentials.expires_at - Date.now() < REFRESH_EARLY_MS) {
+        credentials = await tokenRequest(credentials.client_id, { grant_type: "refresh_token", refresh_token: credentials.refresh_token })
+        saveCredentials(credentials)
       }
-    })
-    return queue
-  }
-
-  const start = (sessionID: string) => {
-    if (busy.size === 0) {
-      heartbeat = setInterval(() => call("checkin").catch(() => {}), HEARTBEAT_MS)
-      heartbeat.unref()
-      void report("working")
+      return credentials.access_token
     }
-    busy.add(sessionID)
-  }
 
-  const stop = (sessionID: string) => {
-    if (!busy.delete(sessionID) || busy.size > 0) return
-    clearInterval(heartbeat)
-    void report("idle")
-  }
+    const call = async (name: string, args: Record<string, unknown> = {}) => {
+      const token = await bearer()
+      if (!token) throw new Error("not connected to Agent Office: run /office")
+      const res = await fetch(`${OFFICE}/mcp`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          "MCP-Protocol-Version": MCP_PROTOCOL,
+          "Mcp-Method": "tools/call",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name, arguments: args, _meta: { "io.modelcontextprotocol/protocolVersion": MCP_PROTOCOL } },
+        }),
+        signal: AbortSignal.timeout(15_000),
+      })
+      if (!res.ok) throw new Error(`Office ${name}: HTTP ${res.status}`)
+      const body = (await res.json()) as { result?: { isError?: boolean; structuredContent?: Record<string, any>; content?: { text?: string }[] }; error?: { message: string } }
+      if (body.error) throw new Error(`Office ${name}: ${body.error.message}`)
+      if (body.result?.isError) throw new Error(`Office ${name}: ${body.result.content?.[0]?.text ?? "tool error"}`)
+      return body.result?.structuredContent ?? {}
+    }
 
-  return {
-    config: async (cfg) => {
-      ;(cfg.command ??= {}).office ??= {
+    // Hands OpenCode the office MCP server with the current access token, and
+    // again whenever the token is refreshed. The transform captures the token
+    // and `reload()` replays it after every refresh.
+    let token: string | undefined
+    await ctx.mcp.transform((editor) => {
+      if (!token) return
+      editor.set("office", { type: "remote", url: `${OFFICE}/mcp`, oauth: false, headers: { Authorization: `Bearer ${token}` } })
+    })
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined
+    const connectMcp = async () => {
+      token = await bearer()
+      if (!token) return
+      await ctx.mcp.reload()
+      clearTimeout(refreshTimer)
+      if (credentials && !process.env.AGENT_OFFICE_TOKEN) {
+        const delay = Math.max(credentials.expires_at - Date.now() - REFRESH_EARLY_MS, 10_000)
+        refreshTimer = setTimeout(() => connectMcp().catch((err) => warn("could not refresh the Office connection", { error: String(err) })), delay)
+        refreshTimer.unref()
+      }
+    }
+    let connected: Promise<void> | undefined
+    const ensureConnected = () => (connected ??= connectMcp().catch((err) => warn("could not connect the Office MCP server", { error: String(err) })))
+
+    const note = `opencode: ${basename(ctx.location.directory)}`
+    const busy = new Set<string>()
+    let heartbeat: ReturnType<typeof setInterval> | undefined
+    let queue = Promise.resolve()
+
+    // Reports run one after another so a short turn cannot land idle before working.
+    const report = (status: "working" | "idle") => {
+      queue = queue.then(async () => {
+        try {
+          if (!(await bearer())) return
+          if (status === "idle" && (await call("checkin")).agent?.work_status === "blocked") return
+          await call("checkin", { status, note })
+        } catch (err) {
+          warn(`could not report ${status}`, { error: String(err) })
+        }
+      })
+      return queue
+    }
+
+    const start = (sessionID: string) => {
+      if (busy.size === 0) {
+        heartbeat = setInterval(() => call("checkin").catch(() => {}), HEARTBEAT_MS)
+        heartbeat.unref()
+        void report("working")
+      }
+      busy.add(sessionID)
+    }
+
+    const stop = (sessionID: string) => {
+      if (!busy.delete(sessionID) || busy.size > 0) return
+      clearInterval(heartbeat)
+      void report("idle")
+    }
+
+    await ctx.command.transform((editor) => {
+      editor.add({
+        name: "office",
         description: "Connect to Agent Office",
-        template: "Connect this OpenCode to Agent Office with the office_connect tool and tell me what it returned. $ARGUMENTS",
-      }
-    },
-    tool: {
-      office_connect: tool({
+        execute: async ({ sessionID, prompt, delivery }) => {
+          const request = "Connect this OpenCode to Agent Office with the office_connect tool and tell me what it returned."
+          await ctx.session.prompt({
+            ...prompt,
+            sessionID,
+            text: prompt.text.trim() ? `${request} ${prompt.text}` : request,
+            delivery,
+          })
+        },
+      })
+    })
+
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: "office_connect",
         description:
           "Connect OpenCode to Agent Office. Opens the browser for the Office admin to approve, stores the tokens and adds the office MCP tools (checkin, tasks, messages, journal, decisions). Already connected: reports who you are. `reconnect` starts a fresh approval.",
-        args: { reconnect: tool.schema.boolean().optional().describe("force a new OAuth approval") },
-        async execute(args, ctx) {
-          if (args.reconnect || !(await bearer())) {
-            credentials = await authorize((url) => ctx.metadata({ title: "Approve OpenCode in the browser", metadata: { url } }))
+        input: {
+          type: "object",
+          properties: { reconnect: { type: "boolean", description: "force a new OAuth approval" } },
+          additionalProperties: false,
+        },
+        async execute(input, toolCtx) {
+          const { reconnect } = input as { reconnect?: boolean }
+          if (reconnect || !(await bearer())) {
+            credentials = await authorize((url) => void toolCtx.progress({ title: "Approve OpenCode in the browser", metadata: { url } }))
             saveCredentials(credentials)
             connected = undefined
           }
           await ensureConnected()
           const me = await call("checkin")
           const pending = me.pending ?? {}
-          return `Connected to Agent Office as @${me.agent?.slug} (${me.agent?.name}). Open tasks: ${pending.open_tasks?.length ?? 0}, unclaimed team tasks: ${pending.unclaimed_team_tasks?.length ?? 0}, unread messages: ${pending.unread_messages?.length ?? 0}. The office MCP tools are available; call checkin first.`
+          return {
+            content: `Connected to Agent Office as @${me.agent?.slug} (${me.agent?.name}). Open tasks: ${pending.open_tasks?.length ?? 0}, unclaimed team tasks: ${pending.unclaimed_team_tasks?.length ?? 0}, unread messages: ${pending.unread_messages?.length ?? 0}. The office MCP tools are available; call checkin first.`,
+          }
         },
-      }),
-    },
-    event: async ({ event }) => {
-      void ensureConnected()
-      switch (event.type) {
-        case "session.status":
-          if (event.properties.status.type === "idle") stop(event.properties.sessionID)
-          else start(event.properties.sessionID)
-          break
-        case "session.idle":
-          stop(event.properties.sessionID)
-          break
-        case "session.deleted":
-          stop(event.properties.info.id)
-          break
+      })
+    })
+
+    const events = new AbortController()
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: events.signal })) {
+          void ensureConnected()
+          switch (event.type) {
+            case "session.status":
+              if (event.data.status.type === "idle") stop(event.data.sessionID)
+              else start(event.data.sessionID)
+              break
+            case "session.idle":
+              stop(event.data.sessionID)
+              break
+            case "session.deleted":
+              stop(event.data.sessionID)
+              break
+          }
+        }
+      } catch (err) {
+        if (!events.signal.aborted) warn("event subscription stopped", { error: String(err) })
       }
-    },
-    dispose: async () => {
+    })()
+
+    return async () => {
+      events.abort()
       clearInterval(heartbeat)
       clearTimeout(refreshTimer)
       if (busy.size === 0) return
       busy.clear()
       await report("idle")
-    },
-  }
-}
+    }
+  },
+})
+

@@ -15,7 +15,7 @@
     "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test test/*.test.mts"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.19.3"
+    "@opencode/plugin": "^2.0.32"
   },
   "devDependencies": {
     "@types/node": "^24.6.0",

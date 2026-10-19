@@ -12,47 +12,150 @@ process.env.AGENT_OFFICE_OPENCODE_CREDENTIALS = credentials
 process.env.AGENT_OFFICE_CALLBACK_PORT = "45123"
 delete process.env.AGENT_OFFICE_TOKEN
 
-const added: any[] = []
-const logs: { level: string; message: string }[] = []
-const client = {
-  app: { log: async (x: { body: { level: string; message: string } }) => void logs.push(x.body) },
-  mcp: { add: async (x: { body: any }) => void added.push(x.body) },
-}
 const tick = () => new Promise((r) => setTimeout(r, 20))
+const until = async (check: () => boolean, what: string) => {
+  for (let i = 0; i < 100; i++) {
+    if (check()) return
+    await tick()
+  }
+  assert.fail(`timed out waiting for ${what}`)
+}
 const mcpCalls = () => office.calls.filter((c) => c.path === "/mcp").map((c) => `${c.auth} ${c.body.params.name} ${JSON.stringify(c.body.params.arguments)}`)
 
-let hooks: any
+// The V2 plugin context, reduced to the domains this plugin uses. Transforms
+// run immediately and again on reload, like the real registries.
+function makeContext(directory = "/home/x/agent-office") {
+  const tools: any[] = []
+  const commands: any[] = []
+  const prompts: any[] = []
+  const servers = new Map<string, any>()
+  const transforms: ((editor: any) => void)[] = []
+  const queue: any[] = []
+  let wake: (() => void) | undefined
+
+  const mcpEditor = {
+    list: () => [...servers.entries()],
+    get: (name: string) => servers.get(name),
+    set: (name: string, config: any) => servers.set(name, config),
+    update: (name: string, update: (config: any) => void) => update(servers.get(name)),
+    remove: (name: string) => servers.delete(name),
+  }
+
+  const ctx: any = {
+    app: { name: "opencode", version: "2.0.11", channel: "latest" },
+    location: { directory, project: { id: "project", directory, canonical: directory } },
+    options: {},
+    tool: {
+      transform: async (callback: (editor: any) => void) => {
+        callback({ list: () => tools, get: (id: string) => tools.find((tool) => tool.name === id), add: (tool: any) => tools.push(tool), update: () => {}, remove: () => {}, namespace: () => {} })
+        return { dispose: async () => {} }
+      },
+    },
+    command: {
+      transform: async (callback: (editor: any) => void) => {
+        callback({ add: (command: any) => commands.push(command) })
+        return { dispose: async () => {} }
+      },
+    },
+    mcp: {
+      transform: async (callback: (editor: any) => void) => {
+        transforms.push(callback)
+        callback(mcpEditor)
+        return { dispose: async () => {} }
+      },
+      reload: async () => {
+        for (const callback of transforms) callback(mcpEditor)
+      },
+    },
+    session: {
+      prompt: async (prompt: any) => void prompts.push(prompt),
+    },
+    event: {
+      subscribe: (options?: { signal?: AbortSignal }) => {
+        const signal = options?.signal
+        return (async function* () {
+          while (!signal?.aborted) {
+            if (queue.length) {
+              yield queue.shift()
+              continue
+            }
+            await new Promise<void>((resolve) => {
+              wake = resolve
+              signal?.addEventListener("abort", () => resolve(), { once: true })
+            })
+          }
+        })()
+      },
+    },
+  }
+
+  return {
+    ctx,
+    tools,
+    commands,
+    prompts,
+    servers,
+    push: (event: any) => {
+      queue.push(event)
+      wake?.()
+      wake = undefined
+    },
+  }
+}
+
+let plugin: any
+let harness: ReturnType<typeof makeContext>
+let cleanupFirst: (() => Promise<void>) | undefined
+const warnings: string[] = []
+const originalWarn = console.warn
+
 before(async () => {
   process.env.AGENT_OFFICE_URL = (await office.listen()) + "/"
-  const { AgentOfficePlugin } = await import("../index.ts")
-  hooks = await AgentOfficePlugin({ client, worktree: "/home/x/agent-office" } as never)
+  console.warn = (...args: unknown[]) => void warnings.push(args.join(" "))
+  const { default: definition } = await import("../index.ts")
+  plugin = definition
+  harness = makeContext()
+  cleanupFirst = await plugin.setup(harness.ctx)
 })
-after(() => office.close())
-
-test("registers the /office command", async () => {
-  const cfg: any = {}
-  await hooks.config(cfg)
-  assert.match(cfg.command.office.template, /office_connect/)
+after(async () => {
+  await cleanupFirst?.()
+  console.warn = originalWarn
+  office.close()
 })
 
-test("not connected: events report nothing and the tools are not added", async () => {
-  await hooks.event({ event: { type: "session.status", properties: { sessionID: "a", status: { type: "busy" } } } })
-  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "a" } } })
+test("defines the agent-office plugin", () => {
+  assert.equal(plugin.id, "agent-office")
+})
+
+test("registers the /office command and the office_connect tool", async () => {
+  const command = harness.commands.find((c) => c.name === "office")
+  assert.ok(command)
+  await command.execute({ sessionID: "s1", prompt: { text: "please" }, delivery: "steer" })
+  assert.equal(harness.prompts.at(-1).sessionID, "s1")
+  assert.match(harness.prompts.at(-1).text, /^Connect this OpenCode to Agent Office with the office_connect tool and tell me what it returned\. please$/)
+  assert.equal(harness.tools[0].name, "office_connect")
+  assert.equal(harness.tools[0].input.properties.reconnect.type, "boolean")
+})
+
+test("not connected: events report nothing and no MCP server is added", async () => {
+  harness.push({ type: "session.status", data: { sessionID: "a", status: { type: "busy" } } })
+  harness.push({ type: "session.idle", data: { sessionID: "a" } })
   await tick()
-  assert.deepEqual(added, [])
+  assert.equal(harness.servers.size, 0)
   assert.deepEqual(office.calls, [])
 })
 
 test("/office: OAuth with PKCE, stored tokens, MCP server added", async () => {
   let authorizeUrl = ""
-  const result = hooks.tool.office_connect.execute({}, { metadata: (m: any) => (authorizeUrl = m.metadata.url) })
-  while (!authorizeUrl) await tick()
+  const result = harness.tools[0].execute({}, { progress: async (m: any) => (authorizeUrl = m.metadata.url) })
+  await until(() => authorizeUrl !== "", "the authorization URL")
   // Azri's browser: the Office approves and sends it back to the plugin's callback.
   const back = await fetch(authorizeUrl, { redirect: "manual" })
   assert.equal(back.status, 302)
   const landing = await fetch(back.headers.get("location")!)
   assert.match(await landing.text(), /connected/)
-  assert.match(await result, /^Connected to Agent Office as @opencode \(OpenCode\)\. Open tasks: 1, unclaimed team tasks: 0, unread messages: 2\./)
+  const response = await result
+  assert.match(response.content, /^Connected to Agent Office as @opencode \(OpenCode\)\. Open tasks: 1, unclaimed team tasks: 0, unread messages: 2\./)
 
   const register = office.calls.find((c) => c.path === "/oauth/register")!
   const token = office.calls.find((c) => c.path === "/oauth/token")!
@@ -66,57 +169,64 @@ test("/office: OAuth with PKCE, stored tokens, MCP server added", async () => {
   const saved = JSON.parse(readFileSync(credentials, "utf8"))
   assert.equal(saved.access_token, "access-1")
   assert.equal(statSync(credentials).mode & 0o777, 0o600)
-  assert.deepEqual(added, [{ name: "office", config: { type: "remote", url: saved.office + "/mcp", oauth: false, headers: { Authorization: "Bearer access-1" } } }])
+  assert.deepEqual(harness.servers.get("office"), { type: "remote", url: saved.office + "/mcp", oauth: false, headers: { Authorization: "Bearer access-1" } })
   assert.deepEqual(mcpCalls(), ["Bearer access-1 checkin {}"])
   office.calls.length = 0
 })
 
 test("working while any session is busy, idle when all are quiet", async () => {
-  await hooks.event({ event: { type: "session.status", properties: { sessionID: "a", status: { type: "busy" } } } })
-  await hooks.event({ event: { type: "session.status", properties: { sessionID: "b", status: { type: "retry", attempt: 1 } } } })
-  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "a" } } })
-  await tick()
-  assert.deepEqual(mcpCalls(), ['Bearer access-1 checkin {"status":"working","note":"opencode: agent-office"}'])
-  await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "b" } } } })
-  await tick()
-  assert.deepEqual(mcpCalls().slice(1), ["Bearer access-1 checkin {}", 'Bearer access-1 checkin {"status":"idle","note":"opencode: agent-office"}'])
+  harness.push({ type: "session.status", data: { sessionID: "a", status: { type: "busy" } } })
+  harness.push({ type: "session.status", data: { sessionID: "b", status: { type: "retry", attempt: 1 } } })
+  harness.push({ type: "session.idle", data: { sessionID: "a" } })
+  await until(() => mcpCalls().includes('Bearer access-1 checkin {"status":"working","note":"opencode: agent-office"}'), "the working report")
+  harness.push({ type: "session.deleted", data: { sessionID: "b" } })
+  await until(() => mcpCalls().some((call) => call.endsWith('{"status":"idle","note":"opencode: agent-office"}')), "the idle report")
+  assert.deepEqual(mcpCalls(), ['Bearer access-1 checkin {"status":"working","note":"opencode: agent-office"}', "Bearer access-1 checkin {}", 'Bearer access-1 checkin {"status":"idle","note":"opencode: agent-office"}'])
   office.calls.length = 0
 })
 
 test("never overrides blocked", async () => {
-  await hooks.event({ event: { type: "session.status", properties: { sessionID: "c", status: { type: "busy" } } } })
-  await tick()
+  harness.push({ type: "session.status", data: { sessionID: "c", status: { type: "busy" } } })
+  await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
   office.state.workStatus = "blocked" // the model asked Azri something through `ask`
-  await hooks.event({ event: { type: "session.status", properties: { sessionID: "c", status: { type: "idle" } } } })
+  harness.push({ type: "session.status", data: { sessionID: "c", status: { type: "idle" } } })
+  await until(() => mcpCalls().includes("Bearer access-1 checkin {}"), "the blocked check")
   await tick()
   assert.deepEqual(mcpCalls(), ['Bearer access-1 checkin {"status":"working","note":"opencode: agent-office"}', "Bearer access-1 checkin {}"])
   office.state.workStatus = "idle"
   office.calls.length = 0
-  await hooks.dispose()
+})
+
+test("cleanup reports idle while a session is still busy", async () => {
+  const fresh = makeContext("/tmp/x")
+  const cleanup = await plugin.setup(fresh.ctx)
+  fresh.push({ type: "session.status", data: { sessionID: "z", status: { type: "busy" } } })
+  await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
+  office.calls.length = 0
+  await cleanup()
+  assert.deepEqual(mcpCalls(), ["Bearer access-1 checkin {}", 'Bearer access-1 checkin {"status":"idle","note":"opencode: x"}'])
+  office.calls.length = 0
 })
 
 test("a stored token near expiry is refreshed before use and handed to OpenCode again", async () => {
   const saved = JSON.parse(readFileSync(credentials, "utf8"))
   writeFileSync(credentials, JSON.stringify({ ...saved, expires_at: Date.now() + 60_000 }))
-  added.length = 0
-  const { AgentOfficePlugin } = await import("../index.ts")
-  const again: any = await AgentOfficePlugin({ client, worktree: "/x" } as never)
-  await again.event({ event: { type: "session.created", properties: { info: { id: "d" } } } })
-  await tick()
+  const second = makeContext("/x")
+  await plugin.setup(second.ctx)
+  second.push({ type: "session.created", data: { info: { id: "d" } } })
+  await until(() => second.servers.get("office")?.headers?.Authorization === "Bearer access-2", "the refreshed MCP server")
   const refresh = office.calls.find((c) => c.path === "/oauth/token")!
   assert.equal(refresh.body.grant_type, "refresh_token")
   assert.equal(refresh.body.refresh_token, "refresh-1")
-  assert.equal(added[0].config.headers.Authorization, "Bearer access-2")
   assert.equal(JSON.parse(readFileSync(credentials, "utf8")).refresh_token, "refresh-2")
-  await again.dispose()
+  second.push({ type: "session.status", data: { sessionID: "d", status: { type: "busy" } } })
+  await tick()
 })
 
 test("logs failures without the token", async () => {
   await office.close()
-  await hooks.event({ event: { type: "session.status", properties: { sessionID: "e", status: { type: "busy" } } } })
-  for (let i = 0; i < 100 && logs.at(-1)?.level !== "warn"; i++) await tick()
-  assert.equal(logs.at(-1)?.level, "warn")
-  assert.match(logs.at(-1)?.message ?? "", /working/)
-  assert.ok(!JSON.stringify(logs).includes("access-"))
-  await hooks.dispose()
+  harness.push({ type: "session.status", data: { sessionID: "e", status: { type: "busy" } } })
+  await until(() => warnings.some((warning) => /could not report working/.test(warning)), "the failure warning")
+  assert.ok(warnings.some((warning) => /could not report working/.test(warning)))
+  assert.ok(!warnings.join("\n").includes("access-"))
 })
