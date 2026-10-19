@@ -1,30 +1,10 @@
 # ao-opencode
 
-[OpenCode](https://opencode.ai) plugin for [Agent Office](https://github.com/az-iar/agent-office). It keeps OpenCode's Office status honest: `working` while any session runs, a heartbeat every 90 s so the dashboard shows it online, and `idle` once every session is quiet. It never overrides `blocked`.
+[OpenCode](https://opencode.ai) plugin for [Agent Office](https://github.com/az-iar/agent-office). Install it, run `/office`, approve in the browser, and OpenCode works as an Office agent: the Office MCP tools (check in, tasks, messages, journal, decisions) appear, and the dashboard shows it `working` while a session runs and `idle` when all are quiet.
 
-The Office tools (check in, tasks, messages, journal, decisions) come from the Office MCP connector, not from this plugin. Use both.
+## Install
 
-## Setup
-
-1. Register OpenCode as an Office agent and store its token (see the Office guide at `/docs` on your dashboard). The plugin reads `AGENT_OFFICE_TOKEN`, or the token file at `~/.config/agent-office/token` (`AGENT_OFFICE_TOKEN_FILE` overrides the path). `AGENT_OFFICE_URL` defaults to `https://office.byma.tech`.
-
-2. Add the Office MCP server to `opencode.json` (project, or `~/.config/opencode/`):
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "mcp": {
-    "office": {
-      "type": "remote",
-      "url": "https://office.byma.tech/mcp",
-      "oauth": false,
-      "headers": { "Authorization": "Bearer {env:AGENT_OFFICE_TOKEN}" }
-    }
-  }
-}
-```
-
-3. Install the plugin. It is one file with no dependencies, so copy it into a plugins directory, global or per project:
+One file, no build step, no dependencies:
 
 ```sh
 mkdir -p ~/.config/opencode/plugins
@@ -32,27 +12,36 @@ curl -fsSo ~/.config/opencode/plugins/ao-opencode.ts \
   https://raw.githubusercontent.com/az-iar/ao-opencode/main/index.ts
 ```
 
-Or, per project, depend on the package in `.opencode/package.json` (OpenCode runs `bun install` there at startup) and re-export it from `.opencode/plugins/agent-office.ts`:
+For one project only, put it in `.opencode/plugins/` instead.
 
-```json
-{ "dependencies": { "ao-opencode": "github:az-iar/ao-opencode" } }
-```
+## Connect
 
-```ts
-export { AgentOfficePlugin } from "ao-opencode"
-```
+In OpenCode, run `/office`. The model calls the plugin's `office_connect` tool, which:
 
-Start OpenCode. Without a token the plugin logs one warning and does nothing.
+1. registers OpenCode with the Office (OAuth dynamic client registration) and opens the Office approval page in your browser;
+2. waits, up to five minutes, for you to sign in to the dashboard and approve, as a new agent named "OpenCode" or an existing one;
+3. stores the tokens in `~/.config/agent-office/opencode.json` (mode 0600), adds the `office` MCP server to OpenCode, and checks in.
 
-## How it reports
+Reconnecting later lands on the same agent. `/office` again reports who you are; ask for `reconnect` to approve afresh. Access tokens last an hour and the plugin refreshes them on its own.
 
-| OpenCode event | Office |
+## While running
+
+| OpenCode | Office |
 |---|---|
-| a session turns busy and no other session is | `PUT /status {"status":"working","note":"opencode: <project dir>"}` and a `GET /me` heartbeat every 90 s |
-| the last busy session goes idle or is deleted | `PUT /status {"status":"idle"}`, unless `GET /me` says you are `blocked` (you asked Azri something and are waiting) |
+| a session turns busy and no other session is | `checkin {status: "working", note: "opencode: <project dir>"}`, then a `checkin` heartbeat every 90 s |
+| the last busy session goes idle or is deleted | `checkin {status: "idle"}`, unless you are `blocked` (you asked Azri something and are waiting) |
 | OpenCode shuts down while busy | `idle`, with the same `blocked` check |
 
-Reports run one after another, so a very short turn cannot land `idle` before `working`. Failures are logged through OpenCode's logger without the token. One OpenCode process is one agent: two running at once with the same token overwrite each other's status.
+Reports run one after another, so a very short turn cannot land `idle` before `working`. Failures are logged through OpenCode's logger under the service `agent-office`, never with a token. One OpenCode process is one agent: two running at once on the same credentials overwrite each other's status.
+
+## Settings
+
+| Variable | Default |
+|---|---|
+| `AGENT_OFFICE_URL` | `https://office.byma.tech` |
+| `AGENT_OFFICE_TOKEN` | unset; an agent API token used instead of OAuth, so `/office` is not needed |
+| `AGENT_OFFICE_OPENCODE_CREDENTIALS` | `~/.config/agent-office/opencode.json` |
+| `AGENT_OFFICE_CALLBACK_PORT` | `41997`, the loopback port for the OAuth callback |
 
 ## Development
 
@@ -61,3 +50,5 @@ npm install
 npm run typecheck
 npm test
 ```
+
+The tests run the plugin against a fake Office (`test/fake-office.mts`): OAuth with PKCE through the real loopback callback, token refresh, and the status reports.
