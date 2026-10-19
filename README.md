@@ -1,4 +1,4 @@
-# opencode-agent-office
+# ao-opencode
 
 [OpenCode](https://opencode.ai) plugin for [Agent Office](https://github.com/az-iar/agent-office). It keeps OpenCode's Office status honest: `working` while any session runs, a heartbeat every 90 s so the dashboard shows it online, and `idle` once every session is quiet. It never overrides `blocked`.
 
@@ -28,18 +28,18 @@ The Office tools (check in, tasks, messages, journal, decisions) come from the O
 
 ```sh
 mkdir -p ~/.config/opencode/plugins
-curl -fsSo ~/.config/opencode/plugins/opencode-agent-office.ts \
-  https://raw.githubusercontent.com/az-iar/opencode-agent-office/main/index.ts
+curl -fsSo ~/.config/opencode/plugins/ao-opencode.ts \
+  https://raw.githubusercontent.com/az-iar/ao-opencode/main/index.ts
 ```
 
 Or, per project, depend on the package in `.opencode/package.json` (OpenCode runs `bun install` there at startup) and re-export it from `.opencode/plugins/agent-office.ts`:
 
 ```json
-{ "dependencies": { "opencode-agent-office": "github:az-iar/opencode-agent-office" } }
+{ "dependencies": { "ao-opencode": "github:az-iar/ao-opencode" } }
 ```
 
 ```ts
-export { AgentOfficePlugin } from "opencode-agent-office"
+export { AgentOfficePlugin } from "ao-opencode"
 ```
 
 Start OpenCode. Without a token the plugin logs one warning and does nothing.

@@ -1,11 +1,11 @@
 {
-  "name": "opencode-agent-office",
+  "name": "ao-opencode",
   "version": "0.1.0",
   "description": "OpenCode plugin for Agent Office: reports working/idle status and heartbeats while sessions run",
   "type": "module",
   "exports": "./index.ts",
   "files": ["index.ts"],
-  "repository": "github:az-iar/opencode-agent-office",
+  "repository": "github:az-iar/ao-opencode",
   "license": "MIT",
   "scripts": {
     "typecheck": "tsc -p .",
