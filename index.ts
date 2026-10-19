@@ -654,7 +654,8 @@ export default Plugin.define({
       }
 
       const label = (item: any) => {
-        const from = item?.from ?? item?.sender ?? item?.agent?.slug
+        const sender = item?.from ?? item?.sender
+        const from = typeof sender === "string" ? sender : sender?.slug ?? sender?.name ?? item?.agent?.slug
         const text = item?.subject ?? item?.title ?? item?.body
         return [from, typeof text === "string" ? text.slice(0, 200) : undefined].filter(Boolean).join(": ")
       }
