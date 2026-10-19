@@ -6,7 +6,16 @@ export type Call = { method: string; path: string; auth?: string; body: any }
 
 export function fakeOffice() {
   const calls: Call[] = []
-  const state = { workStatus: "working", tokens: 0 }
+  const state = {
+    workStatus: "working",
+    tokens: 0,
+    openTasks: [{ id: "task-open-1", title: "Open task" }],
+    unclaimedTasks: [] as any[],
+    unreadMessages: [
+      { id: "message-old-1", from: "azri", subject: "Old one" },
+      { id: "message-old-2", from: "azri", subject: "Old two" },
+    ],
+  }
   const server: Server = createServer(async (req, res) => {
     const chunks: Buffer[] = []
     for await (const chunk of req) chunks.push(chunk as Buffer)
@@ -40,7 +49,11 @@ export function fakeOffice() {
       if (body.method === "tools/list") return result({ tools: [{ name: "checkin", description: "Check in", inputSchema: { type: "object", properties: {} } }] })
       if (body.method === "tools/call") {
         if (body.params.arguments?.status) state.workStatus = body.params.arguments.status
-        const data = { agent: { slug: "opencode", name: "OpenCode", work_status: state.workStatus }, pending: { open_tasks: [{}], unclaimed_team_tasks: [], unread_messages: [{}, {}] } }
+        const data = {
+          agent: { slug: "opencode", name: "OpenCode", work_status: state.workStatus },
+          pending: { open_tasks: state.openTasks, unclaimed_team_tasks: state.unclaimedTasks, unread_messages: state.unreadMessages },
+          rules: { etag: "etag-1", effective: [], always: [], projects: [], layers: [] },
+        }
         return result({ content: [{ type: "text", text: JSON.stringify(data) }], structuredContent: data })
       }
       return json(200, { jsonrpc: "2.0", id: body.id, error: { code: -32601, message: "no such method" } })

@@ -29,6 +29,9 @@ Reconnecting later lands on the same agent. `/office` again reports who you are;
 | a session turns busy and no other session is | `checkin {status: "working", note: "opencode: <project dir>"}`, then a `checkin` heartbeat every 90 s |
 | the last busy session goes idle or is deleted | `checkin {status: "idle"}`, unless you are `blocked` (you asked Azri something and are waiting) |
 | OpenCode shuts down while busy | `idle`, with the same `blocked` check |
+| a new unread message or unclaimed task appears | the background poll appends a synthetic Office notice to the active or most recent session; no extra model turn |
+
+The plugin polls the Office inbox through `checkin` every 60 seconds while loaded. The first poll is a baseline, and later polls report only new message and task IDs. Polls skip the notification when no session has been seen yet.
 
 Reports run one after another, so a very short turn cannot land `idle` before `working`. Failures are logged through OpenCode's logger under the service `agent-office`, never with a token. One OpenCode process is one agent: two running at once on the same credentials overwrite each other's status.
 
@@ -40,6 +43,7 @@ Reports run one after another, so a very short turn cannot land `idle` before `w
 | `AGENT_OFFICE_TOKEN` | unset; an agent API token used instead of OAuth, so `/office` is not needed |
 | `AGENT_OFFICE_OPENCODE_CREDENTIALS` | `~/.config/agent-office/opencode.json` |
 | `AGENT_OFFICE_CALLBACK_PORT` | `41997`, the loopback port for the OAuth callback |
+| `AGENT_OFFICE_POLL_MS` | `60000`, inbox poll interval; minimum `1000` |
 
 ## Development
 

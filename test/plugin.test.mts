@@ -24,10 +24,11 @@ const mcpCalls = () => office.calls.filter((c) => c.path === "/mcp").map((c) => 
 
 // The V2 plugin context, reduced to the domains this plugin uses. Transforms
 // run immediately and again on reload, like the real registries.
-function makeContext(directory = "/home/x/agent-office") {
+function makeContext(directory = "/home/x/agent-office", options: Record<string, unknown> = {}) {
   const tools: any[] = []
   const commands: any[] = []
   const prompts: any[] = []
+  const synthetics: any[] = []
   const servers = new Map<string, any>()
   const transforms: ((editor: any) => void)[] = []
   const queue: any[] = []
@@ -44,7 +45,7 @@ function makeContext(directory = "/home/x/agent-office") {
   const ctx: any = {
     app: { name: "opencode", version: "2.0.11", channel: "latest" },
     location: { directory, project: { id: "project", directory, canonical: directory } },
-    options: {},
+    options,
     tool: {
       transform: async (callback: (editor: any) => void) => {
         callback({ list: () => tools, get: (id: string) => tools.find((tool) => tool.name === id), add: (tool: any) => tools.push(tool), update: () => {}, remove: () => {}, namespace: () => {} })
@@ -69,6 +70,7 @@ function makeContext(directory = "/home/x/agent-office") {
     },
     session: {
       prompt: async (prompt: any) => void prompts.push(prompt),
+      synthetic: async (message: any) => void synthetics.push(message),
     },
     event: {
       subscribe: (options?: { signal?: AbortSignal }) => {
@@ -94,6 +96,7 @@ function makeContext(directory = "/home/x/agent-office") {
     tools,
     commands,
     prompts,
+    synthetics,
     servers,
     push: (event: any) => {
       queue.push(event)
@@ -178,10 +181,10 @@ test("working while any session is busy, idle when all are quiet", async () => {
   harness.push({ type: "session.status", data: { sessionID: "a", status: { type: "busy" } } })
   harness.push({ type: "session.status", data: { sessionID: "b", status: { type: "retry", attempt: 1 } } })
   harness.push({ type: "session.idle", data: { sessionID: "a" } })
-  await until(() => mcpCalls().includes('Bearer access-1 checkin {"status":"working","note":"opencode: agent-office"}'), "the working report")
+  await until(() => mcpCalls().includes('Bearer access-1 checkin {"status":"working","note":"opencode: agent-office","rules_etag":"etag-1"}'), "the working report")
   harness.push({ type: "session.deleted", data: { sessionID: "b" } })
-  await until(() => mcpCalls().some((call) => call.endsWith('{"status":"idle","note":"opencode: agent-office"}')), "the idle report")
-  assert.deepEqual(mcpCalls(), ['Bearer access-1 checkin {"status":"working","note":"opencode: agent-office"}', "Bearer access-1 checkin {}", 'Bearer access-1 checkin {"status":"idle","note":"opencode: agent-office"}'])
+  await until(() => mcpCalls().some((call) => call.endsWith('{"status":"idle","note":"opencode: agent-office","rules_etag":"etag-1"}')), "the idle report")
+  assert.deepEqual(mcpCalls(), ['Bearer access-1 checkin {"status":"working","note":"opencode: agent-office","rules_etag":"etag-1"}', 'Bearer access-1 checkin {"rules_etag":"etag-1"}', 'Bearer access-1 checkin {"status":"idle","note":"opencode: agent-office","rules_etag":"etag-1"}'])
   office.calls.length = 0
 })
 
@@ -190,21 +193,40 @@ test("never overrides blocked", async () => {
   await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
   office.state.workStatus = "blocked" // the model asked Azri something through `ask`
   harness.push({ type: "session.status", data: { sessionID: "c", status: { type: "idle" } } })
-  await until(() => mcpCalls().includes("Bearer access-1 checkin {}"), "the blocked check")
+  await until(() => mcpCalls().includes('Bearer access-1 checkin {"rules_etag":"etag-1"}'), "the blocked check")
   await tick()
-  assert.deepEqual(mcpCalls(), ['Bearer access-1 checkin {"status":"working","note":"opencode: agent-office"}', "Bearer access-1 checkin {}"])
+  assert.deepEqual(mcpCalls(), ['Bearer access-1 checkin {"status":"working","note":"opencode: agent-office","rules_etag":"etag-1"}', 'Bearer access-1 checkin {"rules_etag":"etag-1"}'])
   office.state.workStatus = "idle"
+  office.calls.length = 0
+})
+
+test("polls and notifies the active session about new Office items", async () => {
+  office.calls.length = 0
+  const polled = makeContext("/poll", { pollInterval: 1_000 })
+  const cleanup = await plugin.setup(polled.ctx)
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  office.calls.length = 0
+  polled.push({ type: "session.status", data: { sessionID: "p", status: { type: "busy" } } })
+  await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
+  office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-new", from: "azri", subject: "New work" }]
+  await until(() => polled.synthetics.length > 0, "the poll notification")
+  assert.equal(polled.synthetics[0].sessionID, "p")
+  assert.match(polled.synthetics[0].text, /1 new unread message/)
+  assert.match(polled.synthetics[0].text, /message:message-new/)
+  await cleanup()
   office.calls.length = 0
 })
 
 test("cleanup reports idle while a session is still busy", async () => {
   const fresh = makeContext("/tmp/x")
   const cleanup = await plugin.setup(fresh.ctx)
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  office.calls.length = 0
   fresh.push({ type: "session.status", data: { sessionID: "z", status: { type: "busy" } } })
   await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
   office.calls.length = 0
   await cleanup()
-  assert.deepEqual(mcpCalls(), ["Bearer access-1 checkin {}", 'Bearer access-1 checkin {"status":"idle","note":"opencode: x"}'])
+  assert.deepEqual(mcpCalls(), ['Bearer access-1 checkin {"rules_etag":"etag-1"}', 'Bearer access-1 checkin {"status":"idle","note":"opencode: x","rules_etag":"etag-1"}'])
   office.calls.length = 0
 })
 
