@@ -847,6 +847,9 @@ export default Plugin.define({
             content: JSON.stringify(
               {
                 location: ctx.location.directory,
+                canonical: ctx.location.project?.canonical,
+                credentialsFile,
+                tokenScope: process.env.AGENT_OFFICE_TOKEN_SCOPE ?? "repo",
                 plugin: ctx.app.version,
                 mode: dispatchMode,
                 pollInterval,
