@@ -498,6 +498,7 @@ export default Plugin.define({
     let lastPromptAt: number | undefined
     let lastPromptError: string | undefined
     let lastPending: Record<string, number> | undefined
+    let ownAgent: { id?: string; slug?: string } | undefined
 
     // Reports run one after another so a short turn cannot land idle before working.
     const report = (status: "working" | "idle") => {
@@ -747,7 +748,13 @@ export default Plugin.define({
     // Polling reports only new items. The first successful checkin is a
     // baseline: existing unread mail is already visible through checkin.
     const observePending = async (pending: any, live: boolean) => {
-      const messages: any[] = Array.isArray(pending?.unread_messages) ? pending.unread_messages : []
+      const messages: any[] = (Array.isArray(pending?.unread_messages) ? pending.unread_messages : []).filter((item: any) => {
+        const sender = item?.sender
+        if (!sender || !ownAgent) return true
+        if (ownAgent.id && sender.id === ownAgent.id) return false
+        if (ownAgent.slug && sender.slug === ownAgent.slug) return false
+        return true
+      })
       const tasks: any[] = Array.isArray(pending?.unclaimed_team_tasks) ? pending.unclaimed_team_tasks : []
       const assigned: any[] = Array.isArray(pending?.open_tasks) ? pending.open_tasks : []
       const freshMessages = messages.filter((item) => !seenMessages.has(itemKey(item, "message")))
@@ -816,6 +823,7 @@ export default Plugin.define({
         if (!(await bearer())) return
         const me = await checkin()
         adoptAgent(me.agent?.slug)
+        ownAgent = me.agent
         lastPollAt = Date.now()
         lastPollError = undefined
         await observePending(me.pending, true)
@@ -901,6 +909,7 @@ export default Plugin.define({
           await ensureConnected()
           const me = await checkin()
           adoptAgent(me.agent?.slug)
+          ownAgent = me.agent
           await observePending(me.pending, false)
           const pending = me.pending ?? {}
           return {

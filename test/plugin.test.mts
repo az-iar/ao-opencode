@@ -261,13 +261,14 @@ test("polls and notifies the active session about new Office items", async () =>
   office.calls.length = 0
   polled.push({ type: "session.status", data: { sessionID: "p", status: { type: "busy" } } })
   await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
-  office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-new", from: "azri", subject: "New work" }]
+  office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-self", sender: { slug: "opencode" }, body: "self" }, { id: "message-new", from: "azri", subject: "New work" }]
   await until(() => polled.prompts.some((prompt) => prompt.text.includes("message-new")), "the inbox prompt")
   const prompt = polled.prompts.find((item) => item.text.includes("message-new"))!
   assert.equal(prompt.sessionID, "p")
   assert.match(prompt.text, /new message/)
   assert.match(prompt.text, /message:message-new/)
   assert.match(prompt.text, /post_message/)
+  assert.doesNotMatch(prompt.text, /message-self/)
   await cleanup()
   office.calls.length = 0
 })
