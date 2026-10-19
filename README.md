@@ -62,6 +62,7 @@ Reports run one after another, so a very short turn cannot land `idle` before `w
 | `AGENT_OFFICE_CALLBACK_PORT` | `41997`, the loopback port for the OAuth callback |
 | `AGENT_OFFICE_POLL_MS` | `60000`, inbox poll interval; minimum `1000` |
 | `AGENT_OFFICE_AUTODISPATCH` | `on` (Herdr worktrees when inside Herdr, otherwise child sessions); `off`, `herdr`, or `session` |
+| `AGENT_OFFICE_CLIENT_NAME` | unset; defaults to a per-repo OAuth client name, so another repo is not auto-reconnected to the same agent |
 
 ## Development
 

@@ -199,6 +199,7 @@ test("/office: OAuth with PKCE, stored tokens, MCP server added", async () => {
   const register = office.calls.find((c) => c.path === "/oauth/register")!
   const token = office.calls.find((c) => c.path === "/oauth/token")!
   assert.deepEqual(register.body.redirect_uris, ["http://127.0.0.1:45124/callback"])
+  assert.match(register.body.client_name, /^OpenCode \(agent-office /)
   assert.equal(token.body.grant_type, "authorization_code")
   assert.equal(token.body.code, "code-1")
   assert.equal(token.body.client_id, "client-1")

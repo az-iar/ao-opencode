@@ -14,6 +14,7 @@
 //   AGENT_OFFICE_CALLBACK_PORT         loopback port for the OAuth callback, default 41997
 //   AGENT_OFFICE_POLL_MS               inbox poll interval, default 60000
 //   AGENT_OFFICE_AUTODISPATCH          on (default), off, herdr, or session
+//   AGENT_OFFICE_CLIENT_NAME           OAuth client name; defaults to a per-repo name
 //
 // Tokens are never logged.
 
@@ -161,12 +162,12 @@ async function tokenRequest(client_id: string, form: Record<string, string>): Pr
   return { office: OFFICE, client_id, access_token: body.access_token, refresh_token: body.refresh_token, expires_at: Date.now() + body.expires_in * 1000 }
 }
 
-async function registerClient(callback: string): Promise<string> {
+async function registerClient(callback: string, clientName: string): Promise<string> {
   const res = await fetch(`${OFFICE}/oauth/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      client_name: "OpenCode",
+      client_name: clientName,
       redirect_uris: [callback],
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
@@ -259,13 +260,13 @@ function listenForCode(state: string): Promise<{ port: number; code: Promise<str
   })
 }
 
-async function authorize(onUrl: (url: string) => void): Promise<Credentials> {
+async function authorize(onUrl: (url: string) => void, clientName: string): Promise<Credentials> {
   const verifier = randomBytes(32).toString("base64url")
   const state = randomBytes(16).toString("base64url")
   const listener = await listenForCode(state)
   const callback = callbackUrl(listener.port)
   try {
-    const client_id = await registerClient(callback)
+    const client_id = await registerClient(callback, clientName)
     const url = new URL(`${OFFICE}/oauth/authorize`)
     url.search = new URLSearchParams({
       response_type: "code",
@@ -298,6 +299,9 @@ export default Plugin.define({
     const life = new AbortController()
     const locationKey = createHash("sha256").update(ctx.location.directory).digest("hex").slice(0, 16)
     const sessionStoreKey = `last-session:${locationKey}`
+    const tokenScope = process.env.AGENT_OFFICE_TOKEN_SCOPE ?? "repo"
+    const credentialKey = tokenScope === "folder" ? ctx.location.directory : tokenScope === "global" ? "global" : (ctx.location.project?.canonical ?? ctx.location.directory)
+    const clientName = process.env.AGENT_OFFICE_CLIENT_NAME ?? (tokenScope === "global" ? "OpenCode" : `OpenCode (${basename(credentialKey)} ${createHash("sha256").update(credentialKey).digest("hex").slice(0, 6)})`)
 
     const credentialsFile = credentialsPath(ctx.location.directory, ctx.location.project?.canonical)
     const dispatchDir = join(dirname(credentialsFile), "dispatch")
@@ -825,7 +829,7 @@ export default Plugin.define({
             credentials = next
             connected = undefined
           } else if (reconnect || !(await bearer())) {
-            credentials = await authorize((url) => void toolCtx.progress({ title: "Approve OpenCode in the browser", metadata: { url } }))
+            credentials = await authorize((url) => void toolCtx.progress({ title: "Approve OpenCode in the browser", metadata: { url } }), clientName)
             saveCredentials(credentialsFile, credentials)
             connected = undefined
           }
@@ -849,7 +853,8 @@ export default Plugin.define({
                 location: ctx.location.directory,
                 canonical: ctx.location.project?.canonical,
                 credentialsFile,
-                tokenScope: process.env.AGENT_OFFICE_TOKEN_SCOPE ?? "repo",
+                tokenScope,
+                clientName,
                 plugin: ctx.app.version,
                 mode: dispatchMode,
                 pollInterval,
