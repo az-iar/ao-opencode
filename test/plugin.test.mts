@@ -178,6 +178,10 @@ test("registers the /office command and the office_connect tool", async () => {
   await command.execute({ sessionID: "s1", prompt: { text: "please" }, delivery: "steer" })
   assert.equal(harness.prompts.at(-1).sessionID, "s1")
   assert.match(harness.prompts.at(-1).text, /^Connect this OpenCode to Agent Office with the office_connect tool using agent_name "please" and tell me what it returned\.$/)
+  await command.execute({ sessionID: "s1", prompt: { text: "register my agent" }, delivery: "steer" })
+  assert.match(harness.prompts.at(-1).text, /agent_name "my agent"/)
+  await command.execute({ sessionID: "s1", prompt: { text: "status" }, delivery: "steer" })
+  assert.match(harness.prompts.at(-1).text, /office_status/)
   assert.equal(harness.tools[0].name, "office_connect")
   assert.equal(harness.tools[0].input.properties.reconnect.type, "boolean")
   assert.equal(harness.tools[0].input.properties.agent_name.type, "string")
@@ -211,7 +215,7 @@ test("/office: OAuth with PKCE, stored tokens, MCP server added", async () => {
   const register = office.calls.find((c) => c.path === "/oauth/register")!
   const token = office.calls.find((c) => c.path === "/oauth/token")!
   assert.deepEqual(register.body.redirect_uris, ["http://127.0.0.1:45124/callback"])
-  assert.match(register.body.client_name, /^agent-office$/)
+  assert.match(register.body.client_name, /^agent-office@[^@]+$/)
   assert.equal(token.body.grant_type, "authorization_code")
   assert.equal(token.body.code, "code-1")
   assert.equal(token.body.client_id, "client-1")

@@ -20,6 +20,16 @@ In OpenCode, run `/office`. The model calls the plugin's `office_connect` tool, 
 2. waits, up to five minutes, for you to sign in to the dashboard and approve, as a new agent named "OpenCode" or an existing one;
 3. stores the token under `~/.config/agent-office/opencode/agents/<agent>.json` (mode 0600), records the chosen agent for this workspace in `workspaces/<hash>.json`, adds the `office` MCP server to OpenCode, and checks in.
 
+`/office` subcommands:
+
+| Command | Action |
+|---|---|
+| `/office` | connect or report the current agent |
+| `/office register <name>` | connect and pre-fill a new agent name |
+| `/office status` | show the plugin's poll, session, and credential state |
+| `/office reconnect` | force a fresh OAuth approval |
+| `/office <name>` | alias for `register <name>` |
+
 Reconnecting later lands on the same agent. `/office` again reports who you are; ask for `reconnect` to approve afresh. Run `/office <name>` to pre-fill the new agent name on the approval page. Access tokens last an hour and the plugin refreshes them on its own.
 
 The loopback callback starts at `AGENT_OFFICE_CALLBACK_PORT` and tries the next 19 ports if it is busy. If the browser runs on another machine or cannot reach loopback, copy the full `http://127.0.0.1:.../callback?...` URL and ask the model to finish with `office_connect` and `callback_url`.
@@ -58,7 +68,7 @@ Reports run one after another, so a very short turn cannot land `idle` before `w
 | `AGENT_OFFICE_URL` | `https://office.byma.tech` |
 | `AGENT_OFFICE_TOKEN` | unset; an agent API token used instead of OAuth, so `/office` is not needed |
 | `AGENT_OFFICE_OPENCODE_CREDENTIALS` | unset; an exact credentials file that overrides agent-scoped storage |
-| `AGENT_OFFICE_CLIENT_NAME` | unset; OAuth client name and new-agent prefill, defaults to the workspace folder name |
+| `AGENT_OFFICE_CLIENT_NAME` | unset; OAuth client name and new-agent prefill, defaults to `<folder>@<hostname>` |
 | `AGENT_OFFICE_CALLBACK_PORT` | `41997`, the loopback port for the OAuth callback |
 | `AGENT_OFFICE_POLL_MS` | `60000`, inbox poll interval; minimum `1000` |
 | `AGENT_OFFICE_AUTODISPATCH` | `on` (Herdr worktrees when inside Herdr, otherwise child sessions); `off`, `herdr`, or `session` |

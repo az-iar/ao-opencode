@@ -14,7 +14,7 @@
 //   AGENT_OFFICE_CALLBACK_PORT         loopback port for the OAuth callback, default 41997
 //   AGENT_OFFICE_POLL_MS               inbox poll interval, default 60000
 //   AGENT_OFFICE_AUTODISPATCH          on (default), off, herdr, or session
-//   AGENT_OFFICE_CLIENT_NAME           OAuth client name; defaults to the folder name
+//   AGENT_OFFICE_CLIENT_NAME           OAuth client name; defaults to folder@host
 //
 // Tokens are never logged.
 
@@ -23,7 +23,7 @@ import { spawn } from "node:child_process"
 import { createHash, randomBytes } from "node:crypto"
 import { mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { createServer } from "node:http"
-import { homedir } from "node:os"
+import { homedir, hostname } from "node:os"
 import { basename, dirname, join } from "node:path"
 
 const OFFICE = (process.env.AGENT_OFFICE_URL ?? "https://office.byma.tech").replace(/\/+$/, "")
@@ -324,7 +324,7 @@ export default Plugin.define({
     const life = new AbortController()
     const locationKey = createHash("sha256").update(ctx.location.directory).digest("hex").slice(0, 16)
     const sessionStoreKey = `last-session:${locationKey}`
-    const clientName = process.env.AGENT_OFFICE_CLIENT_NAME ?? (basename(ctx.location.directory) || "OpenCode")
+    const clientName = process.env.AGENT_OFFICE_CLIENT_NAME ?? `${basename(ctx.location.directory) || "OpenCode"}@${hostname().split(".")[0]}`
 
     const legacyCredentialsFile = credentialsPath(ctx.location.directory, ctx.location.project?.canonical)
     const pointerFile = agentPointerPath(ctx.location.directory)
@@ -831,12 +831,25 @@ export default Plugin.define({
     await ctx.command.transform((editor) => {
       editor.add({
         name: "office",
-        description: "Connect to Agent Office",
+        description: "Connect to Agent Office: register an agent, check status, or reconnect",
         execute: async ({ sessionID, prompt, delivery }) => {
-          const requested = prompt.text.trim()
-          const request = requested
-            ? `Connect this OpenCode to Agent Office with the office_connect tool using agent_name ${JSON.stringify(requested)} and tell me what it returned.`
-            : "Connect this OpenCode to Agent Office with the office_connect tool and tell me what it returned."
+          const input = prompt.text.trim()
+          const [verb, ...rest] = input.split(/\s+/)
+          const argument = rest.join(" ").trim()
+          let request: string
+          if (!input) {
+            request = "Connect this OpenCode to Agent Office with the office_connect tool and tell me what it returned."
+          } else if (verb === "status") {
+            request = "Call the office_status tool and report the result in short bullet points."
+          } else if (verb === "reconnect") {
+            request = "Call office_connect with reconnect true, then tell me what it returned."
+          } else if (verb === "register") {
+            request = argument
+              ? `Connect this OpenCode to Agent Office with the office_connect tool using agent_name ${JSON.stringify(argument)} and tell me what it returned.`
+              : "Ask me for the agent name, then call office_connect with agent_name and tell me what it returned."
+          } else {
+            request = `Connect this OpenCode to Agent Office with the office_connect tool using agent_name ${JSON.stringify(input)} and tell me what it returned.`
+          }
           await ctx.session.prompt({
             ...prompt,
             sessionID,
