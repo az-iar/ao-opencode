@@ -328,7 +328,11 @@ export default Plugin.define({
 
     const legacyCredentialsFile = credentialsPath(ctx.location.directory, ctx.location.project?.canonical)
     const pointerFile = agentPointerPath(ctx.location.directory)
-    const pointedAgent = CREDENTIALS_OVERRIDE ? undefined : loadAgentPointer(pointerFile)
+    const repoPointerFile = agentPointerPath(ctx.location.project?.canonical ?? ctx.location.directory)
+    const pointedAgent =
+      CREDENTIALS_OVERRIDE
+        ? undefined
+        : loadAgentPointer(pointerFile) ?? (repoPointerFile !== pointerFile ? loadAgentPointer(repoPointerFile) : undefined)
     let credentialsFile = pointedAgent ? agentCredentialsPath(pointedAgent) : legacyCredentialsFile
     const usingCredentialsOverride = Boolean(CREDENTIALS_OVERRIDE)
     let credentials = loadCredentials(credentialsFile)
@@ -917,6 +921,7 @@ export default Plugin.define({
                 credentialsFile,
                 tokenStorage: usingCredentialsOverride ? "override" : "agent",
                 agentPointer: pointerFile,
+                repoAgentPointer: repoPointerFile,
                 clientName,
                 plugin: ctx.app.version,
                 mode: dispatchMode,
