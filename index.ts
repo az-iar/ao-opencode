@@ -8,7 +8,8 @@
 //
 //   AGENT_OFFICE_URL                   dashboard origin, default https://office.byma.tech
 //   AGENT_OFFICE_TOKEN                 an agent API token instead of OAuth (optional)
-//   AGENT_OFFICE_OPENCODE_CREDENTIALS  default ~/.config/agent-office/opencode.json
+//   AGENT_OFFICE_OPENCODE_CREDENTIALS  exact credentials file, overrides the per-repo default
+//   AGENT_OFFICE_TOKEN_SCOPE           repo (default), folder, or global
 //   AGENT_OFFICE_CALLBACK_PORT         loopback port for the OAuth callback, default 41997
 //   AGENT_OFFICE_POLL_MS               inbox poll interval, default 60000
 //
@@ -23,7 +24,8 @@ import { homedir } from "node:os"
 import { basename, dirname, join } from "node:path"
 
 const OFFICE = (process.env.AGENT_OFFICE_URL ?? "https://office.byma.tech").replace(/\/+$/, "")
-const CREDENTIALS = process.env.AGENT_OFFICE_OPENCODE_CREDENTIALS ?? join(homedir(), ".config", "agent-office", "opencode.json")
+const CREDENTIALS_OVERRIDE = process.env.AGENT_OFFICE_OPENCODE_CREDENTIALS
+const CREDENTIALS_DIR = join(homedir(), ".config", "agent-office", "opencode")
 const CALLBACK_PORT = Number(process.env.AGENT_OFFICE_CALLBACK_PORT ?? 41997)
 const CALLBACK = `http://127.0.0.1:${CALLBACK_PORT}/callback`
 const SCOPES = "office:read office:write office:events"
@@ -43,18 +45,29 @@ function itemKey(item: any, kind: "message" | "task"): string {
   return `${kind}:${JSON.stringify(item)}`
 }
 
-function loadCredentials(): Credentials | undefined {
+// One token per repo by default. Worktrees share the canonical project root;
+// `AGENT_OFFICE_TOKEN_SCOPE=folder` keys by the loaded directory instead.
+export function credentialsPath(directory: string, canonical?: string, override = CREDENTIALS_OVERRIDE, scope = process.env.AGENT_OFFICE_TOKEN_SCOPE ?? "repo"): string {
+  if (override) return override
+  if (scope === "global") return join(homedir(), ".config", "agent-office", "opencode.json")
+  const key = scope === "folder" ? directory : (canonical ?? directory)
+  const hash = createHash("sha256").update(key).digest("hex").slice(0, 16)
+  const slug = basename(key).replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40)
+  return join(CREDENTIALS_DIR, `${slug || "workspace"}-${hash}.json`)
+}
+
+function loadCredentials(path: string): Credentials | undefined {
   try {
-    const c = JSON.parse(readFileSync(CREDENTIALS, "utf8")) as Credentials
+    const c = JSON.parse(readFileSync(path, "utf8")) as Credentials
     return c.office === OFFICE ? c : undefined
   } catch {
     return undefined
   }
 }
 
-function saveCredentials(c: Credentials) {
-  mkdirSync(dirname(CREDENTIALS), { recursive: true, mode: 0o700 })
-  writeFileSync(CREDENTIALS, JSON.stringify(c, null, 2) + "\n", { mode: 0o600 })
+function saveCredentials(path: string, c: Credentials) {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+  writeFileSync(path, JSON.stringify(c, null, 2) + "\n", { mode: 0o600 })
 }
 
 async function tokenRequest(client_id: string, form: Record<string, string>): Promise<Credentials> {
@@ -155,7 +168,8 @@ export default Plugin.define({
       console.warn(`[agent-office] ${message}${extra ? ` ${JSON.stringify(extra)}` : ""}`)
     }
 
-    let credentials = loadCredentials()
+    const credentialsFile = credentialsPath(ctx.location.directory, ctx.location.project?.canonical)
+    let credentials = loadCredentials(credentialsFile)
     let refreshing: Promise<Credentials> | undefined
 
     // The bearer for every Office call: the API token from the environment, or
@@ -168,7 +182,7 @@ export default Plugin.define({
         refreshing ??= tokenRequest(credentials.client_id, { grant_type: "refresh_token", refresh_token: credentials.refresh_token })
           .then((next) => {
             credentials = next
-            saveCredentials(next)
+            saveCredentials(credentialsFile, next)
             return next
           })
           .finally(() => {
@@ -358,7 +372,7 @@ export default Plugin.define({
           const { reconnect } = input as { reconnect?: boolean }
           if (reconnect || !(await bearer())) {
             credentials = await authorize((url) => void toolCtx.progress({ title: "Approve OpenCode in the browser", metadata: { url } }))
-            saveCredentials(credentials)
+            saveCredentials(credentialsFile, credentials)
             connected = undefined
           }
           await ensureConnected()

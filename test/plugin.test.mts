@@ -107,6 +107,7 @@ function makeContext(directory = "/home/x/agent-office", options: Record<string,
 }
 
 let plugin: any
+let credentialsPath: (directory: string, canonical?: string, override?: string, scope?: string) => string
 let harness: ReturnType<typeof makeContext>
 let cleanupFirst: (() => Promise<void>) | undefined
 const warnings: string[] = []
@@ -115,8 +116,9 @@ const originalWarn = console.warn
 before(async () => {
   process.env.AGENT_OFFICE_URL = (await office.listen()) + "/"
   console.warn = (...args: unknown[]) => void warnings.push(args.join(" "))
-  const { default: definition } = await import("../index.ts")
+  const { default: definition, credentialsPath: deriveCredentials } = await import("../index.ts")
   plugin = definition
+  credentialsPath = deriveCredentials
   harness = makeContext()
   cleanupFirst = await plugin.setup(harness.ctx)
 })
@@ -128,6 +130,17 @@ after(async () => {
 
 test("defines the agent-office plugin", () => {
   assert.equal(plugin.id, "agent-office")
+})
+
+test("credentials are scoped per repo, not per folder", () => {
+  const root = credentialsPath("/work/repo", "/work/repo", "", "repo")
+  const nested = credentialsPath("/work/repo/subdir", "/work/repo", "", "repo")
+  const other = credentialsPath("/work/other", "/work/other", "", "repo")
+  assert.equal(root, nested)
+  assert.notEqual(root, other)
+  assert.match(root, /\/agent-office\/opencode\/repo-[a-f0-9]{16}\.json$/)
+  assert.notEqual(credentialsPath("/work/repo", "/work/repo", "", "folder"), credentialsPath("/work/repo/subdir", "/work/repo", "", "folder"))
+  assert.match(credentialsPath("/work/repo", "/work/repo", "", "global"), /\/agent-office\/opencode\.json$/)
 })
 
 test("registers the /office command and the office_connect tool", async () => {

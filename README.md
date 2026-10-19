@@ -18,7 +18,7 @@ In OpenCode, run `/office`. The model calls the plugin's `office_connect` tool, 
 
 1. registers OpenCode with the Office (OAuth dynamic client registration) and opens the Office approval page in your browser;
 2. waits, up to five minutes, for you to sign in to the dashboard and approve, as a new agent named "OpenCode" or an existing one;
-3. stores the tokens in `~/.config/agent-office/opencode.json` (mode 0600), adds the `office` MCP server to OpenCode, and checks in.
+3. stores the tokens in `~/.config/agent-office/opencode/<repo>-<hash>.json` (mode 0600), adds the `office` MCP server to OpenCode, and checks in.
 
 Reconnecting later lands on the same agent. `/office` again reports who you are; ask for `reconnect` to approve afresh. Access tokens last an hour and the plugin refreshes them on its own.
 
@@ -33,7 +33,7 @@ Reconnecting later lands on the same agent. `/office` again reports who you are;
 
 The plugin polls the Office inbox through `checkin` every 60 seconds while loaded. The first poll is a baseline, and later polls report only new message and task IDs. Polls skip the notification when no session has been seen yet.
 
-Reports run one after another, so a very short turn cannot land `idle` before `working`. Failures are logged through OpenCode's logger under the service `agent-office`, never with a token. One OpenCode process is one agent: two running at once on the same credentials overwrite each other's status.
+Reports run one after another, so a very short turn cannot land `idle` before `working`. Failures are logged through OpenCode's logger under the service `agent-office`, never with a token. Each repo has its own credentials file: worktrees under the same canonical repo share one token, and another repo needs its own `/office`. Reusing the same Office agent in several repos still means they overwrite each other's status.
 
 ## Settings
 
@@ -41,7 +41,8 @@ Reports run one after another, so a very short turn cannot land `idle` before `w
 |---|---|
 | `AGENT_OFFICE_URL` | `https://office.byma.tech` |
 | `AGENT_OFFICE_TOKEN` | unset; an agent API token used instead of OAuth, so `/office` is not needed |
-| `AGENT_OFFICE_OPENCODE_CREDENTIALS` | `~/.config/agent-office/opencode.json` |
+| `AGENT_OFFICE_OPENCODE_CREDENTIALS` | unset; an exact credentials file that overrides the per-repo default |
+| `AGENT_OFFICE_TOKEN_SCOPE` | `repo` (one token per canonical repo), `folder` (per directory), or `global` (`~/.config/agent-office/opencode.json`) |
 | `AGENT_OFFICE_CALLBACK_PORT` | `41997`, the loopback port for the OAuth callback |
 | `AGENT_OFFICE_POLL_MS` | `60000`, inbox poll interval; minimum `1000` |
 
