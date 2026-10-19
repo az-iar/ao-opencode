@@ -395,6 +395,8 @@ export default Plugin.define({
     let lastPollError: string | undefined
     let lastEventAt: number | undefined
     let lastEventType: string | undefined
+    let lastEventDirectory: string | undefined
+    let lastEventSessionID: string | undefined
     let lastPromptAt: number | undefined
     let lastPromptError: string | undefined
     let lastPending: Record<string, number> | undefined
@@ -774,6 +776,8 @@ export default Plugin.define({
                 lastPollError,
                 lastEventAt: lastEventAt ? new Date(lastEventAt).toISOString() : undefined,
                 lastEventType,
+                lastEventDirectory,
+                lastEventSessionID,
                 lastSessionID,
                 targetSession: targetSession(),
                 busy: [...busy],
@@ -798,7 +802,11 @@ export default Plugin.define({
           lastEventAt = Date.now()
           lastEventType = event.type
           const directory = (event as any).location?.directory
+          lastEventDirectory = directory
           if (directory && directory !== ctx.location.directory) continue
+          const eventSessionID = (event as any).data?.sessionID
+          lastEventSessionID = typeof eventSessionID === "string" ? eventSessionID : undefined
+          if (lastEventSessionID && !dispatchedSessions.has(lastEventSessionID)) rememberSession(lastEventSessionID)
           void ensureConnected()
           switch (event.type) {
             case "session.status": {
