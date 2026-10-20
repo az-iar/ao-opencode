@@ -846,10 +846,16 @@ export default Plugin.define({
     // baseline: existing unread mail is already visible through checkin.
     const observePending = async (pending: any, live: boolean) => {
       const messages: any[] = (Array.isArray(pending?.unread_messages) ? pending.unread_messages : []).filter((item: any) => {
+        if (!ownAgent) return true
+        const from = item?.from
+        if (typeof from === "string" && ownAgent.slug && from.toLowerCase() === ownAgent.slug.toLowerCase()) return false
         const sender = item?.sender
-        if (!sender || !ownAgent) return true
-        if (ownAgent.id && sender.id === ownAgent.id) return false
-        if (ownAgent.slug && sender.slug === ownAgent.slug) return false
+        if (typeof sender === "string" && ownAgent.slug && sender.toLowerCase() === ownAgent.slug.toLowerCase()) return false
+        if (sender && typeof sender === "object") {
+          if (ownAgent.id && sender.id === ownAgent.id) return false
+          if (ownAgent.slug && sender.slug?.toLowerCase() === ownAgent.slug.toLowerCase()) return false
+        }
+        if (ownAgent.slug && item?.agent?.slug?.toLowerCase() === ownAgent.slug.toLowerCase()) return false
         return true
       })
       const tasks: any[] = Array.isArray(pending?.unclaimed_team_tasks) ? pending.unclaimed_team_tasks : []
