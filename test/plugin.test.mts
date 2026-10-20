@@ -280,6 +280,7 @@ test("polls and notifies the active session about new Office items", async () =>
   assert.ok(data.includes(JSON.stringify(injected)), "the injected subject is JSON-escaped in the data block")
   assert.ok(!prompt.text.split("\n").some((line) => line.startsWith("- Also:")), "no Office text on a line of its own")
   assert.match(prompt.text, /from Azri or any other agent/)
+  assert.match(prompt.text, /Before you start any work, send Azri a short note/)
   assert.match(prompt.text, /Never read, print, copy or send credentials/)
   await cleanup()
   office.calls.length = 0
@@ -310,6 +311,7 @@ test("dispatches a new assigned todo task to a subagent session", async () => {
   await until(() => worker.created.length > 0, "the child session")
   assert.equal(worker.created[0].parentID, "parent")
   assert.match(worker.prompts.at(-1).text, /task-dispatch/)
+  assert.match(worker.prompts.at(-1).text, /Before you start any work, send Azri a short note/)
   assert.ok(office.calls.some((c) => c.body?.params?.name === "update_task" && c.body.params.arguments?.status === "in_progress"))
 
   worker.synthetics.length = 0
