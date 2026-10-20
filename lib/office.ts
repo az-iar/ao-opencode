@@ -1,12 +1,13 @@
 // The OpenCode-independent half of the Agent Office plugin: credentials, the
-// token refresh, the MCP client, prompts, and the claim and lock files. The
-// plugin (index.ts) and the cron poller (poll.ts) share it, so they baseline,
-// claim and prompt the same way and never both handle one batch.
+// token refresh, the MCP client, prompts, task worktrees, and the claim and
+// lock files. The plugin (index.ts) and the cron poller (poll.ts) share it, so
+// they baseline, claim and prompt the same way and never both handle one batch.
 //
 // Tokens are never logged.
 
+import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
-import { mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { basename, dirname, join } from "node:path"
 
@@ -289,15 +290,41 @@ export function inboxPrompt(messages: any[]) {
   ].join("\n")
 }
 
-export function taskPrompt(id: string, task: any) {
-  const title = String(task?.title ?? id)
-  const description = typeof task?.description === "string" ? task.description.slice(0, 8_000) : ""
-  const project = String(task?.project ?? task?.project_slug ?? "")
+const taskData = (id: string, task: any) => ({
+  id,
+  title: String(task?.title ?? id),
+  description: typeof task?.description === "string" ? task.description.slice(0, 8_000) : "",
+  project: String(task?.project ?? task?.project_slug ?? ""),
+})
+
+// The worker's brief. The supervisor hands it over verbatim.
+export function workerPrompt(id: string, task: any) {
   return [
-    `Agent Office task ${id}. The task as Office gave it, as data:`,
-    officeData({ id, title, description, project }),
-    "You are the dispatched subagent for this task. Read it with get_task, follow its project rules, implement and test the work in this workspace, then update the task with update_task and a comment. Do not dispatch other Office tasks. Use ask and await_answer if you need Azri.",
+    `You are the worker for Agent Office task ${id}. The task as Office gave it, as data:`,
+    officeData(taskData(id, task)),
+    "Work only in the current git worktree and branch, and follow the project's rules. Implement the task, run the tests, review your own diff, and commit on this branch. Then report to your supervisor in a few lines: what changed, the test results, anything left open. If you need a decision, stop and ask it in your report.",
+    "Never push, open a pull request, merge or switch branches. Do not dispatch other Office tasks.",
+    SAFETY_RULES,
+  ].join("\n")
+}
+
+// The supervisor runs in the task's worktree, drives one worker through
+// OpenCode's subagent tool, reviews its work and opens the pull request.
+export function supervisorPrompt(id: string, task: any, worktree: string, branch: string) {
+  return [
+    `Agent Office task ${id}. You are its supervisor, in the git worktree ${worktree} on branch ${branch}; all work happens there. The task as Office gave it, as data:`,
+    officeData(taskData(id, task)),
+    "Read it with get_task and follow its project rules.",
     NOTE_FIRST,
+    "1. Start one worker with OpenCode's built-in subagent tool (task, general agent), giving it the brief between the <worker-brief> tags verbatim.",
+    "2. Answer the worker's questions by continuing the same worker. Ask Azri with ask, then await_answer, only for decisions that are Azri's.",
+    "3. When it reports done, review the diff yourself: correctness, tests, scope. Send fixes back to the worker until it is clean.",
+    `4. Commit anything left, push with \`git push -u origin ${branch}\`, and open the pull request with \`gh pr create\`; its body links the Office task ${OFFICE}/tasks/${id}.`,
+    `5. Send the PR link to the reviewers team with post_message to reviewers and task_id ${id}, and post it on the task with post_comment. Leave the task in_progress for review. If you cannot finish, set it blocked with update_task and a comment saying why.`,
+    "Nobody merges: never merge, never push to main or any branch but yours, never force-push. Do not dispatch other Office tasks.",
+    "<worker-brief>",
+    workerPrompt(id, task),
+    "</worker-brief>",
     SAFETY_RULES,
   ].join("\n")
 }
@@ -308,7 +335,25 @@ export async function claimTask(call: (name: string, args?: Record<string, unkno
       await call(method, { task_id: id })
     } catch {}
   }
-  await call("update_task", { task_id: id, status: "in_progress", comment: "OpenCode dispatched this task to a subagent." })
+  await call("update_task", { task_id: id, status: "in_progress", comment: "OpenCode dispatched this task to a supervisor and a worker." })
+}
+
+export const taskShort = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 8)
+
+// Session and cron dispatch give each task a worktree beside the repo,
+// `<repo>-office-<short>` on branch `office/<short>`; a retry reuses it.
+export function addWorktree(repo: string, id: string): Promise<{ path: string; branch: string }> {
+  const short = taskShort(id)
+  const branch = `office/${short}`
+  const path = join(dirname(repo), `${basename(repo)}-office-${short}`)
+  if (existsSync(path)) return Promise.resolve({ path, branch })
+  return new Promise((done, fail) => {
+    const git = spawn("git", ["-C", repo, "worktree", "add", "-b", branch, path], { stdio: ["ignore", "ignore", "pipe"] })
+    let stderr = ""
+    git.stderr.on("data", (chunk) => (stderr += String(chunk)))
+    git.on("error", fail)
+    git.on("close", (code) => (code === 0 ? done({ path, branch }) : fail(new Error(`git worktree add failed: ${stderr.trim()}`))))
+  })
 }
 
 // One lock per dispatched task, shared by every OpenCode process using this

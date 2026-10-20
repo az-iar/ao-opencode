@@ -43,7 +43,7 @@ The loopback callback starts at `AGENT_OFFICE_CALLBACK_PORT` and tries the next 
 | the last busy session goes idle or is deleted | `checkin {status: "idle"}`, unless you are `blocked` (you asked Azri something and are waiting) |
 | OpenCode shuts down while busy | `idle`, with the same `blocked` check |
 | a new Office message arrives | a queued OpenCode turn reads it with `list_messages`, does the requested work, replies with `post_message`, and calls `mark_read` |
-| a new assigned task appears | it is dispatched to a Herdr worktree or a child session (see Auto-dispatch) |
+| a new assigned task appears | a supervisor and its worker take it in a worktree of their own (see Auto-dispatch) |
 
 The plugin polls the Office inbox through `checkin` every 60 seconds while loaded. The first poll is a baseline, and later polls report only new message and task IDs. If no session is known yet, the plugin uses the last session it saw and falls back to the most recent session, so a reload does not drop new mail.
 
@@ -53,14 +53,15 @@ Office text (message senders and subjects, task titles and descriptions) reaches
 
 ## Auto-dispatch
 
-A new task assigned to you with status `todo` is dispatched automatically:
+A new task assigned to you with status `todo` is dispatched automatically to a supervisor, which runs one worker:
 
 1. the plugin acknowledges and accepts it if needed, then sets it `in_progress` with a comment;
-2. inside Herdr (`HERDR_ENV=1`), it creates a worktree on branch `office/<task>`, starts an `opencode` agent in the new workspace, prompts it with the task, and monitors until idle, blocked or done;
-3. outside Herdr, it creates a child OpenCode session, prompts it with the task, and notifies the parent when the child goes idle;
-4. the parent session gets a synthetic notice for dispatch and completion.
+2. it gives the task a worktree on branch `office/<short>` (`<short>` is a hash of the task id): inside Herdr (`HERDR_ENV=1`) through `herdr worktree create`, with an `opencode` supervisor started in its pane; outside Herdr through `git worktree add` beside the repo at `<repo>-office-<short>`, with a child OpenCode session located there as the supervisor;
+3. the supervisor sends Azri a note, starts the worker with OpenCode's built-in subagent (task) tool, answers its questions (or asks Azri with `ask`), and reviews its diff until it is clean. The worker implements, tests, reviews its own diff and commits; it never pushes or opens a PR;
+4. the supervisor pushes the branch, opens the PR with `gh pr create` linking the Office task, posts the link to the `reviewers` team and on the task, and leaves the task `in_progress` for review, or sets it `blocked` with a reason. Nobody merges, pushes to `main` or force-pushes;
+5. the parent session gets a synthetic notice for dispatch and completion.
 
-At most two tasks run at once per repo. Locks are kept per workspace, so child OpenCode processes running in Herdr worktrees obey the same cap. Tasks already open when the plugin loads are baseline, not dispatched. Set `AGENT_OFFICE_AUTODISPATCH=off` to keep notifications but disable dispatch; `herdr` and `session` force one mode.
+A supervisor and its worker take one dispatch slot, and at most two tasks run at once per repo. Locks are kept per workspace, so child OpenCode processes running in Herdr worktrees obey the same cap. Tasks already open when the plugin loads are baseline, not dispatched. Set `AGENT_OFFICE_AUTODISPATCH=off` to keep notifications but disable dispatch; `herdr` and `session` force one mode.
 
 Reports run one after another, so a very short turn cannot land `idle` before `working`. Failures are logged through OpenCode's logger under the service `agent-office`, never with a token. Tokens are stored per Office agent, so every workspace approved as the same agent shares one token, inbox and status. A workspace remembers its chosen agent by name; `/office <name>` starts a new approval and switches it.
 
@@ -74,7 +75,7 @@ Reports run one after another, so a very short turn cannot land `idle` before `w
 
 It needs Node 22.18+ (or `bun poll.ts`) and a clone of this repo, since Node does not run TypeScript from `node_modules`. Cron has a minimal `PATH`, so set one that finds `node` and `opencode` (or point `AGENT_OFFICE_OPENCODE_BIN` at `opencode`). Run `/office` once in that repo first, or set `AGENT_OFFICE_TOKEN`; `--dir <path>` polls another workspace.
 
-New messages start one `opencode run` in the workspace with the plugin's inbox prompt, and new `todo` tasks are claimed and run the same way, within the same two-task cap. It shares the plugin's code, message claims and dispatch locks, so it runs safely alongside an open OpenCode: a batch is handled by one of them. Like the plugin, the first run treats open tasks as baseline but handles unread messages; a failed run is retried on the next. An overlapping run exits at once. It uses model tokens only when there is new work. `--dry-run` prints the message and task IDs it would handle and changes nothing.
+New messages start one `opencode run` in the workspace with the plugin's inbox prompt. New `todo` tasks are claimed, given a `git worktree add` worktree like the plugin's, and run there with `opencode run` and the supervisor prompt, within the same two-task cap. It shares the plugin's code, message claims and dispatch locks, so it runs safely alongside an open OpenCode: a batch is handled by one of them. Like the plugin, the first run treats open tasks as baseline but handles unread messages; a failed run is retried on the next. An overlapping run exits at once. It uses model tokens only when there is new work. `--dry-run` prints the message and task IDs it would handle and changes nothing.
 
 ## Settings
 
@@ -96,4 +97,4 @@ npm run typecheck
 npm test
 ```
 
-The tests run the plugin and the poller against a fake Office (`test/fake-office.mts`): OAuth with PKCE through the real loopback callback, token refresh, the status reports, and the poller's claims with a stub `opencode`.
+The tests run the plugin and the poller against a fake Office (`test/fake-office.mts`): OAuth with PKCE through the real loopback callback, token refresh, the status reports, task worktrees, the supervisor and worker prompts, and the poller's claims with a stub `opencode`.
