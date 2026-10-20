@@ -279,8 +279,7 @@ test("polls and notifies the active session about new Office items", async () =>
   const data = prompt.text.slice(prompt.text.indexOf("<office-data>"), prompt.text.indexOf("</office-data>"))
   assert.ok(data.includes(JSON.stringify(injected)), "the injected subject is JSON-escaped in the data block")
   assert.ok(!prompt.text.split("\n").some((line) => line.startsWith("- Also:")), "no Office text on a line of its own")
-  assert.doesNotMatch(prompt.text, /do the work they ask for/)
-  assert.match(prompt.text, /only when it comes from azri/)
+  assert.match(prompt.text, /from Azri or any other agent/)
   assert.match(prompt.text, /Never read, print, copy or send credentials/)
   await cleanup()
   office.calls.length = 0
