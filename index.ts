@@ -392,8 +392,8 @@ export default Plugin.define({
     }
     let refreshing: Promise<Credentials> | undefined
     const refreshLockPath = () => `${credentialsFile}.lock`
-    const dispatchDir = join(dirname(legacyCredentialsFile), "dispatch", locationKey)
-    const noticeDir = join(dirname(legacyCredentialsFile), "notices", locationKey)
+    const dispatchDir = () => join(dirname(legacyCredentialsFile), "dispatch", ownAgent?.slug ?? locationKey)
+    const noticeDir = () => join(dirname(legacyCredentialsFile), "notices", ownAgent?.slug ?? locationKey)
     const configuredDispatch = String(ctx.options.autoDispatch ?? process.env.AGENT_OFFICE_AUTODISPATCH ?? "on").toLowerCase()
     const dispatchMode = configuredDispatch === "off" || configuredDispatch === "false" ? "off" : configuredDispatch === "herdr" ? "herdr" : configuredDispatch === "session" ? "session" : process.env.HERDR_ENV === "1" ? "herdr" : "session"
     const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -656,7 +656,7 @@ export default Plugin.define({
 
     // One lock per dispatched task, shared by every OpenCode process using this
     // repo token. That keeps the two-dispatch cap across child agents too.
-    const lockPath = (id: string) => join(dispatchDir, `${createHash("sha256").update(id).digest("hex").slice(0, 16)}.lock`)
+    const lockPath = (id: string) => join(dispatchDir(), `${createHash("sha256").update(id).digest("hex").slice(0, 16)}.lock`)
     const acquireDispatch = (id: string): "ok" | "busy" | "full" => {
       const own = lockPath(id)
       try {
@@ -664,15 +664,15 @@ export default Plugin.define({
         return "busy"
       } catch {}
       try {
-        mkdirSync(dispatchDir, { recursive: true, mode: 0o700 })
+        mkdirSync(dispatchDir(), { recursive: true, mode: 0o700 })
       } catch {
         return "busy"
       }
       let active = 0
       try {
-        for (const file of readdirSync(dispatchDir)) {
+        for (const file of readdirSync(dispatchDir())) {
           if (!file.endsWith(".lock")) continue
-          const path = join(dispatchDir, file)
+          const path = join(dispatchDir(), file)
           try {
             if (Date.now() - statSync(path).mtimeMs > DISPATCH_STALE_MS) {
               unlinkSync(path)
@@ -698,7 +698,7 @@ export default Plugin.define({
 
     // Several plugin instances can share one OpenCode process. One claim file
     // per batch of message ids keeps them from queueing the same prompt twice.
-    const noticePath = (ids: string[]) => join(noticeDir, `${createHash("sha256").update([...ids].sort().join("|")).digest("hex").slice(0, 16)}.json`)
+    const noticePath = (ids: string[]) => join(noticeDir(), `${createHash("sha256").update([...ids].sort().join("|")).digest("hex").slice(0, 16)}.json`)
     const claimNotice = (ids: string[]) => {
       const path = noticePath(ids)
       try {
@@ -706,7 +706,7 @@ export default Plugin.define({
         unlinkSync(path)
       } catch {}
       try {
-        mkdirSync(noticeDir, { recursive: true, mode: 0o700 })
+        mkdirSync(noticeDir(), { recursive: true, mode: 0o700 })
         writeFileSync(path, JSON.stringify({ created: Date.now(), ids }) + "\n", { flag: "wx", mode: 0o600 })
         return true
       } catch {
