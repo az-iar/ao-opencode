@@ -298,32 +298,50 @@ function listenForCode(state: string): Promise<{ port: number; code: Promise<str
   })
 }
 
-async function authorize(onUrl: (url: string) => void, clientName: string): Promise<Credentials> {
+// Starts an approval and returns its URL at once. The tokens follow when the
+// browser reaches the loopback callback or the callback URL is pasted back,
+// so a remote machine never blocks on a browser it cannot open.
+async function authorize(clientName: string): Promise<{ url: string; state: string; credentials: Promise<Credentials> }> {
   const verifier = randomBytes(32).toString("base64url")
   const state = randomBytes(16).toString("base64url")
   const listener = await listenForCode(state)
   const callback = callbackUrl(listener.port)
+  let client_id: string
   try {
-    const client_id = await registerClient(callback, clientName)
-    const url = new URL(`${OFFICE}/oauth/authorize`)
-    url.search = new URLSearchParams({
-      response_type: "code",
-      client_id,
-      redirect_uri: callback,
-      scope: SCOPES,
-      state,
-      code_challenge: createHash("sha256").update(verifier).digest("base64url"),
-      code_challenge_method: "S256",
-      resource: `${OFFICE}/mcp`,
-    }).toString()
-    onUrl(url.href)
-    openBrowser(url.href)
-    const code = await listener.code
-    return tokenRequest(client_id, { grant_type: "authorization_code", code, redirect_uri: callback, code_verifier: verifier })
+    client_id = await registerClient(callback, clientName)
   } catch (err) {
     listener.close()
     throw err
   }
+  const url = new URL(`${OFFICE}/oauth/authorize`)
+  url.search = new URLSearchParams({
+    response_type: "code",
+    client_id,
+    redirect_uri: callback,
+    scope: SCOPES,
+    state,
+    code_challenge: createHash("sha256").update(verifier).digest("base64url"),
+    code_challenge_method: "S256",
+    resource: `${OFFICE}/mcp`,
+  }).toString()
+  openBrowser(url.href)
+  const credentials = listener.code.then((code) =>
+    tokenRequest(client_id, { grant_type: "authorization_code", code, redirect_uri: callback, code_verifier: verifier }),
+  )
+  return { url: url.href, state, credentials }
+}
+
+const isCallbackUrl = (text: string) => /^http:\/\/(127\.0\.0\.1|localhost):\d+\/callback\?\S*$/.test(text)
+
+function approvalText(name: string, url: string) {
+  return [
+    `Open this link and approve "${name}" as the Office admin:`,
+    url,
+    "",
+    "On this machine the browser opens it by itself and the connection finishes on its own.",
+    "On a remote machine, open the link in any browser. After you approve, the browser lands on a page that does not load: copy that page's full address (http://127.0.0.1:.../callback?...) and paste it here, or run /office followed by the address.",
+    `The link works for ${APPROVAL_TIMEOUT_MS / 60_000} minutes. Show the user the link exactly as written.`,
+  ].join("\n")
 }
 
 export default Plugin.define({
@@ -569,6 +587,59 @@ export default Plugin.define({
     const notify = (sessionID: string | undefined, text: string) => {
       if (!sessionID) return
       void ctx.session.synthetic({ sessionID, text, description: "Agent Office" }).catch((err) => warn("could not notify the session", { error: String(err) }))
+    }
+
+    const connectedSummary = async () => {
+      await ensureConnected()
+      const me = await checkin()
+      adoptAgent(me.agent?.slug)
+      ownAgent = me.agent
+      await observePending(me.pending, false)
+      const pending = me.pending ?? {}
+      return `Connected to Agent Office as @${me.agent?.slug} (${me.agent?.name}). Open tasks: ${pending.open_tasks?.length ?? 0}, unclaimed team tasks: ${pending.unclaimed_team_tasks?.length ?? 0}, unread messages: ${pending.unread_messages?.length ?? 0}. The office MCP tools are available; call checkin first.`
+    }
+
+    // The approval in flight. A loopback callback finishes it in the
+    // background and tells the session; a pasted URL reports it in reply.
+    let approval: { state: string; done: Promise<string>; pasted: boolean } | undefined
+    const startApproval = async (approvalName: string, sessionID: string | undefined) => {
+      const started = await authorize(approvalName)
+      const current = {
+        state: started.state,
+        pasted: false,
+        done: started.credentials.then(async (next) => {
+          credentials = next
+          saveCredentials(credentialsFile, next)
+          connected = undefined
+          return connectedSummary()
+        }),
+      }
+      approval = current
+      current.done.then(
+        (summary) => current.pasted || notify(sessionID, summary),
+        (err) => current.pasted || notify(sessionID, `Agent Office approval did not finish: ${err instanceof Error ? err.message : String(err)}. Run /office again.`),
+      )
+      return started.url
+    }
+    const finishWithCallback = async (raw: string) => {
+      let state = ""
+      try {
+        state = new URL(raw.trim()).searchParams.get("state") ?? ""
+      } catch {}
+      // Another OpenCode in this process may own the approval this URL answers.
+      const current = approval?.state === state ? approval : undefined
+      if (current) current.pasted = true
+      const result = completeCallback(raw.trim())
+      if (!result.handled || !result.ok) {
+        if (current) current.pasted = false
+        return result.message
+      }
+      if (!current) return `${result.message} in the OpenCode that started it.`
+      try {
+        return await current.done
+      } catch (err) {
+        return `Agent Office approval did not finish: ${err instanceof Error ? err.message : String(err)}. Run /office again.`
+      }
     }
 
     // One lock per dispatched task, shared by every OpenCode process using this
@@ -869,6 +940,10 @@ export default Plugin.define({
         description: "Connect to Agent Office: register an agent, check status, or reconnect",
         execute: async ({ sessionID, prompt, delivery }) => {
           const input = prompt.text.trim()
+          if (isCallbackUrl(input)) {
+            notify(sessionID, await finishWithCallback(input))
+            return
+          }
           const [verb, ...rest] = input.split(/\s+/)
           const argument = rest.join(" ").trim()
           let request: string
@@ -899,7 +974,7 @@ export default Plugin.define({
       editor.add({
         name: "office_connect",
         description:
-          "Connect OpenCode to Agent Office. Opens the browser for the Office admin to approve, stores the tokens and adds the office MCP tools (checkin, tasks, messages, journal, decisions). Already connected: reports who you are. `reconnect` starts a fresh approval. `agent_name` pre-fills a new Office agent name. Paste the full callback URL as `callback_url` to finish an approval manually.",
+          "Connect OpenCode to Agent Office. Starts an approval and returns its link at once; show the user the link. When the Office admin approves, the tokens are stored, the office MCP tools (checkin, tasks, messages, journal, decisions) are added and the session is told. Already connected: reports who you are. `reconnect` starts a fresh approval. `agent_name` pre-fills a new Office agent name. When the user pastes a http://127.0.0.1:.../callback?... URL, pass it as `callback_url` to finish the approval.",
         input: {
           type: "object",
           properties: {
@@ -911,33 +986,12 @@ export default Plugin.define({
         },
         async execute(input, toolCtx) {
           const { reconnect, callback_url, agent_name } = input as { reconnect?: boolean; callback_url?: string; agent_name?: string }
-          if (callback_url) {
-            const before = loadCredentials(credentialsFile)?.access_token
-            const result = completeCallback(callback_url)
-            if (!result.handled || !result.ok) return { content: result.message }
-            let next = loadCredentials(credentialsFile)
-            for (let i = 0; i < 100 && (!next || next.access_token === before); i++) {
-              await new Promise((resolve) => setTimeout(resolve, 200))
-              next = loadCredentials(credentialsFile)
-            }
-            if (!next || next.access_token === before) return { content: `${result.message}, but no new credentials were saved. Run /office again.` }
-            credentials = next
-            connected = undefined
-          } else if (agent_name?.trim() || reconnect || !(await bearer())) {
+          if (callback_url) return { content: await finishWithCallback(callback_url) }
+          if (agent_name?.trim() || reconnect || !(await bearer())) {
             const approvalName = agent_name?.trim() ? agent_name.trim().slice(0, 80) : clientName
-            credentials = await authorize((url) => void toolCtx.progress({ title: `Approve ${approvalName} in the browser`, metadata: { url } }), approvalName)
-            saveCredentials(credentialsFile, credentials)
-            connected = undefined
+            return { content: approvalText(approvalName, await startApproval(approvalName, toolCtx.sessionID)) }
           }
-          await ensureConnected()
-          const me = await checkin()
-          adoptAgent(me.agent?.slug)
-          ownAgent = me.agent
-          await observePending(me.pending, false)
-          const pending = me.pending ?? {}
-          return {
-            content: `Connected to Agent Office as @${me.agent?.slug} (${me.agent?.name}). Open tasks: ${pending.open_tasks?.length ?? 0}, unclaimed team tasks: ${pending.unclaimed_team_tasks?.length ?? 0}, unread messages: ${pending.unread_messages?.length ?? 0}. The office MCP tools are available; call checkin first.`,
-          }
+          return { content: await connectedSummary() }
         },
       })
       editor.add({
