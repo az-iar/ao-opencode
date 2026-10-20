@@ -9,7 +9,7 @@ import { spawn, spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { basename, dirname, join } from "node:path"
+import { basename, dirname, join, sep } from "node:path"
 
 export const OFFICE = (process.env.AGENT_OFFICE_URL ?? "https://office.byma.tech").replace(/\/+$/, "")
 export const CREDENTIALS_OVERRIDE = process.env.AGENT_OFFICE_OPENCODE_CREDENTIALS
@@ -428,4 +428,13 @@ export function releaseNotice(dir: string, ids: string[]) {
   try {
     unlinkSync(noticePath(dir, ids))
   } catch {}
+}
+
+// The crontab line that runs the poller for a workspace every two minutes.
+// Cron's PATH is minimal, so it carries the caller's. Node will not run
+// TypeScript from node_modules, so an installed plugin's poller runs on bun.
+export function cronLine(directory: string, pollScript: string, path = process.env.PATH ?? "") {
+  const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`
+  const runtime = pollScript.includes(`${sep}node_modules${sep}`) ? "bun" : "node"
+  return `*/2 * * * * cd ${quote(directory)} && PATH=${quote(path)} ${runtime} ${quote(pollScript)} >> "$HOME/.config/agent-office/opencode/poll.log" 2>&1`
 }
