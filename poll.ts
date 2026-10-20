@@ -1,4 +1,4 @@
-// Agent Office poller for cron: one checkin, then exit. It shares office.ts
+// Agent Office poller for cron: one checkin, then exit. It shares lib/office.ts
 // with the plugin, so it baselines, claims and prompts the same way, and a
 // running OpenCode and cron never both handle one batch.
 //
@@ -35,7 +35,7 @@ import {
   taskID,
   taskPrompt,
   workspaceKey,
-} from "./office.ts"
+} from "./lib/office.ts"
 
 const OPENCODE = process.env.AGENT_OFFICE_OPENCODE_BIN || "opencode"
 const INBOX_TIMEOUT_MS = 60 * 60_000

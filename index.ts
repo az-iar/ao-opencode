@@ -51,9 +51,9 @@ import {
   taskPrompt,
   tokenRequest,
   workspaceKey,
-} from "./office.ts"
+} from "./lib/office.ts"
 
-export { agentCredentialsPath, agentPointerPath, credentialsPath } from "./office.ts"
+export { agentCredentialsPath, agentPointerPath, credentialsPath } from "./lib/office.ts"
 
 const CALLBACK_BASE_PORT = Number(process.env.AGENT_OFFICE_CALLBACK_PORT ?? 41997)
 const CALLBACK_TRIES = 20

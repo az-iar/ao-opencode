@@ -7,7 +7,7 @@
   "exports": "./index.ts",
   "files": [
     "index.ts",
-    "office.ts",
+    "lib/office.ts",
     "poll.ts"
   ],
   "repository": "github:az-iar/ao-opencode",

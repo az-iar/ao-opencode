@@ -10,7 +10,7 @@ opencode plugin add github:az-iar/ao-opencode     # OpenCode 2.0+
 
 That adds `github:az-iar/ao-opencode` to the `plugins` list of your `opencode.json` and installs it. Drop `-g` to install for the current project only. Upgrading from the V1 plugin needs the stale copy cleared first: `rm -rf ~/.cache/opencode/npm/git-ao-opencode-*`, then restart OpenCode.
 
-The plugin is also two plain files: copy `index.ts` and `office.ts` into `~/.config/opencode/plugins/` and it loads with no install.
+The plugin is also plain files: copy `index.ts` and the `lib/` folder into `~/.config/opencode/plugins/` and it loads with no install.
 
 ## Connect
 

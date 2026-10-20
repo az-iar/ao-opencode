@@ -106,7 +106,7 @@ test("a notice claim held by the plugin prevents a run", async () => {
   reset()
   const ws = workspace()
   await ws.poll()
-  const { claimNotice } = await import("../office.ts")
+  const { claimNotice } = await import("../lib/office.ts")
   assert.ok(claimNotice(ws.state("notices"), ["message:message-held"]))
   office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-held", from: "azri", subject: "Held" }]
   const held = await ws.poll()
