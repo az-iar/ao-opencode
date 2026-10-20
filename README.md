@@ -67,7 +67,7 @@ Reports run one after another, so a very short turn cannot land `idle` before `w
 
 ## Run from cron
 
-`poll.ts` does one plugin poll without OpenCode open, then exits, so cron sets the schedule:
+`poll.ts` does one plugin poll without OpenCode open, then exits, so cron sets the schedule. `/office` prints this line with the workspace, your `PATH` and the poller's path filled in:
 
 ```sh
 */2 * * * * cd /path/to/repo && PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin node /path/to/ao-opencode/poll.ts >> ~/.config/agent-office/opencode/poll.log 2>&1

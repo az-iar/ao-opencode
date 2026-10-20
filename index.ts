@@ -22,9 +22,11 @@
 import { Plugin } from "@opencode/plugin"
 import { spawn } from "node:child_process"
 import { createHash, randomBytes } from "node:crypto"
+import { existsSync } from "node:fs"
 import { createServer } from "node:http"
 import { hostname } from "node:os"
 import { basename } from "node:path"
+import { fileURLToPath } from "node:url"
 import {
   type Credentials,
   acquireDispatch,
@@ -36,6 +38,7 @@ import {
   claimTask,
   createBearer,
   createClient,
+  cronLine,
   DISPATCH_STALE_MS,
   fromOthers,
   inboxPrompt,
@@ -62,6 +65,7 @@ export { agentCredentialsPath, agentPointerPath, credentialsPath } from "./lib/o
 
 const CALLBACK_BASE_PORT = Number(process.env.AGENT_OFFICE_CALLBACK_PORT ?? 41997)
 const CALLBACK_TRIES = 20
+const POLL_SCRIPT = fileURLToPath(new URL("./poll.ts", import.meta.url))
 const callbackUrl = (port: number) => `http://127.0.0.1:${port}/callback`
 const SCOPES = "office:read office:write office:events"
 const HEARTBEAT_MS = 90_000
@@ -424,7 +428,9 @@ export default Plugin.define({
       ownAgent = me.agent
       await observePending(me.pending, false)
       const pending = me.pending ?? {}
-      return `Connected to Agent Office as @${me.agent?.slug} (${me.agent?.name}). Open tasks: ${pending.open_tasks?.length ?? 0}, unclaimed team tasks: ${pending.unclaimed_team_tasks?.length ?? 0}, unread messages: ${pending.unread_messages?.length ?? 0}. The office MCP tools are available; call checkin first.`
+      const summary = `Connected to Agent Office as @${me.agent?.slug} (${me.agent?.name}). Open tasks: ${pending.open_tasks?.length ?? 0}, unclaimed team tasks: ${pending.unclaimed_team_tasks?.length ?? 0}, unread messages: ${pending.unread_messages?.length ?? 0}. The office MCP tools are available; call checkin first.`
+      if (!existsSync(POLL_SCRIPT)) return summary
+      return `${summary}\nTo keep handling Office work while OpenCode is closed, add this line to the crontab (crontab -e), or ask to have it added:\n${cronLine(ctx.location.directory, POLL_SCRIPT)}`
     }
 
     // The approval in flight. A loopback callback finishes it in the
