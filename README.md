@@ -16,8 +16,8 @@ The plugin is also a single file: copy `index.ts` into `~/.config/opencode/plugi
 
 In OpenCode, run `/office`. The model calls the plugin's `office_connect` tool, which:
 
-1. registers OpenCode with the Office (OAuth dynamic client registration) and opens the Office approval page in your browser;
-2. waits, up to five minutes, for you to sign in to the dashboard and approve, as a new agent named "OpenCode" or an existing one;
+1. registers OpenCode with the Office (OAuth dynamic client registration), shows the approval link and opens it in your browser if this machine has one;
+2. returns at once; when you approve in the dashboard (within five minutes), as a new agent named "OpenCode" or an existing one, the plugin finishes in the background and tells the session;
 3. stores the token under `~/.config/agent-office/opencode/agents/<agent>.json` (mode 0600), records the chosen agent for this workspace in `workspaces/<hash>.json`, adds the `office` MCP server to OpenCode, and checks in.
 
 `/office` subcommands:
@@ -29,10 +29,11 @@ In OpenCode, run `/office`. The model calls the plugin's `office_connect` tool, 
 | `/office status` | show the plugin's poll, session, and credential state |
 | `/office reconnect` | force a fresh OAuth approval |
 | `/office <name>` | alias for `register <name>` |
+| `/office http://127.0.0.1:.../callback?...` | finish an approval from a browser on another machine |
 
 Reconnecting later lands on the same agent. `/office` again reports who you are; ask for `reconnect` to approve afresh. Run `/office <name>` to pre-fill the new agent name on the approval page. Access tokens last an hour and the plugin refreshes them on its own.
 
-The loopback callback starts at `AGENT_OFFICE_CALLBACK_PORT` and tries the next 19 ports if it is busy. If the browser runs on another machine or cannot reach loopback, copy the full `http://127.0.0.1:.../callback?...` URL and ask the model to finish with `office_connect` and `callback_url`.
+The loopback callback starts at `AGENT_OFFICE_CALLBACK_PORT` and tries the next 19 ports if it is busy. On a remote or headless machine, open the link in any browser and approve. The browser then lands on a `http://127.0.0.1:.../callback?...` page that does not load: copy that full address and run `/office <address>`, which finishes the connection directly, or paste it into the chat for the model to pass to `office_connect`.
 
 ## While running
 

@@ -200,17 +200,19 @@ test("/office: OAuth with PKCE, stored tokens, MCP server added", async () => {
   // Another plugin instance already holds the preferred callback port.
   const blocker = createServer((_req, res) => res.writeHead(204).end())
   await new Promise<void>((resolve) => blocker.listen(45123, "127.0.0.1", resolve))
-  let authorizeUrl = ""
-  const result = harness.tools[0].execute({}, { progress: async (m: any) => (authorizeUrl = m.metadata.url) })
-  await until(() => authorizeUrl !== "", "the authorization URL")
+  // The tool answers at once with the link, so a remote machine is not left waiting.
+  const started = await harness.tools[0].execute({}, { sessionID: "s1", progress: async () => {} })
+  const authorizeUrl = started.content.match(/^(http\S+\/oauth\/authorize\?\S+)$/m)?.[1]
+  assert.ok(authorizeUrl, started.content)
+  assert.match(started.content, /paste it here, or run \/office/)
   // Azri's browser: the Office approves and sends it back to the plugin's callback.
   const back = await fetch(authorizeUrl, { redirect: "manual" })
   assert.equal(back.status, 302)
   const landing = await fetch(back.headers.get("location")!)
   assert.match(await landing.text(), /connected/)
-  const response = await result
+  await until(() => harness.synthetics.some((m) => m.sessionID === "s1" && /^Connected to Agent Office/.test(m.text)), "the connected notice")
   await new Promise<void>((resolve) => blocker.close(() => resolve()))
-  assert.match(response.content, /^Connected to Agent Office as @opencode \(OpenCode\)\. Open tasks: 1, unclaimed team tasks: 0, unread messages: 2\./)
+  assert.match(harness.synthetics.find((m) => /^Connected to Agent Office/.test(m.text)).text, /^Connected to Agent Office as @opencode \(OpenCode\)\. Open tasks: 1, unclaimed team tasks: 0, unread messages: 2\./)
 
   const register = office.calls.find((c) => c.path === "/oauth/register")!
   const token = office.calls.find((c) => c.path === "/oauth/token")!
@@ -333,6 +335,25 @@ test("a stored token near expiry is refreshed before use and handed to OpenCode 
   assert.equal(JSON.parse(readFileSync(credentials, "utf8")).refresh_token, "refresh-2")
   second.push({ type: "session.status", data: { sessionID: "d", status: { type: "busy" } } })
   await tick()
+})
+
+test("remote machine: a pasted callback URL finishes the approval through /office", async () => {
+  const before = harness.synthetics.length
+  const started = await harness.tools[0].execute({ reconnect: true }, { sessionID: "r1", progress: async () => {} })
+  const authorizeUrl = started.content.match(/^(http\S+\/oauth\/authorize\?\S+)$/m)![1]
+  // The browser runs elsewhere: it gets the redirect but never reaches this machine's loopback.
+  const back = await fetch(authorizeUrl, { redirect: "manual" })
+  const pasted = back.headers.get("location")!
+  assert.match(pasted, /^http:\/\/127\.0\.0\.1:\d+\/callback\?/)
+  const command = harness.commands.find((c) => c.name === "office")
+  const prompts = harness.prompts.length
+  await command.execute({ sessionID: "r1", prompt: { text: pasted }, delivery: "steer" })
+  assert.equal(harness.prompts.length, prompts, "no model turn for a pasted URL")
+  const notices = harness.synthetics.slice(before).filter((m) => m.sessionID === "r1")
+  assert.equal(notices.length, 1, JSON.stringify(notices))
+  assert.match(notices[0].text, /^Connected to Agent Office as @opencode/)
+  const again = await harness.tools[0].execute({ callback_url: pasted }, { sessionID: "r1", progress: async () => {} })
+  assert.match(again.content, /no pending approval/)
 })
 
 test("logs failures without the token", async () => {
