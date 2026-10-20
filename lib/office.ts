@@ -5,7 +5,7 @@
 //
 // Tokens are never logged.
 
-import { spawn } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
@@ -338,17 +338,26 @@ export async function claimTask(call: (name: string, args?: Record<string, unkno
   await call("update_task", { task_id: id, status: "in_progress", comment: "OpenCode dispatched this task to a supervisor and a worker." })
 }
 
+// A task worktree's own OpenCode belongs to its supervisor: it must not poll
+// the inbox or dispatch, or it would pull Office work into that session.
+export function onTaskBranch(directory: string) {
+  const git = spawnSync("git", ["-C", directory, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8" })
+  return git.status === 0 && git.stdout.trim().startsWith("office/")
+}
+
 export const taskShort = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 8)
 
 // Session and cron dispatch give each task a worktree beside the repo,
 // `<repo>-office-<short>` on branch `office/<short>`; a retry reuses it.
+// It branches from the remote's default branch when the clone knows one.
 export function addWorktree(repo: string, id: string): Promise<{ path: string; branch: string }> {
   const short = taskShort(id)
   const branch = `office/${short}`
   const path = join(dirname(repo), `${basename(repo)}-office-${short}`)
   if (existsSync(path)) return Promise.resolve({ path, branch })
+  const remote = spawnSync("git", ["-C", repo, "rev-parse", "--verify", "--quiet", "origin/HEAD"]).status === 0
   return new Promise((done, fail) => {
-    const git = spawn("git", ["-C", repo, "worktree", "add", "-b", branch, path], { stdio: ["ignore", "ignore", "pipe"] })
+    const git = spawn("git", ["-C", repo, "worktree", "add", "-b", branch, path, ...(remote ? ["origin/HEAD"] : [])], { stdio: ["ignore", "ignore", "pipe"] })
     let stderr = ""
     git.stderr.on("data", (chunk) => (stderr += String(chunk)))
     git.on("error", fail)

@@ -36,12 +36,14 @@ import {
   claimTask,
   createBearer,
   createClient,
+  DISPATCH_STALE_MS,
   fromOthers,
   inboxPrompt,
   itemKey,
   MAX_DISPATCHES,
   OFFICE,
   officeData,
+  onTaskBranch,
   REFRESH_EARLY_MS,
   releaseDispatch,
   releaseNotice,
@@ -515,7 +517,7 @@ export default Plugin.define({
         const started = await run("herdr", ["agent", "start", name, "--kind", "opencode", "--pane", pane, "--timeout", "120000"], 150_000)
         if (started.code !== 0) throw new Error(`herdr agent start failed: ${started.stderr || started.stdout}`)
         const worktree = info?.worktree?.path ?? "of this pane"
-        const prompted = await run("herdr", ["agent", "prompt", name, supervisorPrompt(id, task, worktree, branch), "--wait", "--timeout", "3600000"], 3_650_000)
+        const prompted = await run("herdr", ["agent", "prompt", name, supervisorPrompt(id, task, worktree, branch), "--wait", "--timeout", String(DISPATCH_STALE_MS)], DISPATCH_STALE_MS + 60_000)
         const state = agentState(prompted.stdout) ?? "unknown"
         notify(parent, `Office task ${id} dispatched to Herdr supervisor ${name} (${branch}) at ${info?.worktree?.path ?? "its worktree"}. State: ${state}.`)
       } finally {
@@ -650,9 +652,11 @@ export default Plugin.define({
 
     const configuredPoll = Number(ctx.options.pollInterval ?? process.env.AGENT_OFFICE_POLL_MS ?? DEFAULT_POLL_MS)
     const pollInterval = Number.isFinite(configuredPoll) ? Math.max(configuredPoll, 1_000) : DEFAULT_POLL_MS
-    pollTimer = setInterval(() => void poll(), pollInterval)
-    pollTimer.unref()
-    void poll()
+    if (!onTaskBranch(ctx.location.directory)) {
+      pollTimer = setInterval(() => void poll(), pollInterval)
+      pollTimer.unref()
+      void poll()
+    }
     void targetSessionAsync()
 
     await ctx.command.transform((editor) => {
