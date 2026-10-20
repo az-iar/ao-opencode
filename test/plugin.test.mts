@@ -33,6 +33,7 @@ function makeContext(directory = "/home/x/agent-office", options: Record<string,
   const prompts: any[] = []
   const synthetics: any[] = []
   const created: any[] = []
+  const sessionDetails = new Map<string, any>()
   const stored = new Map<string, any>()
   let child = 0
   const servers = new Map<string, any>()
@@ -80,9 +81,12 @@ function makeContext(directory = "/home/x/agent-office", options: Record<string,
       },
     },
     session: {
+      get: async ({ sessionID }: any) => sessionDetails.get(sessionID) ?? created.find((session) => session.id === sessionID) ?? {
+        id: sessionID, location: { directory }, agent: "build", model: { providerID: "test", id: "wren-model" },
+      },
       list: async () => ({ data: created.filter((session) => !session.parentID).slice(-1), cursor: {} }),
       create: async (input: any) => {
-        const session = { id: `child-${++child}`, ...input }
+        const session = { id: `child-${++child}`, location: { directory }, ...input }
         created.push(session)
         return session
       },
@@ -115,6 +119,7 @@ function makeContext(directory = "/home/x/agent-office", options: Record<string,
     prompts,
     synthetics,
     created,
+    sessionDetails,
     servers,
     push: (event: any) => {
       queue.push(event)
@@ -255,10 +260,11 @@ test("never overrides blocked", async () => {
   office.calls.length = 0
 })
 
-test("polls and notifies the active session about new Office items", async () => {
+test("handles Office messages in a separate session with the parent's model", async (t) => {
   office.calls.length = 0
   const polled = makeContext("/poll", { pollInterval: 1_000 })
   const cleanup = await plugin.setup(polled.ctx)
+  t.after(cleanup)
   await until(() => mcpCalls().length > 0, "the baseline poll")
   office.calls.length = 0
   polled.push({ type: "session.status", data: { sessionID: "p", status: { type: "busy" } } })
@@ -274,7 +280,11 @@ test("polls and notifies the active session about new Office items", async () =>
   ]
   await until(() => polled.prompts.some((prompt) => prompt.text.includes("message-new")), "the inbox prompt")
   const prompt = polled.prompts.find((item) => item.text.includes("message-new"))!
-  assert.equal(prompt.sessionID, "p")
+  assert.notEqual(prompt.sessionID, "p", "Office work must not enter the human's chat")
+  const inbox = polled.created.find((session) => session.id === prompt.sessionID)!
+  assert.equal(inbox.parentID, "p")
+  assert.deepEqual(inbox.model, { providerID: "test", id: "wren-model" })
+  assert.equal(inbox.agent, "build")
   assert.match(prompt.text, /new message/)
   assert.match(prompt.text, /message:message-new/)
   assert.match(prompt.text, /post_message/)
@@ -291,39 +301,153 @@ test("polls and notifies the active session about new Office items", async () =>
   office.calls.length = 0
 })
 
-test("uses the remembered session when polling after a reload", async () => {
+test("uses the remembered session when polling after a reload", async (t) => {
   office.calls.length = 0
   const worker = makeContext("/fallback", { pollInterval: 1_000 })
   const sessionKey = `last-session:${createHash("sha256").update("/fallback").digest("hex").slice(0, 16)}`
   await worker.ctx.storage.set(sessionKey, "remembered")
   const cleanup = await plugin.setup(worker.ctx)
+  t.after(cleanup)
   await until(() => mcpCalls().length > 0, "the baseline poll")
   office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-fallback", from: "azri", subject: "After reload" }]
   await until(() => worker.prompts.some((prompt) => prompt.text.includes("message-fallback")), "the fallback notice")
-  assert.equal(worker.prompts.find((prompt) => prompt.text.includes("message-fallback"))!.sessionID, "remembered")
+  const prompt = worker.prompts.find((prompt) => prompt.text.includes("message-fallback"))!
+  assert.notEqual(prompt.sessionID, "remembered")
+  assert.equal(worker.created.find((session) => session.id === prompt.sessionID)!.parentID, "remembered")
   await cleanup()
   office.calls.length = 0
 })
 
-test("dispatches a new assigned todo task to a subagent session", async () => {
+test("dispatches a new assigned todo task to a subagent session", async (t) => {
   office.calls.length = 0
   const worker = makeContext("/worker", { pollInterval: 1_000 })
   const cleanup = await plugin.setup(worker.ctx)
+  t.after(cleanup)
   await until(() => mcpCalls().length > 0, "the baseline poll")
   worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
   await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
   office.state.openTasks = [...office.state.openTasks, { id: "task-dispatch", title: "Fix it", status: "todo" }]
-  await until(() => worker.created.length > 0, "the child session")
-  assert.equal(worker.created[0].parentID, "parent")
-  assert.match(worker.prompts.at(-1).text, /task-dispatch/)
-  assert.match(worker.prompts.at(-1).text, /Before you start any work, send Azri a short note/)
+  await until(() => worker.prompts.some((prompt) => prompt.text.includes("task-dispatch")), "the child session")
+  const prompt = worker.prompts.find((prompt) => prompt.text.includes("task-dispatch"))!
+  const child = worker.created.find((session) => session.id === prompt.sessionID)!
+  assert.equal(child.parentID, "parent")
+  assert.deepEqual(child.model, { providerID: "test", id: "wren-model" })
+  assert.match(prompt.text, /Before you start any work, send Azri a short note/)
   assert.ok(office.calls.some((c) => c.body?.params?.name === "update_task" && c.body.params.arguments?.status === "in_progress"))
 
   worker.synthetics.length = 0
-  worker.push({ type: "session.idle", data: { sessionID: worker.created[0].id } })
+  worker.push({ type: "session.idle", data: { sessionID: child.id } })
   await until(() => worker.synthetics.some((message) => /subagent session/.test(message.text)), "the completion notice")
   await cleanup()
   office.calls.length = 0
+})
+
+test("events without a location cannot redirect the inbox to another workspace", async () => {
+  const worker = makeContext("/own-workspace", { pollInterval: 1_000 })
+  const cleanup = await plugin.setup(worker.ctx)
+  try {
+    worker.push({ type: "session.status", data: { sessionID: "own-chat", status: { type: "busy" } } })
+    await tick()
+    worker.sessionDetails.set("other-bot", { id: "other-bot", location: { directory: "/other-workspace" }, model: { providerID: "test", id: "other-model" } })
+    worker.push({ type: "session.status", data: { sessionID: "other-bot", status: { type: "busy" } } })
+    await tick()
+    office.state.unreadMessages.push({ id: "foreign-event-regression", from: "azri", subject: "Stay with Wren" })
+    await until(() => worker.prompts.some((prompt) => prompt.text.includes("foreign-event-regression")), "the owned inbox prompt")
+    const prompt = worker.prompts.find((prompt) => prompt.text.includes("foreign-event-regression"))!
+    const inbox = worker.created.find((session) => session.id === prompt.sessionID)
+    assert.ok(inbox, "the inbox needs an isolated worker")
+    assert.equal(inbox.parentID, "own-chat")
+    assert.deepEqual(inbox.model, { providerID: "test", id: "wren-model" })
+  } finally {
+    await cleanup()
+  }
+})
+
+test("an unrelated child session cannot become the Office parent", async (t) => {
+  const worker = makeContext("/child-events", { pollInterval: 1_000 })
+  const cleanup = await plugin.setup(worker.ctx)
+  t.after(cleanup)
+  worker.push({ type: "session.status", data: { sessionID: "root", status: { type: "busy" } } })
+  await tick()
+  worker.sessionDetails.set("unrelated-child", { id: "unrelated-child", parentID: "root", location: { directory: "/child-events" } })
+  worker.push({ type: "session.status", data: { sessionID: "unrelated-child", status: { type: "busy" } } })
+  await tick()
+  office.state.unreadMessages.push({ id: "child-parent-regression", from: "azri", subject: "Stay on the root" })
+  await until(() => worker.prompts.some((prompt) => prompt.text.includes("child-parent-regression")), "the root's inbox prompt")
+  const prompt = worker.prompts.find((prompt) => prompt.text.includes("child-parent-regression"))!
+  assert.equal(worker.created.find((session) => session.id === prompt.sessionID)!.parentID, "root")
+})
+
+test("inbox delivery waits for an explicit model and retries without losing messages", async (t) => {
+  const worker = makeContext("/missing-model", { pollInterval: 1_000 })
+  worker.sessionDetails.set("root", { id: "root", location: { directory: "/missing-model" } })
+  const cleanup = await plugin.setup(worker.ctx)
+  t.after(cleanup)
+  worker.push({ type: "session.status", data: { sessionID: "root", status: { type: "busy" } } })
+  office.state.unreadMessages.push({ id: "missing-model-regression", from: "azri", subject: "Use my chosen model" })
+  await until(() => warnings.some((line) => line.includes("explicit model")), "the deferred delivery")
+  assert.equal(worker.prompts.length, 0)
+  worker.sessionDetails.set("root", { id: "root", location: { directory: "/missing-model" }, model: { providerID: "test", id: "explicit-model" } })
+  await until(() => worker.prompts.some((prompt) => prompt.text.includes("missing-model-regression")), "the retried delivery")
+  const prompt = worker.prompts.find((prompt) => prompt.text.includes("missing-model-regression"))!
+  assert.deepEqual(worker.created.find((session) => session.id === prompt.sessionID)!.model, { providerID: "test", id: "explicit-model" })
+})
+
+test("assigned tasks wait for a model without being claimed or lost", async (t) => {
+  const worker = makeContext("/task-missing-model", { pollInterval: 1_000 })
+  worker.sessionDetails.set("root", { id: "root", location: { directory: "/task-missing-model" } })
+  const cleanup = await plugin.setup(worker.ctx)
+  t.after(cleanup)
+  worker.push({ type: "session.status", data: { sessionID: "root", status: { type: "busy" } } })
+  await tick()
+  office.state.openTasks.push({ id: "task-late-model", title: "Wait for my model", status: "todo" })
+  await until(() => worker.synthetics.some((notice) => notice.text.includes("task-late-model")), "the task notice")
+  await tick()
+  assert.equal(office.calls.some((call) => call.body?.params?.arguments?.task_id === "task-late-model" && call.body.params.name === "update_task"), false)
+  worker.sessionDetails.set("root", { id: "root", location: { directory: "/task-missing-model" }, model: { providerID: "test", id: "explicit-model" } })
+  await until(() => worker.prompts.some((prompt) => prompt.text.includes("Agent Office task task-late-model")), "the deferred task dispatch")
+})
+
+test("an invalid remembered session does not prevent recovery to the workspace's root", async (t) => {
+  const worker = makeContext("/stale-parent", { pollInterval: 1_000 })
+  const key = `last-session:${createHash("sha256").update("/stale-parent").digest("hex").slice(0, 16)}`
+  await worker.ctx.storage.set(key, "old-child")
+  worker.sessionDetails.set("old-child", { id: "old-child", parentID: "old-root", location: { directory: "/stale-parent" } })
+  const cleanup = await plugin.setup(worker.ctx)
+  t.after(cleanup)
+  await tick()
+  worker.created.push({ id: "valid-root", location: { directory: "/stale-parent" }, model: { providerID: "test", id: "owned-model" } })
+  office.state.unreadMessages.push({ id: "stale-parent-regression", from: "azri", subject: "Recover the parent" })
+  await until(() => worker.prompts.some((prompt) => prompt.text.includes("stale-parent-regression")), "the recovered inbox")
+  const prompt = worker.prompts.find((prompt) => prompt.text.includes("stale-parent-regression"))!
+  assert.equal(worker.created.find((session) => session.id === prompt.sessionID)!.parentID, "valid-root")
+})
+
+test("a session event during task dispatch cannot change its validated parent or model", async (t) => {
+  const messages = office.state.unreadMessages
+  office.state.unreadMessages = []
+  const worker = makeContext("/dispatch-race", { pollInterval: 1_000 })
+  const cleanup = await plugin.setup(worker.ctx)
+  t.after(async () => { await cleanup(); office.state.unreadMessages = messages })
+  worker.push({ type: "session.status", data: { sessionID: "parent-a", status: { type: "busy" } } })
+  await tick()
+  const get = worker.ctx.session.get
+  let reads = 0
+  worker.ctx.session.get = async (input: any) => {
+    const session = await get(input)
+    if (input.sessionID === "parent-a" && ++reads === 3) {
+      worker.sessionDetails.set("parent-b", { id: "parent-b", location: { directory: "/dispatch-race" } })
+      worker.push({ type: "session.status", data: { sessionID: "parent-b", status: { type: "busy" } } })
+      await tick()
+    }
+    return session
+  }
+  office.state.openTasks.push({ id: "task-parent-race", title: "Keep the selected model", status: "todo" })
+  await until(() => worker.prompts.some((prompt) => prompt.text.includes("Agent Office task task-parent-race")), "the stable task dispatch")
+  const prompt = worker.prompts.find((prompt) => prompt.text.includes("Agent Office task task-parent-race"))!
+  const child = worker.created.find((session) => session.id === prompt.sessionID)!
+  assert.equal(child.parentID, "parent-a")
+  assert.deepEqual(child.model, { providerID: "test", id: "wren-model" })
 })
 
 test("cleanup reports idle while a session is still busy", async () => {

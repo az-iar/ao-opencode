@@ -538,7 +538,13 @@ export default Plugin.define({
     let lastPromptAt: number | undefined
     let lastPromptError: string | undefined
     let lastPending: Record<string, number> | undefined
-    let ownAgent: { id?: string; slug?: string } | undefined
+    let ownAgent: { id?: string; slug?: string; name?: string } | undefined
+    const inboxSessions = new Set<string>()
+    const ownSession = async (sessionID: string) => {
+      const session = await ctx.session.get({ sessionID })
+      if (session.location.directory !== ctx.location.directory) throw new Error("Office session belongs to another workspace")
+      return session
+    }
 
     // Reports run one after another so a short turn cannot land idle before working.
     const report = (status: "working" | "idle") => {
@@ -569,21 +575,33 @@ export default Plugin.define({
       void report("idle")
     }
 
-    const targetSession = () => [...busy].filter((id) => !id.startsWith("herdr:") && !dispatchedSessions.has(id)).at(-1) ?? lastSessionID
+    const targetSession = () => [...busy].filter((id) => !id.startsWith("herdr:") && !dispatchedSessions.has(id) && !inboxSessions.has(id)).at(-1) ?? lastSessionID
     let resolvingTarget: Promise<string | undefined> | undefined
     const targetSessionAsync = async () => {
-      const known = targetSession()
-      if (known) return known
+      let known = targetSession()
+      while (known) {
+        const session = await ownSession(known).catch(() => undefined)
+        if (session && !session.parentID) return known
+        busy.delete(known)
+        if (lastSessionID === known) {
+          lastSessionID = undefined
+          await ctx.storage.remove(sessionStoreKey).catch(() => {})
+        }
+        known = targetSession()
+      }
       const list = (ctx.session as any).list
       if (typeof list !== "function") return undefined
-      resolvingTarget ??= list({ directory: ctx.location.directory, order: "desc", limit: 1 })
+      resolvingTarget ??= list({ directory: ctx.location.directory, order: "desc", limit: 50 })
         .then((page: any) => page?.data?.find((session: any) => !session.parentID)?.id as string | undefined)
         .catch(() => undefined)
         .finally(() => {
           resolvingTarget = undefined
         })
       const found = await resolvingTarget
-      if (found) rememberSession(found)
+      if (!found) return undefined
+      const session = await ownSession(found).catch(() => undefined)
+      if (!session || session.parentID) return undefined
+      rememberSession(found)
       return found
     }
     void ctx.storage.get(sessionStoreKey).then((id) => {
@@ -596,6 +614,11 @@ export default Plugin.define({
     const notify = (sessionID: string | undefined, text: string) => {
       if (!sessionID) return
       void ctx.session.synthetic({ sessionID, text, description: "Agent Office" }).catch((err) => warn("could not notify the session", { error: String(err) }))
+    }
+    const createOfficeSession = async (parent: string, title: string, source?: Awaited<ReturnType<typeof ownSession>>) => {
+      const session = source ?? await ownSession(parent)
+      if (session.parentID || !session.model) throw new Error("Office work needs a parent session with an explicit model")
+      return ctx.session.create({ parentID: parent, title, agent: session.agent, model: session.model, location: session.location })
     }
 
     const connectedSummary = async () => {
@@ -755,10 +778,11 @@ export default Plugin.define({
       await call("update_task", { task_id: id, status: "in_progress", comment: "OpenCode dispatched this task to a subagent." })
     }
 
-    const dispatchSession = async (id: string, title: string, prompt: string, parent: string) => {
-      const child = await ctx.session.create({ parentID: parent, title: `Office: ${title}`.slice(0, 120) })
+    const dispatchSession = async (id: string, title: string, prompt: string, parent: string, source: Awaited<ReturnType<typeof ownSession>>) => {
+      const child = await createOfficeSession(parent, `Office: ${title}`.slice(0, 120), source)
       dispatchedSessions.set(child.id, { taskID: id, parent, title })
       try {
+        await claimTask(id)
         await ctx.session.prompt({ sessionID: child.id, text: prompt })
       } catch (err) {
         dispatchedSessions.delete(child.id)
@@ -790,20 +814,18 @@ export default Plugin.define({
       }
     }
 
-    const dispatchTask = async (id: string) => {
+    const dispatchTask = async (id: string, parent: string, source: Awaited<ReturnType<typeof ownSession>>) => {
       let held = false
-      const parent = await targetSessionAsync()
       try {
-        if (!parent) return
         const detail = await call("get_task", { task_id: id }).catch(() => undefined)
         const task = detail?.task ?? detail
         const title = String(task?.title ?? id)
         const prompt = taskPrompt(id, task)
-        await claimTask(id)
         if (dispatchMode === "herdr") {
+          await claimTask(id)
           await dispatchHerdr(id, title, prompt, parent)
         } else {
-          await dispatchSession(id, title, prompt, parent)
+          await dispatchSession(id, title, prompt, parent, source)
           held = true
         }
       } catch (err) {
@@ -818,23 +840,27 @@ export default Plugin.define({
       }
     }
 
+    let pumping = false
     const pumpDispatch = () => {
-      if (life.signal.aborted || dispatchMode === "off") return
-      if (!targetSession()) {
-        void targetSessionAsync().then((id) => {
-          if (id) pumpDispatch()
-        })
-        return
-      }
-      for (const id of [...backlog]) {
-        if (dispatching.size >= MAX_DISPATCHES) return
-        const acquired = acquireDispatch(id)
-        if (acquired === "full") return
-        backlog.delete(id)
-        if (acquired === "busy") continue
-        dispatching.add(id)
-        void dispatchTask(id)
-      }
+      if (life.signal.aborted || dispatchMode === "off" || pumping || backlog.size === 0) return
+      pumping = true
+      void (async () => {
+        const parent = await targetSessionAsync()
+        if (!parent) return
+        const session = await ownSession(parent)
+        if (dispatchMode !== "herdr" && !session.model) return
+        for (const id of [...backlog]) {
+          if (dispatching.size >= MAX_DISPATCHES) return
+          const acquired = acquireDispatch(id)
+          if (acquired === "full") return
+          backlog.delete(id)
+          if (acquired === "busy") continue
+          dispatching.add(id)
+          void dispatchTask(id, parent, session)
+        }
+      })().catch((err) => warn("could not prepare Office task dispatch", { error: String(err) })).finally(() => {
+        pumping = false
+      })
     }
 
     const seenMessages = new Set<string>()
@@ -908,7 +934,10 @@ export default Plugin.define({
             SAFETY_RULES,
           ].join("\n")
           try {
-            await ctx.session.prompt({ sessionID, text, delivery: "queue" })
+            const child = await createOfficeSession(sessionID, `Office inbox: @${ownAgent?.slug ?? "agent"}`)
+            inboxSessions.add(child.id)
+            const identity = `You are ${ownAgent?.name ?? ownAgent?.slug ?? "the registered agent"}, Agent Office @${ownAgent?.slug ?? "agent"}. This session handles Office work separately from the human's chat. Send results and questions through Agent Office.`
+            await ctx.session.prompt({ sessionID: child.id, text: `${identity}\n${text}`, delivery: "queue" })
             lastPromptAt = Date.now()
             lastPromptError = undefined
             for (const item of freshMessages) seenMessages.add(itemKey(item, "message"))
@@ -930,7 +959,10 @@ export default Plugin.define({
       if (backlog.size > 0) pumpDispatch()
     }
 
+    let polling = false
     const poll = async () => {
+      if (polling || life.signal.aborted) return
+      polling = true
       try {
         if (!(await bearer())) return
         const me = await checkin()
@@ -939,9 +971,12 @@ export default Plugin.define({
         lastPollAt = Date.now()
         lastPollError = undefined
         await observePending(me.pending, true)
+        pumpDispatch()
       } catch (err) {
         lastPollError = String(err)
         warn("could not poll the Office inbox", { error: String(err) })
+      } finally {
+        polling = false
       }
     }
 
@@ -1046,6 +1081,7 @@ export default Plugin.define({
                 seen: { messages: seenMessages.size, unclaimed: seenTasks.size, assigned: seenAssigned.size },
                 backlog: [...backlog],
                 dispatching: [...dispatching],
+                inboxSessions: [...inboxSessions],
               },
               null,
               2,
@@ -1065,12 +1101,17 @@ export default Plugin.define({
           if (directory && directory !== ctx.location.directory) continue
           const eventSessionID = (event as any).data?.sessionID
           lastEventSessionID = typeof eventSessionID === "string" ? eventSessionID : undefined
-          if (lastEventSessionID && !dispatchedSessions.has(lastEventSessionID)) rememberSession(lastEventSessionID)
+          const managedChild = lastEventSessionID && (dispatchedSessions.has(lastEventSessionID) || inboxSessions.has(lastEventSessionID))
+          let parentEvent = false
+          if (lastEventSessionID && !managedChild && !(event.type === "session.deleted" && (lastEventSessionID === lastSessionID || busy.has(lastEventSessionID)))) {
+            const session = await ownSession(lastEventSessionID).catch(() => undefined)
+            if (!session || session.parentID) continue
+            parentEvent = true
+          }
+          if (lastEventSessionID && parentEvent) rememberSession(lastEventSessionID)
           void ensureConnected()
           switch (event.type) {
             case "session.status": {
-              const child = dispatchedSessions.has(event.data.sessionID)
-              if (!child) rememberSession(event.data.sessionID)
               if (event.data.status.type === "idle") {
                 stop(event.data.sessionID)
                 settleChild(event.data.sessionID)
@@ -1078,13 +1119,12 @@ export default Plugin.define({
               break
             }
             case "session.idle": {
-              const child = dispatchedSessions.has(event.data.sessionID)
-              if (!child) rememberSession(event.data.sessionID)
               stop(event.data.sessionID)
               settleChild(event.data.sessionID)
               break
             }
             case "session.deleted":
+              inboxSessions.delete(event.data.sessionID)
               if (lastSessionID === event.data.sessionID) {
                 lastSessionID = undefined
                 void ctx.storage.remove(sessionStoreKey).catch(() => {})

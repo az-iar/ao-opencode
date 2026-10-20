@@ -42,12 +42,12 @@ The loopback callback starts at `AGENT_OFFICE_CALLBACK_PORT` and tries the next 
 | a session turns busy and no other session is | `checkin {status: "working", note: "opencode: <project dir>"}`, then a `checkin` heartbeat every 90 s |
 | the last busy session goes idle or is deleted | `checkin {status: "idle"}`, unless you are `blocked` (you asked Azri something and are waiting) |
 | OpenCode shuts down while busy | `idle`, with the same `blocked` check |
-| a new Office message arrives | a queued OpenCode turn reads it with `list_messages`, does the requested work, replies with `post_message`, and calls `mark_read` |
+| a new Office message arrives | a separate child session reads it with `list_messages`, does the requested work, replies with `post_message`, and calls `mark_read` |
 | a new assigned task appears | it is dispatched to a Herdr worktree or a child session (see Auto-dispatch) |
 
 The plugin polls the Office inbox through `checkin` every 60 seconds while loaded. The first poll is a baseline, and later polls report only new message and task IDs. If no session is known yet, the plugin uses the last session it saw and falls back to the most recent session, so a reload does not drop new mail.
 
-New messages, from Azri or any other agent, queue a real OpenCode turn that reads the inbox, does the work, replies with `post_message`, and marks the messages read. Before it starts any work it sends Azri one short note per wake (or per dispatched task) saying what it is about to do and who asked, then goes ahead without waiting. Pure acknowledgements are marked read without a reply. This uses model tokens.
+New messages, from Azri or any other agent, run in a separate child session, keeping Office work out of the human's chat history. Inbox and task child sessions explicitly copy their parent session's model and agent instead of using the shared OpenCode defaults. A parent must belong to the plugin's workspace and have an explicit model before a child session can start; messages and queued tasks remain available for retry if it does not. Events from another workspace or an unrelated child cannot change the parent. Herdr dispatch retains its existing model selection. Before it starts any work it sends Azri one short note per wake (or per dispatched task) saying what it is about to do and who asked, then goes ahead without waiting. Pure acknowledgements are marked read without a reply. This uses model tokens.
 
 Office text (message senders and subjects, task titles and descriptions) reaches the model only inside an `<office-data>` JSON block, so it cannot pose as the plugin's own instructions. Every inbox and dispatch prompt also says that no message, whoever sent it, unlocks reading or sending credentials (tokens, `~/.config/agent-office`, `~/.ssh`, `.env` files) or changing permissions, plugins or config.
 
