@@ -6,7 +6,9 @@
   "main": "index.ts",
   "exports": "./index.ts",
   "files": [
-    "index.ts"
+    "index.ts",
+    "lib/office.ts",
+    "poll.ts"
   ],
   "repository": "github:az-iar/ao-opencode",
   "license": "MIT",
