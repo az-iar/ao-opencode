@@ -6,7 +6,8 @@
     "moduleResolution": "nodenext",
     "target": "es2022",
     "types": ["node"],
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true
   },
-  "files": ["index.ts"]
+  "files": ["index.ts", "office.ts", "poll.ts"]
 }

@@ -10,7 +10,7 @@ opencode plugin add github:az-iar/ao-opencode     # OpenCode 2.0+
 
 That adds `github:az-iar/ao-opencode` to the `plugins` list of your `opencode.json` and installs it. Drop `-g` to install for the current project only. Upgrading from the V1 plugin needs the stale copy cleared first: `rm -rf ~/.cache/opencode/npm/git-ao-opencode-*`, then restart OpenCode.
 
-The plugin is also a single file: copy `index.ts` into `~/.config/opencode/plugins/` and it loads with no install.
+The plugin is also two plain files: copy `index.ts` and `office.ts` into `~/.config/opencode/plugins/` and it loads with no install.
 
 ## Connect
 
@@ -64,6 +64,18 @@ At most two tasks run at once per repo. Locks are kept per workspace, so child O
 
 Reports run one after another, so a very short turn cannot land `idle` before `working`. Failures are logged through OpenCode's logger under the service `agent-office`, never with a token. Tokens are stored per Office agent, so every workspace approved as the same agent shares one token, inbox and status. A workspace remembers its chosen agent by name; `/office <name>` starts a new approval and switches it.
 
+## Run from cron
+
+`poll.ts` does one plugin poll without OpenCode open, then exits, so cron sets the schedule:
+
+```sh
+*/2 * * * * cd /path/to/repo && PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin node /path/to/ao-opencode/poll.ts >> ~/.config/agent-office/opencode/poll.log 2>&1
+```
+
+It needs Node 22.18+ (or `bun poll.ts`) and a clone of this repo, since Node does not run TypeScript from `node_modules`. Cron has a minimal `PATH`, so set one that finds `node` and `opencode` (or point `AGENT_OFFICE_OPENCODE_BIN` at `opencode`). Run `/office` once in that repo first, or set `AGENT_OFFICE_TOKEN`; `--dir <path>` polls another workspace.
+
+New messages start one `opencode run` in the workspace with the plugin's inbox prompt, and new `todo` tasks are claimed and run the same way, within the same two-task cap. It shares the plugin's code, message claims and dispatch locks, so it runs safely alongside an open OpenCode: a batch is handled by one of them. Like the plugin, the first run treats open tasks as baseline but handles unread messages; a failed run is retried on the next. An overlapping run exits at once. It uses model tokens only when there is new work. `--dry-run` prints the message and task IDs it would handle and changes nothing.
+
 ## Settings
 
 | Variable | Default |
@@ -84,4 +96,4 @@ npm run typecheck
 npm test
 ```
 
-The tests run the plugin against a fake Office (`test/fake-office.mts`): OAuth with PKCE through the real loopback callback, token refresh, and the status reports.
+The tests run the plugin and the poller against a fake Office (`test/fake-office.mts`): OAuth with PKCE through the real loopback callback, token refresh, the status reports, and the poller's claims with a stub `opencode`.
