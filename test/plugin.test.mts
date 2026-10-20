@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { createServer } from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -305,23 +306,35 @@ test("uses the remembered session when polling after a reload", async () => {
   office.calls.length = 0
 })
 
-test("dispatches a new assigned todo task to a subagent session", async () => {
+test("dispatches a new assigned todo task to a supervisor session in its own worktree", async () => {
   office.calls.length = 0
-  const worker = makeContext("/worker", { pollInterval: 1_000 })
+  const repo = join(mkdtempSync(join(tmpdir(), "ao-dispatch-")), "repo")
+  mkdirSync(repo)
+  execFileSync("git", ["-C", repo, "init", "-q"])
+  execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  const worker = makeContext(repo, { pollInterval: 1_000 })
   const cleanup = await plugin.setup(worker.ctx)
   await until(() => mcpCalls().length > 0, "the baseline poll")
   worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
   await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
   office.state.openTasks = [...office.state.openTasks, { id: "task-dispatch", title: "Fix it", status: "todo" }]
   await until(() => worker.created.length > 0, "the child session")
+  const short = createHash("sha256").update("task-dispatch").digest("hex").slice(0, 8)
+  const worktree = `${repo}-office-${short}`
   assert.equal(worker.created[0].parentID, "parent")
-  assert.match(worker.prompts.at(-1).text, /task-dispatch/)
-  assert.match(worker.prompts.at(-1).text, /Before you start any work, send Azri a short note/)
+  assert.deepEqual(worker.created[0].location, { directory: worktree })
+  assert.equal(execFileSync("git", ["-C", worktree, "branch", "--show-current"], { encoding: "utf8" }).trim(), `office/${short}`)
+  await until(() => worker.prompts.some((prompt) => prompt.sessionID === worker.created[0].id), "the supervisor prompt")
+  const prompt = worker.prompts.find((item) => item.sessionID === worker.created[0].id)!.text
+  assert.match(prompt, /^Agent Office task task-dispatch\. You are its supervisor/)
+  assert.ok(prompt.includes(`git worktree ${worktree} on branch office/${short}`))
+  assert.match(prompt, /Before you start any work, send Azri a short note/)
   assert.ok(office.calls.some((c) => c.body?.params?.name === "update_task" && c.body.params.arguments?.status === "in_progress"))
 
+  // The supervisor's events come from its worktree and still settle the dispatch.
   worker.synthetics.length = 0
-  worker.push({ type: "session.idle", data: { sessionID: worker.created[0].id } })
-  await until(() => worker.synthetics.some((message) => /subagent session/.test(message.text)), "the completion notice")
+  worker.push({ type: "session.idle", location: { directory: worktree }, data: { sessionID: worker.created[0].id } })
+  await until(() => worker.synthetics.some((message) => /supervisor session .* is idle/.test(message.text)), "the completion notice")
   await cleanup()
   office.calls.length = 0
 })

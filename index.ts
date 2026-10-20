@@ -5,8 +5,9 @@
 //                      appear in OpenCode. The name pre-fills a new agent.
 //   while running      `working` while any session runs, a heartbeat every
 //                      90 s, `idle` once every session is quiet; `blocked` is
-//                      never overridden. New assigned tasks are dispatched to
-//                      Herdr worktrees or child sessions, up to two at a time.
+//                      never overridden. New assigned tasks go to a supervisor
+//                      and its worker in a worktree, through Herdr or a child
+//                      session, up to two tasks at a time.
 //
 //   AGENT_OFFICE_URL                   dashboard origin, default https://office.byma.tech
 //   AGENT_OFFICE_TOKEN                 an agent API token instead of OAuth (optional)
@@ -27,6 +28,7 @@ import { basename } from "node:path"
 import {
   type Credentials,
   acquireDispatch,
+  addWorktree,
   agentCredentialsPath,
   agentStateDir,
   CREDENTIALS_OVERRIDE,
@@ -34,12 +36,14 @@ import {
   claimTask,
   createBearer,
   createClient,
+  DISPATCH_STALE_MS,
   fromOthers,
   inboxPrompt,
   itemKey,
   MAX_DISPATCHES,
   OFFICE,
   officeData,
+  onTaskBranch,
   REFRESH_EARLY_MS,
   releaseDispatch,
   releaseNotice,
@@ -47,8 +51,9 @@ import {
   saveAgentPointer,
   saveCredentials,
   summary,
+  supervisorPrompt,
   taskID,
-  taskPrompt,
+  taskShort,
   tokenRequest,
   workspaceKey,
 } from "./lib/office.ts"
@@ -478,28 +483,30 @@ export default Plugin.define({
       dispatchedSessions.delete(sessionID)
       releaseDispatch(dispatchDir(), child.taskID)
       dispatching.delete(child.taskID)
-      notify(child.parent, `Office task ${child.taskID} subagent session ${sessionID} is idle. Read the session, then update the task.`)
+      notify(child.parent, `Office task ${child.taskID} supervisor session ${sessionID} is idle. Read the session; the supervisor opens the PR and updates the task.`)
       pumpDispatch()
     }
 
-    const dispatchSession = async (id: string, title: string, prompt: string, parent: string) => {
-      const child = await ctx.session.create({ parentID: parent, title: `Office: ${title}`.slice(0, 120) })
+    const repo = ctx.location.project?.canonical ?? ctx.location.directory
+
+    const dispatchSession = async (id: string, task: any, title: string, parent: string) => {
+      const { path, branch } = await addWorktree(repo, id)
+      const child = await ctx.session.create({ parentID: parent, title: `Office: ${title}`.slice(0, 120), location: { directory: path } })
       dispatchedSessions.set(child.id, { taskID: id, parent, title })
       try {
-        await ctx.session.prompt({ sessionID: child.id, text: prompt })
+        await ctx.session.prompt({ sessionID: child.id, text: supervisorPrompt(id, task, path, branch) })
       } catch (err) {
         dispatchedSessions.delete(child.id)
         throw err
       }
-      notify(parent, `Dispatched Office task ${id} to subagent session ${child.id}.`)
+      notify(parent, `Dispatched Office task ${id} to supervisor session ${child.id} (${branch}) at ${path}.`)
     }
 
-    const dispatchHerdr = async (id: string, title: string, prompt: string, parent: string) => {
+    const dispatchHerdr = async (id: string, task: any, title: string, parent: string) => {
       const pseudo = `herdr:${id}`
       start(pseudo)
       try {
-        const repo = ctx.location.project?.canonical ?? ctx.location.directory
-        const short = createHash("sha256").update(id).digest("hex").slice(0, 8)
+        const short = taskShort(id)
         const branch = `office/${short}`
         const created = await run("herdr", ["worktree", "create", "--cwd", repo, "--branch", branch, "--label", title.slice(0, 80), "--no-focus"], 120_000)
         if (created.code !== 0) throw new Error(`herdr worktree create failed: ${created.stderr || created.stdout}`)
@@ -509,9 +516,10 @@ export default Plugin.define({
         const name = `office-${short}`
         const started = await run("herdr", ["agent", "start", name, "--kind", "opencode", "--pane", pane, "--timeout", "120000"], 150_000)
         if (started.code !== 0) throw new Error(`herdr agent start failed: ${started.stderr || started.stdout}`)
-        const prompted = await run("herdr", ["agent", "prompt", name, prompt, "--wait", "--timeout", "3600000"], 3_650_000)
+        const worktree = info?.worktree?.path ?? "of this pane"
+        const prompted = await run("herdr", ["agent", "prompt", name, supervisorPrompt(id, task, worktree, branch), "--wait", "--timeout", String(DISPATCH_STALE_MS)], DISPATCH_STALE_MS + 60_000)
         const state = agentState(prompted.stdout) ?? "unknown"
-        notify(parent, `Office task ${id} dispatched to Herdr agent ${name} (${branch}) at ${info?.worktree?.path ?? "its worktree"}. State: ${state}.`)
+        notify(parent, `Office task ${id} dispatched to Herdr supervisor ${name} (${branch}) at ${info?.worktree?.path ?? "its worktree"}. State: ${state}.`)
       } finally {
         stop(pseudo)
       }
@@ -525,12 +533,11 @@ export default Plugin.define({
         const detail = await call("get_task", { task_id: id }).catch(() => undefined)
         const task = detail?.task ?? detail
         const title = String(task?.title ?? id)
-        const prompt = taskPrompt(id, task)
         await claimTask(call, id)
         if (dispatchMode === "herdr") {
-          await dispatchHerdr(id, title, prompt, parent)
+          await dispatchHerdr(id, task, title, parent)
         } else {
-          await dispatchSession(id, title, prompt, parent)
+          await dispatchSession(id, task, title, parent)
           held = true
         }
       } catch (err) {
@@ -645,9 +652,11 @@ export default Plugin.define({
 
     const configuredPoll = Number(ctx.options.pollInterval ?? process.env.AGENT_OFFICE_POLL_MS ?? DEFAULT_POLL_MS)
     const pollInterval = Number.isFinite(configuredPoll) ? Math.max(configuredPoll, 1_000) : DEFAULT_POLL_MS
-    pollTimer = setInterval(() => void poll(), pollInterval)
-    pollTimer.unref()
-    void poll()
+    if (!onTaskBranch(ctx.location.directory)) {
+      pollTimer = setInterval(() => void poll(), pollInterval)
+      pollTimer.unref()
+      void poll()
+    }
     void targetSessionAsync()
 
     await ctx.command.transform((editor) => {
@@ -760,8 +769,9 @@ export default Plugin.define({
           lastEventType = event.type
           const directory = (event as any).location?.directory
           lastEventDirectory = directory
-          if (directory && directory !== ctx.location.directory) continue
           const eventSessionID = (event as any).data?.sessionID
+          // Supervisor sessions run in their task worktree.
+          if (directory && directory !== ctx.location.directory && !dispatchedSessions.has(eventSessionID)) continue
           lastEventSessionID = typeof eventSessionID === "string" ? eventSessionID : undefined
           if (lastEventSessionID && !dispatchedSessions.has(lastEventSessionID)) rememberSession(lastEventSessionID)
           void ensureConnected()

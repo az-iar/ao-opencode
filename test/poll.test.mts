@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
-import { spawn } from "node:child_process"
+import { execFileSync, spawn } from "node:child_process"
+import { createHash } from "node:crypto"
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -16,14 +17,16 @@ before(async () => {
 })
 after(() => office.close())
 
-// A workspace with its own credentials, claim and state directories, and an
-// `opencode` stub that records each run's cwd and argv as JSON.
+// A git workspace with its own credentials, claim and state directories, and
+// an `opencode` stub that records each run's cwd and argv as JSON.
 function workspace() {
   const root = mkdtempSync(join(tmpdir(), "ao-poll-"))
   const dir = join(root, "repo")
   const runs = join(root, "runs")
   mkdirSync(dir)
   mkdirSync(runs)
+  execFileSync("git", ["-C", dir, "init", "-q"])
+  execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
   const credentials = join(root, "store", "opencode.json")
   mkdirSync(join(root, "store"))
   writeFileSync(credentials, JSON.stringify({ office: url, client_id: "client-1", access_token: "access-poll", refresh_token: "refresh-poll", expires_at: Date.now() + 3_600_000 }))
@@ -116,7 +119,7 @@ test("a notice claim held by the plugin prevents a run", async () => {
   assert.equal(ws.recorded().length, 1, "a claimed batch is seen")
 })
 
-test("a new todo task is claimed, run, and its dispatch lock released", async () => {
+test("a new todo task is claimed, run as a supervisor in its worktree, and its dispatch lock released", async () => {
   reset()
   const ws = workspace()
   await ws.poll()
@@ -131,8 +134,13 @@ test("a new todo task is claimed, run, and its dispatch lock released", async ()
   assert.equal(result.code, 0, result.stderr)
   assert.equal(ws.recorded().length, 2)
   const run = ws.recorded()[1]
-  assert.deepEqual(run.argv.slice(0, 5), ["run", "--dir", ws.dir, "--title", "Office task task-new"])
-  assert.match(run.argv[5], /^Agent Office task task-new\./)
+  const short = createHash("sha256").update("task-new").digest("hex").slice(0, 8)
+  const worktree = `${ws.dir}-office-${short}`
+  assert.equal(execFileSync("git", ["-C", worktree, "branch", "--show-current"], { encoding: "utf8" }).trim(), `office/${short}`)
+  assert.equal(run.cwd, worktree)
+  assert.deepEqual(run.argv.slice(0, 5), ["run", "--dir", worktree, "--title", "Office task task-new"])
+  assert.match(run.argv[5], /^Agent Office task task-new\. You are its supervisor/)
+  assert.ok(run.argv[5].includes(`git worktree ${worktree} on branch office/${short}`))
   assert.match(run.argv[5], /Before you start any work, send Azri a short note/)
   const update = office.calls.find((c) => c.body?.params?.name === "update_task")
   assert.equal(update?.body.params.arguments.task_id, "task-new")
