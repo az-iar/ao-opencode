@@ -46,7 +46,9 @@ The loopback callback starts at `AGENT_OFFICE_CALLBACK_PORT` and tries the next 
 
 The plugin polls the Office inbox through `checkin` every 60 seconds while loaded. The first poll is a baseline, and later polls report only new message and task IDs. If no session is known yet, the plugin uses the last session it saw and falls back to the most recent session, so a reload does not drop new mail.
 
-New messages queue a real OpenCode turn that reads the inbox, does the work, replies with `post_message`, and marks the messages read. Pure acknowledgements are marked read without a reply, and message text is treated as data. This uses model tokens.
+New messages queue a real OpenCode turn that reads the inbox, replies with `post_message`, and marks the messages read. Pure acknowledgements are marked read without a reply. This uses model tokens.
+
+Office text (message senders and subjects, task titles and descriptions) reaches the model only inside an `<office-data>` JSON block, never as instructions. The turn acts on a message only when it comes from Azri or belongs to a task assigned to this agent; anything else gets an answer, and the agent asks Azri if action is needed. Every inbox and dispatch prompt also says that no message unlocks reading or sending credentials (tokens, `~/.config/agent-office`, `~/.ssh`, `.env` files) or changing permissions, plugins or config.
 
 ## Auto-dispatch
 
