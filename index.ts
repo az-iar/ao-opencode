@@ -302,7 +302,6 @@ export default Plugin.define({
     }
     const life = new AbortController()
     const locationKey = workspaceKey(ctx.location.directory)
-    const sessionStoreKey = `last-session:${locationKey}`
     const clientName = process.env.AGENT_OFFICE_CLIENT_NAME ?? `${basename(ctx.location.directory) || "OpenCode"}@${hostname().split(".")[0]}`
 
     const resolved = resolveCredentials(ctx.location.directory, ctx.location.project?.canonical)
@@ -394,28 +393,40 @@ export default Plugin.define({
     }
 
     const targetSession = () => [...busy].filter((id) => !id.startsWith("herdr:") && !dispatchedSessions.has(id)).at(-1) ?? lastSessionID
-    let resolvingTarget: Promise<string | undefined> | undefined
+    // One OpenCode server can stream events for several windows, so a session
+    // counts only when OpenCode places it in this folder or this plugin
+    // dispatched it.
+    const ownership = new Map<string, Promise<boolean>>()
+    const ownsSession = (sessionID: string) => {
+      if (dispatchedSessions.has(sessionID)) return Promise.resolve(true)
+      let owned = ownership.get(sessionID)
+      if (!owned) {
+        owned = ctx.session.get({ sessionID }).then(
+          // A subagent's session is its parent's business, never a mail target.
+          (info) => !info.parentID && info.location.directory === ctx.location.directory,
+          () => {
+            ownership.delete(sessionID)
+            return false
+          },
+        )
+        ownership.set(sessionID, owned)
+      }
+      return owned
+    }
+    const sessionStoreKey = () => (ownAgent?.slug ? `last-session:${ownAgent.slug}:${locationKey}` : undefined)
     const targetSessionAsync = async () => {
       const known = targetSession()
-      if (known) return known
-      const list = (ctx.session as any).list
-      if (typeof list !== "function") return undefined
-      resolvingTarget ??= list({ directory: ctx.location.directory, order: "desc", limit: 1 })
-        .then((page: any) => page?.data?.find((session: any) => !session.parentID)?.id as string | undefined)
-        .catch(() => undefined)
-        .finally(() => {
-          resolvingTarget = undefined
-        })
-      const found = await resolvingTarget
-      if (found) rememberSession(found)
-      return found
+      const key = sessionStoreKey()
+      if (known || !key) return known
+      const stored = await ctx.storage.get(key).catch(() => undefined)
+      if (typeof stored !== "string" || !(await ownsSession(stored))) return undefined
+      lastSessionID = stored
+      return stored
     }
-    void ctx.storage.get(sessionStoreKey).then((id) => {
-      if (typeof id === "string" && !lastSessionID) lastSessionID = id
-    }).catch(() => {})
     const rememberSession = (sessionID: string) => {
       lastSessionID = sessionID
-      void ctx.storage.set(sessionStoreKey, sessionID).catch(() => {})
+      const key = sessionStoreKey()
+      if (key) void ctx.storage.set(key, sessionID).catch(() => {})
     }
     const notify = (sessionID: string | undefined, text: string) => {
       if (!sessionID) return
@@ -664,7 +675,6 @@ export default Plugin.define({
       pollTimer.unref()
       void poll()
     }
-    void targetSessionAsync()
 
     await ctx.command.transform((editor) => {
       editor.add({
@@ -776,11 +786,11 @@ export default Plugin.define({
           lastEventType = event.type
           const directory = (event as any).location?.directory
           lastEventDirectory = directory
-          const eventSessionID = (event as any).data?.sessionID
-          // Supervisor sessions run in their task worktree.
-          if (directory && directory !== ctx.location.directory && !dispatchedSessions.has(eventSessionID)) continue
-          lastEventSessionID = typeof eventSessionID === "string" ? eventSessionID : undefined
-          if (lastEventSessionID && !dispatchedSessions.has(lastEventSessionID)) rememberSession(lastEventSessionID)
+          const eventSessionID = typeof (event as any).data?.sessionID === "string" ? ((event as any).data.sessionID as string) : undefined
+          const deleted = event.type === "session.deleted"
+          if (eventSessionID ? !deleted && !(await ownsSession(eventSessionID)) : directory && directory !== ctx.location.directory) continue
+          lastEventSessionID = eventSessionID
+          if (lastEventSessionID && !deleted && !dispatchedSessions.has(lastEventSessionID)) rememberSession(lastEventSessionID)
           void ensureConnected()
           switch (event.type) {
             case "session.status": {
@@ -799,14 +809,17 @@ export default Plugin.define({
               settleChild(event.data.sessionID)
               break
             }
-            case "session.deleted":
+            case "session.deleted": {
+              ownership.delete(event.data.sessionID)
+              const key = sessionStoreKey()
               if (lastSessionID === event.data.sessionID) {
                 lastSessionID = undefined
-                void ctx.storage.remove(sessionStoreKey).catch(() => {})
+                if (key) void ctx.storage.remove(key).catch(() => {})
               }
               stop(event.data.sessionID)
               settleChild(event.data.sessionID)
               break
+            }
           }
         }
       } catch (err) {

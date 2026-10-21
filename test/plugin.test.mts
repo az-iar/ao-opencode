@@ -27,7 +27,9 @@ const mcpCalls = () => office.calls.filter((c) => c.path === "/mcp").map((c) => 
 
 // The V2 plugin context, reduced to the domains this plugin uses. Transforms
 // run immediately and again on reload, like the real registries.
-function makeContext(directory = "/home/x/agent-office", options: Record<string, unknown> = {}) {
+// `sessions` maps session ids to their folders, as one OpenCode server serving
+// several windows would; without it every session is in this folder.
+function makeContext(directory = "/home/x/agent-office", options: Record<string, unknown> = {}, sessions?: Map<string, string>) {
   const pluginOptions = { autoDispatch: "session", ...options }
   const tools: any[] = []
   const commands: any[] = []
@@ -81,7 +83,11 @@ function makeContext(directory = "/home/x/agent-office", options: Record<string,
       },
     },
     session: {
-      list: async () => ({ data: created.filter((session) => !session.parentID).slice(-1), cursor: {} }),
+      get: async ({ sessionID }: { sessionID: string }) => {
+        const own = created.find((session) => session.id === sessionID)?.location?.directory ?? (sessions ? sessions.get(sessionID) : directory)
+        if (!own) throw new Error(`no session ${sessionID}`)
+        return { id: sessionID, location: { directory: own }, ...(sessionID.startsWith("sub-") ? { parentID: "parent" } : {}) }
+      },
       create: async (input: any) => {
         const session = { id: `child-${++child}`, ...input }
         created.push(session)
@@ -295,7 +301,7 @@ test("polls and notifies the active session about new Office items", async () =>
 test("uses the remembered session when polling after a reload", async () => {
   office.calls.length = 0
   const worker = makeContext("/fallback", { pollInterval: 1_000 })
-  const sessionKey = `last-session:${createHash("sha256").update("/fallback").digest("hex").slice(0, 16)}`
+  const sessionKey = `last-session:opencode:${createHash("sha256").update("/fallback").digest("hex").slice(0, 16)}`
   await worker.ctx.storage.set(sessionKey, "remembered")
   const cleanup = await plugin.setup(worker.ctx)
   await until(() => mcpCalls().length > 0, "the baseline poll")
@@ -303,6 +309,42 @@ test("uses the remembered session when polling after a reload", async () => {
   await until(() => worker.prompts.some((prompt) => prompt.text.includes("message-fallback")), "the fallback notice")
   assert.equal(worker.prompts.find((prompt) => prompt.text.includes("message-fallback"))!.sessionID, "remembered")
   await cleanup()
+  office.calls.length = 0
+})
+
+test("two windows on one event stream track and wake only their own sessions", async () => {
+  office.calls.length = 0
+  const sessions = new Map([["theao-1", "/win/theao"], ["om-1", "/win/cw-ai-om"], ["sub-om", "/win/cw-ai-om"]])
+  const theao = makeContext("/win/theao", { pollInterval: 1_000 }, sessions)
+  const om = makeContext("/win/cw-ai-om", { pollInterval: 1_000 }, sessions)
+  const cleanups = [await plugin.setup(theao.ctx), await plugin.setup(om.ctx)]
+  await until(() => mcpCalls().length >= 2, "the baseline polls")
+  const both = (event: any) => (theao.push(event), om.push(event))
+  const status = async (window: ReturnType<typeof makeContext>) => JSON.parse((await window.tools.find((tool) => tool.name === "office_status").execute({}, {})).content)
+  const reported = (state: string, folder: string) => mcpCalls().some((call) => call.includes(`"status":"${state}","note":"opencode: ${folder}"`))
+
+  // Without a location, and with a location naming the other window.
+  both({ type: "session.status", data: { sessionID: "om-1", status: { type: "busy" } } })
+  both({ type: "session.status", location: { directory: "/win/theao" }, data: { sessionID: "om-1", status: { type: "busy" } } })
+  await until(() => reported("working", "cw-ai-om"), "cw-ai-om working")
+  both({ type: "session.status", location: { directory: "/win/theao" }, data: { sessionID: "theao-1", status: { type: "busy" } } })
+  await until(() => reported("working", "theao"), "theao working")
+  assert.deepEqual([(await status(theao)).lastSessionID, (await status(theao)).busy], ["theao-1", ["theao-1"]])
+  assert.deepEqual([(await status(om)).lastSessionID, (await status(om)).busy], ["om-1", ["om-1"]])
+
+  // A subagent's session in the same folder never becomes a mail target.
+  both({ type: "session.status", location: { directory: "/win/cw-ai-om" }, data: { sessionID: "sub-om", status: { type: "busy" } } })
+  both({ type: "session.idle", data: { sessionID: "om-1" } })
+  await until(() => reported("idle", "cw-ai-om"), "cw-ai-om idle")
+  assert.equal((await status(om)).lastSessionID, "om-1")
+  assert.deepEqual((await status(theao)).busy, ["theao-1"])
+  assert.ok(!reported("idle", "theao"))
+
+  office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-two-windows", from: "azri", subject: "For one window" }]
+  await until(() => [...theao.prompts, ...om.prompts].some((prompt) => prompt.text.includes("message-two-windows")), "the inbox prompt")
+  assert.ok(theao.prompts.every((prompt) => prompt.sessionID === "theao-1"))
+  assert.ok(om.prompts.every((prompt) => prompt.sessionID === "om-1"))
+  for (const cleanup of cleanups) await cleanup()
   office.calls.length = 0
 })
 

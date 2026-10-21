@@ -45,7 +45,9 @@ The loopback callback starts at `AGENT_OFFICE_CALLBACK_PORT` and tries the next 
 | a new Office message arrives | a queued OpenCode turn reads it with `list_messages`, does the requested work, replies with `post_message`, and calls `mark_read` |
 | a new assigned task appears | a supervisor and its worker take it in a worktree of their own (see Auto-dispatch) |
 
-The plugin polls the Office inbox through `checkin` every 60 seconds while loaded. The first poll is a baseline, and later polls report only new message and task IDs. If no session is known yet, the plugin uses the last session it saw and falls back to the most recent session, so a reload does not drop new mail.
+The plugin polls the Office inbox through `checkin` every 60 seconds while loaded. The first poll is a baseline, and later polls report only new message and task IDs. If no session is known yet, the plugin uses the last session this agent used in this folder, so a reload does not drop new mail.
+
+Delivery only targets sessions in the plugin's own folder (or the supervisor sessions it dispatched), so two OpenCode windows connected as different agents never take each other's mail or working/idle status.
 
 New messages, from Azri or any other agent, queue a real OpenCode turn that reads the inbox, does the work, replies with `post_message`, and marks the messages read. Before it starts any work it sends Azri one short note per wake (or per dispatched task) saying what it is about to do and who asked, then goes ahead without waiting. Pure acknowledgements are marked read without a reply. This uses model tokens.
 
