@@ -345,6 +345,17 @@ export function onTaskBranch(directory: string) {
   return git.status === 0 && git.stdout.trim().startsWith("office/")
 }
 
+// Inside Herdr only the main checkout reads the inbox: every Herdr worktree is
+// a linked git worktree, and its OpenCode would otherwise poll and dispatch
+// beside the main one.
+export function inHerdrWorktree(directory: string, env = process.env) {
+  if (env.HERDR_ENV !== "1") return false
+  const git = spawnSync("git", ["-C", directory, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], { encoding: "utf8" })
+  if (git.status !== 0) return false
+  const [gitDir, commonDir] = git.stdout.trim().split("\n")
+  return Boolean(gitDir && commonDir) && gitDir !== commonDir
+}
+
 export const taskShort = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 8)
 
 // Session and cron dispatch give each task a worktree beside the repo,

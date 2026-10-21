@@ -46,6 +46,7 @@ import {
   MAX_DISPATCHES,
   OFFICE,
   officeData,
+  inHerdrWorktree,
   onTaskBranch,
   REFRESH_EARLY_MS,
   releaseDispatch,
@@ -658,7 +659,7 @@ export default Plugin.define({
 
     const configuredPoll = Number(ctx.options.pollInterval ?? process.env.AGENT_OFFICE_POLL_MS ?? DEFAULT_POLL_MS)
     const pollInterval = Number.isFinite(configuredPoll) ? Math.max(configuredPoll, 1_000) : DEFAULT_POLL_MS
-    if (!onTaskBranch(ctx.location.directory)) {
+    if (!onTaskBranch(ctx.location.directory) && !inHerdrWorktree(ctx.location.directory)) {
       pollTimer = setInterval(() => void poll(), pollInterval)
       pollTimer.unref()
       void poll()
