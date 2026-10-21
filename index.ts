@@ -402,7 +402,8 @@ export default Plugin.define({
       let owned = ownership.get(sessionID)
       if (!owned) {
         owned = ctx.session.get({ sessionID }).then(
-          (info) => info.location.directory === ctx.location.directory,
+          // A subagent's session is its parent's business, never a mail target.
+          (info) => !info.parentID && info.location.directory === ctx.location.directory,
           () => {
             ownership.delete(sessionID)
             return false

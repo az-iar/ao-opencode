@@ -86,7 +86,7 @@ function makeContext(directory = "/home/x/agent-office", options: Record<string,
       get: async ({ sessionID }: { sessionID: string }) => {
         const own = created.find((session) => session.id === sessionID)?.location?.directory ?? (sessions ? sessions.get(sessionID) : directory)
         if (!own) throw new Error(`no session ${sessionID}`)
-        return { id: sessionID, location: { directory: own } }
+        return { id: sessionID, location: { directory: own }, ...(sessionID.startsWith("sub-") ? { parentID: "parent" } : {}) }
       },
       create: async (input: any) => {
         const session = { id: `child-${++child}`, ...input }
@@ -314,7 +314,7 @@ test("uses the remembered session when polling after a reload", async () => {
 
 test("two windows on one event stream track and wake only their own sessions", async () => {
   office.calls.length = 0
-  const sessions = new Map([["theao-1", "/win/theao"], ["om-1", "/win/cw-ai-om"]])
+  const sessions = new Map([["theao-1", "/win/theao"], ["om-1", "/win/cw-ai-om"], ["sub-om", "/win/cw-ai-om"]])
   const theao = makeContext("/win/theao", { pollInterval: 1_000 }, sessions)
   const om = makeContext("/win/cw-ai-om", { pollInterval: 1_000 }, sessions)
   const cleanups = [await plugin.setup(theao.ctx), await plugin.setup(om.ctx)]
@@ -332,8 +332,11 @@ test("two windows on one event stream track and wake only their own sessions", a
   assert.deepEqual([(await status(theao)).lastSessionID, (await status(theao)).busy], ["theao-1", ["theao-1"]])
   assert.deepEqual([(await status(om)).lastSessionID, (await status(om)).busy], ["om-1", ["om-1"]])
 
+  // A subagent's session in the same folder never becomes a mail target.
+  both({ type: "session.status", location: { directory: "/win/cw-ai-om" }, data: { sessionID: "sub-om", status: { type: "busy" } } })
   both({ type: "session.idle", data: { sessionID: "om-1" } })
   await until(() => reported("idle", "cw-ai-om"), "cw-ai-om idle")
+  assert.equal((await status(om)).lastSessionID, "om-1")
   assert.deepEqual((await status(theao)).busy, ["theao-1"])
   assert.ok(!reported("idle", "theao"))
 
