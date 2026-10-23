@@ -29,6 +29,7 @@ const mcpCalls = () => office.calls.filter((c) => c.path === "/mcp").map((c) => 
 // run immediately and again on reload, like the real registries.
 // `sessions` maps session ids to their folders, as one OpenCode server serving
 // several windows would; without it every session is in this folder.
+// `details` adds fields such as a session's model and agent.
 function makeContext(directory = "/home/x/agent-office", options: Record<string, unknown> = {}, sessions?: Map<string, string>) {
   const pluginOptions = { autoDispatch: "session", ...options }
   const tools: any[] = []
@@ -36,6 +37,8 @@ function makeContext(directory = "/home/x/agent-office", options: Record<string,
   const prompts: any[] = []
   const synthetics: any[] = []
   const created: any[] = []
+  const removed: string[] = []
+  const details = new Map<string, any>()
   const stored = new Map<string, any>()
   let child = 0
   const servers = new Map<string, any>()
@@ -84,10 +87,12 @@ function makeContext(directory = "/home/x/agent-office", options: Record<string,
     },
     session: {
       get: async ({ sessionID }: { sessionID: string }) => {
-        const own = created.find((session) => session.id === sessionID)?.location?.directory ?? (sessions ? sessions.get(sessionID) : directory)
-        if (!own) throw new Error(`no session ${sessionID}`)
-        return { id: sessionID, location: { directory: own }, ...(sessionID.startsWith("sub-") ? { parentID: "parent" } : {}) }
+        const made = created.find((session) => session.id === sessionID)
+        const own = made?.location?.directory ?? (sessions ? sessions.get(sessionID) : directory)
+        if (!own || removed.includes(sessionID)) throw new Error(`no session ${sessionID}`)
+        return { id: sessionID, location: { directory: own }, ...(sessionID.startsWith("sub-") ? { parentID: "parent" } : {}), ...(made ? { parentID: made.parentID } : {}), ...details.get(sessionID) }
       },
+      remove: async ({ sessionID }: { sessionID: string }) => void removed.push(sessionID),
       create: async (input: any) => {
         const session = { id: `child-${++child}`, ...input }
         created.push(session)
@@ -122,6 +127,8 @@ function makeContext(directory = "/home/x/agent-office", options: Record<string,
     prompts,
     synthetics,
     created,
+    removed,
+    details,
     servers,
     push: (event: any) => {
       queue.push(event)
@@ -281,7 +288,12 @@ test("polls and notifies the active session about new Office items", async () =>
   ]
   await until(() => polled.prompts.some((prompt) => prompt.text.includes("message-new")), "the inbox prompt")
   const prompt = polled.prompts.find((item) => item.text.includes("message-new"))!
-  assert.equal(prompt.sessionID, "p")
+  // The work runs in a child of the chat's session, never in the chat itself.
+  assert.notEqual(prompt.sessionID, "p")
+  assert.ok(polled.prompts.every((item) => item.sessionID !== "p"))
+  assert.equal(polled.created.find((session) => session.id === prompt.sessionID)?.parentID, "p")
+  assert.equal(prompt.delivery, "queue")
+  assert.match(prompt.text, /^This is your Office inbox session, apart from the human's chat/)
   assert.match(prompt.text, /new message/)
   assert.match(prompt.text, /message:message-new/)
   assert.match(prompt.text, /post_message/)
@@ -308,7 +320,8 @@ test("uses the remembered session when polling after a reload", async () => {
   await until(() => mcpCalls().length > 0, "the baseline poll")
   office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-fallback", from: "azri", subject: "After reload" }]
   await until(() => worker.prompts.some((prompt) => prompt.text.includes("message-fallback")), "the fallback notice")
-  assert.equal(worker.prompts.find((prompt) => prompt.text.includes("message-fallback"))!.sessionID, "remembered")
+  const prompt = worker.prompts.find((prompt) => prompt.text.includes("message-fallback"))!
+  assert.equal(worker.created.find((session) => session.id === prompt.sessionID)?.parentID, "remembered")
   await cleanup()
   office.calls.length = 0
 })
@@ -343,8 +356,10 @@ test("two windows on one event stream track and wake only their own sessions", a
 
   office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-two-windows", from: "azri", subject: "For one window" }]
   await until(() => [...theao.prompts, ...om.prompts].some((prompt) => prompt.text.includes("message-two-windows")), "the inbox prompt")
-  assert.ok(theao.prompts.every((prompt) => prompt.sessionID === "theao-1"))
-  assert.ok(om.prompts.every((prompt) => prompt.sessionID === "om-1"))
+  // Each window's inbox child hangs off its own root session.
+  const roots = (window: ReturnType<typeof makeContext>) => window.prompts.map((prompt) => window.created.find((session) => session.id === prompt.sessionID)?.parentID)
+  assert.ok(roots(theao).every((id) => id === "theao-1"))
+  assert.ok(roots(om).every((id) => id === "om-1"))
   for (const cleanup of cleanups) await cleanup()
   office.calls.length = 0
 })
@@ -356,6 +371,7 @@ test("dispatches a new assigned todo task to a supervisor session in its own wor
   execFileSync("git", ["-C", repo, "init", "-q"])
   execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
   const worker = makeContext(repo, { pollInterval: 1_000 })
+  worker.details.set("parent", { agent: "build", model: { providerID: "test", id: "chosen" } })
   const cleanup = await plugin.setup(worker.ctx)
   await until(() => mcpCalls().length > 0, "the baseline poll")
   worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
@@ -366,6 +382,9 @@ test("dispatches a new assigned todo task to a supervisor session in its own wor
   const worktree = `${repo}-office-${short}`
   assert.equal(worker.created[0].parentID, "parent")
   assert.deepEqual(worker.created[0].location, { directory: worktree })
+  // The supervisor runs on the parent's model and agent, not OpenCode's defaults.
+  assert.deepEqual(worker.created[0].model, { providerID: "test", id: "chosen" })
+  assert.equal(worker.created[0].agent, "build")
   assert.equal(execFileSync("git", ["-C", worktree, "branch", "--show-current"], { encoding: "utf8" }).trim(), `office/${short}`)
   await until(() => worker.prompts.some((prompt) => prompt.sessionID === worker.created[0].id), "the supervisor prompt")
   const prompt = worker.prompts.find((item) => item.sessionID === worker.created[0].id)!.text
@@ -379,6 +398,135 @@ test("dispatches a new assigned todo task to a supervisor session in its own wor
   worker.synthetics.length = 0
   worker.push({ type: "session.idle", location: { directory: worktree }, data: { sessionID: worker.created[0].id } })
   await until(() => worker.synthetics.some((message) => /supervisor session .* is idle/.test(message.text)), "the completion notice")
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("inbox work reuses one child per root session, on the root's model and agent", async () => {
+  office.calls.length = 0
+  // The inbox prompt lists ten messages, so earlier tests' mail is cleared.
+  office.state.unreadMessages = []
+  const worker = makeContext("/reuse", { pollInterval: 1_000 })
+  worker.details.set("root", { agent: "plan", model: { providerID: "test", id: "chosen", variant: "high" } })
+  const cleanup = await plugin.setup(worker.ctx)
+  const status = async () => JSON.parse((await worker.tools.find((tool) => tool.name === "office_status").execute({}, {})).content)
+  const delivered = (id: string) => until(() => worker.prompts.some((prompt) => prompt.text.includes(id)), id)
+  const promptFor = (id: string) => worker.prompts.find((prompt) => prompt.text.includes(id))!
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "root", status: { type: "busy" } } })
+  await until(() => office.calls.some((c) => c.path === "/mcp" && c.body.params.arguments?.status === "working"), "the working report")
+
+  office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-reuse-1", from: "azri", subject: "First" }]
+  await delivered("message-reuse-1")
+  assert.equal(worker.created.length, 1)
+  const inbox = worker.created[0]
+  assert.equal(promptFor("message-reuse-1").sessionID, inbox.id)
+  assert.equal(inbox.parentID, "root")
+  assert.equal(inbox.agent, "plan")
+  assert.deepEqual(inbox.model, { providerID: "test", id: "chosen", variant: "high" })
+  assert.deepEqual(inbox.location, { directory: "/reuse" })
+  assert.ok(!worker.synthetics.some((message) => /default model/.test(message.text)))
+
+  // The inbox child counts as busy work but never becomes the target.
+  worker.push({ type: "session.status", data: { sessionID: inbox.id, status: { type: "busy" } } })
+  worker.push({ type: "session.idle", data: { sessionID: "root" } })
+  let busy: any
+  await until(() => {
+    void status().then((value) => (busy = value))
+    return busy?.busy.length === 1 && busy.busy[0] === inbox.id
+  }, "the root idle with its inbox child busy")
+  assert.equal(busy.lastSessionID, "root")
+  assert.equal(busy.targetSession, "root")
+  assert.deepEqual(busy.inboxSessions, { [inbox.id]: "root" })
+  assert.ok(!office.calls.some((c) => c.body?.params?.arguments?.status === "idle"), "a busy inbox child keeps the agent working")
+
+  office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-reuse-2", from: "azri", subject: "Second" }]
+  await delivered("message-reuse-2")
+  assert.equal(promptFor("message-reuse-2").sessionID, inbox.id)
+  assert.equal(worker.created.length, 1)
+
+  // A deleted inbox child is replaced on the next mail.
+  worker.push({ type: "session.deleted", data: { sessionID: inbox.id } })
+  await until(() => office.calls.some((c) => c.body?.params?.arguments?.status === "idle"), "the idle report")
+  office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-reuse-3", from: "azri", subject: "Third" }]
+  await delivered("message-reuse-3")
+  assert.equal(worker.created.length, 2)
+  assert.equal(promptFor("message-reuse-3").sessionID, worker.created[1].id)
+  assert.equal(worker.created[1].parentID, "root")
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("a root without a model: the inbox child uses OpenCode's default and the chat is told once", async () => {
+  office.calls.length = 0
+  office.state.unreadMessages = []
+  const worker = makeContext("/default-model", { pollInterval: 1_000 })
+  const cleanup = await plugin.setup(worker.ctx)
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "root", status: { type: "busy" } } })
+  office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-default-1", from: "azri", subject: "No model" }]
+  await until(() => worker.prompts.some((prompt) => prompt.text.includes("message-default-1")), "the inbox prompt")
+  assert.equal(worker.created.length, 1)
+  assert.equal(worker.created[0].parentID, "root")
+  assert.ok(!("model" in worker.created[0]) && !("agent" in worker.created[0]))
+
+  // A second child for the same root does not repeat the notice.
+  worker.push({ type: "session.deleted", data: { sessionID: worker.created[0].id } })
+  office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-default-2", from: "azri", subject: "Still no model" }]
+  await until(() => worker.prompts.some((prompt) => prompt.text.includes("message-default-2")), "the second inbox prompt")
+  assert.equal(worker.created.length, 2)
+  const notices = worker.synthetics.filter((message) => /default model/.test(message.text))
+  assert.deepEqual(notices.map((message) => [message.sessionID, message.text]), [["root", "Office work is using OpenCode's default model; pick a model in this chat to choose one."]])
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("a refused claim leaves no child session behind", async () => {
+  office.calls.length = 0
+  office.state.unreadMessages = []
+  const worker = makeContext("/claim-refused", { pollInterval: 1_000 })
+  const cleanup = await plugin.setup(worker.ctx)
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+  office.state.failing.add("update_task")
+  try {
+    office.state.openTasks = [...office.state.openTasks, { id: "task-refused", title: "Taken elsewhere", status: "todo" }]
+    await until(() => worker.synthetics.some((message) => /Could not dispatch Office task task-refused/.test(message.text)), "the dispatch failure")
+  } finally {
+    office.state.failing.delete("update_task")
+  }
+  assert.deepEqual(worker.created, [])
+  assert.ok(!worker.prompts.some((prompt) => prompt.text.includes("task-refused")))
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("a poll still waiting on its inbox prompt is not overlapped by the next", async () => {
+  office.calls.length = 0
+  office.state.unreadMessages = []
+  const worker = makeContext("/slow-poll", { pollInterval: 1_000 })
+  let release!: () => void
+  const held = new Promise<void>((resolve) => (release = resolve))
+  worker.ctx.session.prompt = async (prompt: any) => {
+    worker.prompts.push(prompt)
+    await held
+  }
+  const cleanup = await plugin.setup(worker.ctx)
+  const lastPollAt = async () => JSON.parse((await worker.tools.find((tool) => tool.name === "office_status").execute({}, {})).content).lastPollAt
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "root", status: { type: "busy" } } })
+  office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-slow", from: "azri", subject: "Slow" }]
+  await until(() => worker.prompts.some((prompt) => prompt.text.includes("message-slow")), "the held inbox prompt")
+  const stuck = await lastPollAt()
+  await new Promise((resolve) => setTimeout(resolve, 2_500))
+  assert.equal(await lastPollAt(), stuck, "no poll ran while the last one was held")
+  assert.equal(worker.prompts.length, 1)
+  release()
+  let next = stuck
+  await until(() => {
+    void lastPollAt().then((at) => (next = at))
+    return next !== stuck
+  }, "the next poll")
   await cleanup()
   office.calls.length = 0
 })

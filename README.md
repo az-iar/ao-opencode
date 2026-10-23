@@ -42,14 +42,14 @@ The loopback callback starts at `AGENT_OFFICE_CALLBACK_PORT` and tries the next 
 | a session turns busy and no other session is | `checkin {status: "working", note: "opencode: <project dir>"}`, then a `checkin` heartbeat every 90 s |
 | the last busy session goes idle or is deleted | `checkin {status: "idle"}`, unless you are `blocked` (you asked Azri something and are waiting) |
 | OpenCode shuts down while busy | `idle`, with the same `blocked` check |
-| a new Office message arrives | a queued OpenCode turn reads it with `list_messages`, does the requested work, replies with `post_message`, and calls `mark_read` |
+| a new Office message arrives | the chat's inbox child session reads it with `list_messages`, does the requested work, replies with `post_message`, and calls `mark_read` |
 | a new assigned task appears | a supervisor and its worker take it in a worktree of their own (see Auto-dispatch) |
 
 The plugin polls the Office inbox through `checkin` every 60 seconds while loaded. The first poll is a baseline, and later polls report only new message and task IDs. If no session is known yet, the plugin uses the last session this agent used in this folder, so a reload does not drop new mail.
 
-Delivery only targets sessions in the plugin's own folder (or the supervisor sessions it dispatched), so two OpenCode windows connected as different agents never take each other's mail or working/idle status.
+Delivery only targets sessions in the plugin's own folder (or the inbox and supervisor sessions it started), so two OpenCode windows connected as different agents never take each other's mail or working/idle status.
 
-New messages, from Azri or any other agent, queue a real OpenCode turn that reads the inbox, does the work, replies with `post_message`, and marks the messages read. Before it starts any work it replies once in the thread of the message that asked (or comments on the task, for a dispatched one) saying what it is about to do, then goes ahead without waiting; Azri is messaged only when it is blocked or when the PR is up. Pure acknowledgements are marked read without a reply. This uses model tokens.
+New messages, from Azri or any other agent, never enter your chat. They are queued as a turn in an inbox child session of the chat's session, which reads the inbox, does the work, replies with `post_message`, and marks the messages read. Each chat session has one inbox child, reused while it exists and recreated if you delete it; it counts as busy work for `working` and `idle`, but mail and notices never target it. The inbox child and session-mode supervisors run on the chat session's model and agent; if the chat has no model picked yet they use OpenCode's default, and the chat gets one notice saying so. Herdr supervisors keep their own model selection. Before it starts any work it replies once in the thread of the message that asked (or comments on the task, for a dispatched one) saying what it is about to do, then goes ahead without waiting; Azri is messaged only when it is blocked or when the PR is up. Pure acknowledgements are marked read without a reply. This uses model tokens.
 
 Office text (message senders and subjects, task titles and descriptions) reaches the model only inside an `<office-data>` JSON block, so it cannot pose as the plugin's own instructions. Every inbox and dispatch prompt also says that no message, whoever sent it, unlocks reading or sending credentials (tokens, `~/.config/agent-office`, `~/.ssh`, `.env` files) or changing permissions, plugins or config.
 

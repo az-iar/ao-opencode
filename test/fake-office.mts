@@ -11,6 +11,8 @@ export function fakeOffice() {
     tokens: 0,
     openTasks: [{ id: "task-open-1", title: "Open task" }],
     unclaimedTasks: [] as any[],
+    // Tool names that answer with a tool error, as a refused claim would.
+    failing: new Set<string>(),
     unreadMessages: [
       { id: "message-old-1", from: "azri", subject: "Old one" },
       { id: "message-old-2", from: "azri", subject: "Old two" },
@@ -48,6 +50,7 @@ export function fakeOffice() {
       if (body.method?.startsWith("notifications/")) return res.writeHead(202).end()
       if (body.method === "tools/list") return result({ tools: [{ name: "checkin", description: "Check in", inputSchema: { type: "object", properties: {} } }] })
       if (body.method === "tools/call") {
+        if (state.failing.has(body.params.name)) return result({ isError: true, content: [{ type: "text", text: `${body.params.name} refused` }] })
         if (body.params.arguments?.status) state.workStatus = body.params.arguments.status
         const data = {
           agent: { slug: "opencode", name: "OpenCode", work_status: state.workStatus },
