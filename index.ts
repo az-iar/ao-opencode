@@ -5,7 +5,8 @@
 //                      appear in OpenCode. The name pre-fills a new agent.
 //   while running      `working` while any session runs, a heartbeat every
 //                      90 s, `idle` once every session is quiet; `blocked` is
-//                      never overridden. New assigned tasks go to a supervisor
+//                      never overridden. New mail runs in an inbox child of
+//                      the chat's session. New assigned tasks go to a supervisor
 //                      and its worker in a worktree, through Herdr or a child
 //                      session, up to two tasks at a time.
 //
@@ -72,6 +73,8 @@ const SCOPES = "office:read office:write office:events"
 const HEARTBEAT_MS = 90_000
 const APPROVAL_TIMEOUT_MS = 5 * 60_000
 const DEFAULT_POLL_MS = 60_000
+// The inbox child's first line: nobody in the human's chat sees its replies.
+const INBOX_SESSION = "This is your Office inbox session, apart from the human's chat; nobody reads your replies here, so answer and ask only through Agent Office."
 
 type PendingCallback = { resolve: (code: string) => void; reject: (err: Error) => void; close: () => void }
 
@@ -392,13 +395,17 @@ export default Plugin.define({
       void report("idle")
     }
 
-    const targetSession = () => [...busy].filter((id) => !id.startsWith("herdr:") && !dispatchedSessions.has(id)).at(-1) ?? lastSessionID
+    // Inbox children by id, each mapped to the root session it works for.
+    const inboxSessions = new Map<string, string>()
+    // Children this plugin started count as busy work, but never as a target.
+    const officeChild = (sessionID: string) => dispatchedSessions.has(sessionID) || inboxSessions.has(sessionID)
+    const targetSession = () => [...busy].filter((id) => !id.startsWith("herdr:") && !officeChild(id)).at(-1) ?? lastSessionID
     // One OpenCode server can stream events for several windows, so a session
     // counts only when OpenCode places it in this folder or this plugin
-    // dispatched it.
+    // started it.
     const ownership = new Map<string, Promise<boolean>>()
     const ownsSession = (sessionID: string) => {
-      if (dispatchedSessions.has(sessionID)) return Promise.resolve(true)
+      if (officeChild(sessionID)) return Promise.resolve(true)
       let owned = ownership.get(sessionID)
       if (!owned) {
         owned = ctx.session.get({ sessionID }).then(
@@ -431,6 +438,48 @@ export default Plugin.define({
     const notify = (sessionID: string | undefined, text: string) => {
       if (!sessionID) return
       void ctx.session.synthetic({ sessionID, text, description: "Agent Office" }).catch((err) => warn("could not notify the session", { error: String(err) }))
+    }
+
+    // Office children run on their root session's model and agent, not on
+    // OpenCode's defaults. A root without an explicit model still gets its
+    // child, on the default model, and its chat is told once.
+    const defaultModelNoticed = new Set<string>()
+    const createChild = async (parent: string, title: string, location?: { directory: string }) => {
+      const info = await ctx.session.get({ sessionID: parent })
+      if (!info.model && !defaultModelNoticed.has(parent)) {
+        defaultModelNoticed.add(parent)
+        notify(parent, "Office work is using OpenCode's default model; pick a model in this chat to choose one.")
+      }
+      return ctx.session.create({
+        parentID: parent,
+        title,
+        location: location ?? { directory: info.location.directory },
+        ...(info.agent ? { agent: info.agent } : {}),
+        ...(info.model ? { model: info.model } : {}),
+      })
+    }
+
+    // New mail runs in one inbox child per root session, reused while it
+    // lives, so Office work stays out of the human's chat history.
+    const deliverInbox = async (parent: string, text: string) => {
+      let sessionID = [...inboxSessions].find(([, root]) => root === parent)?.[0]
+      if (sessionID && !(await ctx.session.get({ sessionID }).then(() => true, () => false))) {
+        inboxSessions.delete(sessionID)
+        sessionID = undefined
+      }
+      if (sessionID) {
+        await ctx.session.prompt({ sessionID, text, delivery: "queue" })
+        return
+      }
+      const child = await createChild(parent, "Office inbox")
+      inboxSessions.set(child.id, parent)
+      try {
+        await ctx.session.prompt({ sessionID: child.id, text, delivery: "queue" })
+      } catch (err) {
+        inboxSessions.delete(child.id)
+        void ctx.session.remove({ sessionID: child.id }).catch(() => {})
+        throw err
+      }
     }
 
     const connectedSummary = async () => {
@@ -509,12 +558,13 @@ export default Plugin.define({
 
     const dispatchSession = async (id: string, task: any, title: string, parent: string) => {
       const { path, branch } = await addWorktree(repo, id)
-      const child = await ctx.session.create({ parentID: parent, title: `Office: ${title}`.slice(0, 120), location: { directory: path } })
+      const child = await createChild(parent, `Office: ${title}`.slice(0, 120), { directory: path })
       dispatchedSessions.set(child.id, { taskID: id, parent, title })
       try {
         await ctx.session.prompt({ sessionID: child.id, text: supervisorPrompt(id, task, path, branch) })
       } catch (err) {
         dispatchedSessions.delete(child.id)
+        void ctx.session.remove({ sessionID: child.id }).catch(() => {})
         throw err
       }
       notify(parent, `Dispatched Office task ${id} to supervisor session ${child.id} (${branch}) at ${path}.`)
@@ -570,22 +620,32 @@ export default Plugin.define({
       }
     }
 
+    // One pump at a time, including while it looks up the remembered session.
+    let pumping = false
     const pumpDispatch = () => {
-      if (life.signal.aborted || dispatchMode === "off") return
+      if (life.signal.aborted || dispatchMode === "off" || pumping) return
+      pumping = true
       if (!targetSession()) {
-        void targetSessionAsync().then((id) => {
-          if (id) pumpDispatch()
-        })
+        void targetSessionAsync()
+          .catch(() => undefined)
+          .then((id) => {
+            pumping = false
+            if (id) pumpDispatch()
+          })
         return
       }
-      for (const id of [...backlog]) {
-        if (dispatching.size >= MAX_DISPATCHES) return
-        const acquired = acquireDispatch(dispatchDir(), id)
-        if (acquired === "full") return
-        backlog.delete(id)
-        if (acquired === "busy") continue
-        dispatching.add(id)
-        void dispatchTask(id)
+      try {
+        for (const id of [...backlog]) {
+          if (dispatching.size >= MAX_DISPATCHES) return
+          const acquired = acquireDispatch(dispatchDir(), id)
+          if (acquired === "full") return
+          backlog.delete(id)
+          if (acquired === "busy") continue
+          dispatching.add(id)
+          void dispatchTask(id)
+        }
+      } finally {
+        pumping = false
       }
     }
 
@@ -629,9 +689,9 @@ export default Plugin.define({
         if (!claimNotice(noticeDir(), ids)) {
           for (const item of freshMessages) seenMessages.add(itemKey(item, "message"))
         } else {
-          const text = inboxPrompt(freshMessages)
+          const text = `${INBOX_SESSION}\n${inboxPrompt(freshMessages)}`
           try {
-            await ctx.session.prompt({ sessionID, text, delivery: "queue" })
+            await deliverInbox(sessionID, text)
             lastPromptAt = Date.now()
             lastPromptError = undefined
             for (const item of freshMessages) seenMessages.add(itemKey(item, "message"))
@@ -653,7 +713,11 @@ export default Plugin.define({
       if (backlog.size > 0) pumpDispatch()
     }
 
+    // A slow poll (a queued prompt, a stuck checkin) must not overlap the next.
+    let polling = false
     const poll = async () => {
+      if (polling) return
+      polling = true
       try {
         if (!(await bearer())) return
         const me = await checkin()
@@ -665,6 +729,8 @@ export default Plugin.define({
       } catch (err) {
         lastPollError = String(err)
         warn("could not poll the Office inbox", { error: String(err) })
+      } finally {
+        polling = false
       }
     }
 
@@ -770,6 +836,7 @@ export default Plugin.define({
                 seen: { messages: seenMessages.size, unclaimed: seenTasks.size, assigned: seenAssigned.size },
                 backlog: [...backlog],
                 dispatching: [...dispatching],
+                inboxSessions: Object.fromEntries(inboxSessions),
               },
               null,
               2,
@@ -790,11 +857,11 @@ export default Plugin.define({
           const deleted = event.type === "session.deleted"
           if (eventSessionID ? !deleted && !(await ownsSession(eventSessionID)) : directory && directory !== ctx.location.directory) continue
           lastEventSessionID = eventSessionID
-          if (lastEventSessionID && !deleted && !dispatchedSessions.has(lastEventSessionID)) rememberSession(lastEventSessionID)
+          if (lastEventSessionID && !deleted && !officeChild(lastEventSessionID)) rememberSession(lastEventSessionID)
           void ensureConnected()
           switch (event.type) {
             case "session.status": {
-              const child = dispatchedSessions.has(event.data.sessionID)
+              const child = officeChild(event.data.sessionID)
               if (!child) rememberSession(event.data.sessionID)
               if (event.data.status.type === "idle") {
                 stop(event.data.sessionID)
@@ -803,7 +870,7 @@ export default Plugin.define({
               break
             }
             case "session.idle": {
-              const child = dispatchedSessions.has(event.data.sessionID)
+              const child = officeChild(event.data.sessionID)
               if (!child) rememberSession(event.data.sessionID)
               stop(event.data.sessionID)
               settleChild(event.data.sessionID)
@@ -811,6 +878,9 @@ export default Plugin.define({
             }
             case "session.deleted": {
               ownership.delete(event.data.sessionID)
+              defaultModelNoticed.delete(event.data.sessionID)
+              // A deleted inbox child is recreated on the next mail.
+              for (const [child, root] of inboxSessions) if (child === event.data.sessionID || root === event.data.sessionID) inboxSessions.delete(child)
               const key = sessionStoreKey()
               if (lastSessionID === event.data.sessionID) {
                 lastSessionID = undefined
