@@ -473,15 +473,17 @@ export default Plugin.define({
       creating.add(pending)
       try {
         const info = await bounded(ctx.session.get({ sessionID: parent }), "session.get")
-        const child = await bounded(
-          ctx.session.create({
-            parentID: parent,
-            title,
-            location: location ?? { directory: info.location.directory },
-            ...(info.model ? { model: info.model } : {}),
-          }),
-          "session.create",
-        )
+        const created = ctx.session.create({
+          parentID: parent,
+          title,
+          location: location ?? { directory: info.location.directory },
+          ...(info.model ? { model: info.model } : {}),
+        })
+        // A create that lands after its timeout is removed, so no empty child is left.
+        const child = await bounded(created, "session.create").catch((err) => {
+          void created.then((late) => ctx.session.remove({ sessionID: late.id })).catch(() => {})
+          throw err
+        })
         if (pending.deleted) {
           void ctx.session.remove({ sessionID: child.id }).catch(() => {})
           throw new Error(`session ${parent} was deleted while its Office child was created`)
@@ -499,7 +501,9 @@ export default Plugin.define({
     // New mail runs in one inbox child per root session, reused while it
     // lives, so Office work stays out of the human's chat history. Only a
     // session OpenCode reports missing is replaced; any other error is retried.
-    const deliverInbox = async (parent: string, text: string) => {
+    // A queue into the reused child can land after it timed out, so it is
+    // handed back in `sent` for the caller to settle the mail from.
+    const deliverInbox = async (parent: string, text: string, sent: { queued?: Promise<unknown> } = {}) => {
       let sessionID = [...inboxSessions].find(([, root]) => root === parent)?.[0]
       if (sessionID) {
         const gone = await bounded(ctx.session.get({ sessionID }), "session.get").then(
@@ -515,7 +519,8 @@ export default Plugin.define({
         }
       }
       if (sessionID) {
-        await bounded(ctx.session.prompt({ sessionID, text, delivery: "queue" }), "session.prompt")
+        sent.queued = ctx.session.prompt({ sessionID, text, delivery: "queue" })
+        await bounded(sent.queued, "session.prompt")
         return
       }
       const child = await createChild(parent, "Office inbox")
@@ -608,7 +613,7 @@ export default Plugin.define({
       const child = await createChild(parent, `Office: ${title}`.slice(0, 120), { directory: path })
       dispatchedSessions.set(child.id, { taskID: id, parent, title })
       try {
-        await ctx.session.prompt({ sessionID: child.id, text: supervisorPrompt(id, task, path, branch) })
+        await bounded(ctx.session.prompt({ sessionID: child.id, text: supervisorPrompt(id, task, path, branch) }), "session.prompt")
       } catch (err) {
         dispatchedSessions.delete(child.id)
         void ctx.session.remove({ sessionID: child.id }).catch(() => {})
@@ -737,13 +742,22 @@ export default Plugin.define({
           for (const item of freshMessages) seenMessages.add(itemKey(item, "message"))
         } else {
           const text = `${INBOX_SESSION}\n${inboxPrompt(freshMessages)}`
+          const sent: { queued?: Promise<unknown> } = {}
           try {
-            await deliverInbox(sessionID, text)
+            await deliverInbox(sessionID, text, sent)
             lastPromptAt = Date.now()
             lastPromptError = undefined
             for (const item of freshMessages) seenMessages.add(itemKey(item, "message"))
           } catch (err) {
-            releaseNotice(noticeDir(), ids)
+            if (sent.queued) {
+              // The reused child may still get this mail: it stays claimed and
+              // seen, and is released for a retry only if the queue fails.
+              for (const id of ids) seenMessages.add(id)
+              void sent.queued.catch(() => {
+                for (const id of ids) seenMessages.delete(id)
+                releaseNotice(noticeDir(), ids)
+              })
+            } else releaseNotice(noticeDir(), ids)
             lastPromptError = String(err)
             warn("could not wake the session for new Office messages", { error: String(err) })
           }
