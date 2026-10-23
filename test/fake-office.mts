@@ -13,6 +13,10 @@ export function fakeOffice() {
     unclaimedTasks: [] as any[],
     // Tool names that answer with a tool error, as a refused claim would.
     failing: new Set<string>(),
+    // A narrower refusal, by tool name and arguments.
+    refuse: undefined as undefined | ((name: string, args: any) => boolean),
+    // What get_task returns for a task id; other ids get the checkin data.
+    taskDetails: new Map<string, any>(),
     unreadMessages: [
       { id: "message-old-1", from: "azri", subject: "Old one" },
       { id: "message-old-2", from: "azri", subject: "Old two" },
@@ -50,7 +54,11 @@ export function fakeOffice() {
       if (body.method?.startsWith("notifications/")) return res.writeHead(202).end()
       if (body.method === "tools/list") return result({ tools: [{ name: "checkin", description: "Check in", inputSchema: { type: "object", properties: {} } }] })
       if (body.method === "tools/call") {
-        if (state.failing.has(body.params.name)) return result({ isError: true, content: [{ type: "text", text: `${body.params.name} refused` }] })
+        if (state.failing.has(body.params.name) || state.refuse?.(body.params.name, body.params.arguments)) return result({ isError: true, content: [{ type: "text", text: `${body.params.name} refused` }] })
+        if (body.params.name === "get_task" && state.taskDetails.has(body.params.arguments?.task_id)) {
+          const detail = { task: state.taskDetails.get(body.params.arguments.task_id) }
+          return result({ content: [{ type: "text", text: JSON.stringify(detail) }], structuredContent: detail })
+        }
         if (body.params.arguments?.status) state.workStatus = body.params.arguments.status
         const data = {
           agent: { slug: "opencode", name: "OpenCode", work_status: state.workStatus },

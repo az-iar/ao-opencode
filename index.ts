@@ -649,11 +649,12 @@ export default Plugin.define({
     const dispatchTask = async (id: string) => {
       let held = false
       let claimed = false
+      let task: any
       const parent = await targetSessionAsync()
       try {
         if (!parent) return
         const detail = await call("get_task", { task_id: id }).catch(() => undefined)
-        const task = detail?.task ?? detail
+        task = detail?.task ?? detail
         const title = String(task?.title ?? id)
         await claimTask(call, id)
         claimed = true
@@ -668,7 +669,7 @@ export default Plugin.define({
         notify(parent, `Could not dispatch Office task ${id}: ${String(err)}`)
         // The finally drops it from the dispatch state, and it stays seen, so
         // a lasting failure is not claimed again.
-        if (claimed) await blockTask(call, id, err).catch((blockErr) => warn("could not mark the Office task blocked", { task: id, error: String(blockErr) }))
+        if (claimed) await blockTask(call, id, err, task, ownAgent?.slug).catch((blockErr) => warn("could not mark the Office task blocked", { task: id, error: String(blockErr) }))
       } finally {
         if (!held) {
           releaseDispatch(dispatchDir(), id)
@@ -757,7 +758,10 @@ export default Plugin.define({
           } catch (err) {
             if (sent.queued) {
               // The reused child may still get this mail: it stays claimed and
-              // seen, and is released for a retry only if the queue fails.
+              // seen, and is released for a retry only if the queue fails. A
+              // queue that never settles keeps its mail seen here until a
+              // restart, and the cron poller can take it once the notice
+              // expires after 10 minutes: the price of never queueing it twice.
               for (const id of ids) seenMessages.add(id)
               void sent.queued.catch(() => {
                 for (const id of ids) seenMessages.delete(id)

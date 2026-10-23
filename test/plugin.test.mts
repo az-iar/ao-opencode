@@ -743,8 +743,14 @@ test("a dispatch that fails after the claim blocks the task with a reason and le
   const status = async () => JSON.parse((await worker.tools.find((tool) => tool.name === "office_status").execute({}, {})).content)
   await until(() => mcpCalls().length > 0, "the baseline poll")
   worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
-  office.state.openTasks = [...office.state.openTasks, { id: "task-create-fails", title: "Never created", status: "todo" }]
-  await until(() => taskUpdates("task-create-fails").some((update) => update.status === "blocked"), "the blocked update")
+  // Without the task's detail it waits on Azri.
+  office.state.failing.add("get_task")
+  try {
+    office.state.openTasks = [...office.state.openTasks, { id: "task-create-fails", title: "Never created", status: "todo" }]
+    await until(() => taskUpdates("task-create-fails").some((update) => update.status === "blocked"), "the blocked update")
+  } finally {
+    office.state.failing.delete("get_task")
+  }
   // The reason names the failure, without paths, URLs or the lines after it.
   assert.deepEqual(taskUpdates("task-create-fails"), [
     { task_id: "task-create-fails", status: "in_progress", comment: "OpenCode dispatched this task to a supervisor and a worker." },
@@ -756,6 +762,71 @@ test("a dispatch that fails after the claim blocks the task with a reason and le
   // Blocked, not back to todo: later polls do not claim it again.
   await new Promise((resolve) => setTimeout(resolve, 1_500))
   assert.equal(taskUpdates("task-create-fails").length, 2)
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("a task whose start fails waits on the agent that created it, not on Azri", async () => {
+  office.calls.length = 0
+  office.state.unreadMessages = []
+  const repo = join(mkdtempSync(join(tmpdir(), "ao-dispatch-")), "repo")
+  mkdirSync(repo)
+  execFileSync("git", ["-C", repo, "init", "-q"])
+  execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  const worker = makeContext(repo, { pollInterval: 1_000 })
+  worker.ctx.session.create = async () => {
+    throw new Error("create refused")
+  }
+  office.state.taskDetails.set("task-by-agent", { id: "task-by-agent", title: "From an agent", created_by: "agent:Planner" })
+  office.state.taskDetails.set("task-by-admin", { id: "task-by-admin", title: "From an admin", created_by: "admin:azri" })
+  office.state.taskDetails.set("task-by-self", { id: "task-by-self", title: "From itself", created_by: "agent:opencode" })
+  const cleanup = await plugin.setup(worker.ctx)
+  const waitingOn = (id: string) => taskUpdates(id).find((update) => update.status === "blocked")?.waiting_on
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+  office.state.openTasks = [
+    ...office.state.openTasks,
+    ...["task-by-agent", "task-by-admin", "task-by-self"].map((id) => ({ id, title: id, status: "todo" })),
+  ]
+  await until(() => ["task-by-agent", "task-by-admin", "task-by-self"].every((id) => waitingOn(id)), "the blocked updates")
+  assert.deepEqual(["task-by-agent", "task-by-admin", "task-by-self"].map(waitingOn), ["planner", "azri", "azri"])
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("a refused creator falls back to Azri, and a refused blocked update is logged and left", async () => {
+  office.calls.length = 0
+  office.state.unreadMessages = []
+  const repo = join(mkdtempSync(join(tmpdir(), "ao-dispatch-")), "repo")
+  mkdirSync(repo)
+  execFileSync("git", ["-C", repo, "init", "-q"])
+  execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  const worker = makeContext(repo, { pollInterval: 1_000 })
+  worker.ctx.session.create = async () => {
+    throw new Error("create refused")
+  }
+  office.state.taskDetails.set("task-by-ghost", { id: "task-by-ghost", title: "From a gone agent", created_by: "agent:ghost" })
+  office.state.taskDetails.set("task-never-blocked", { id: "task-never-blocked", title: "Cannot be blocked", created_by: "agent:ghost" })
+  const cleanup = await plugin.setup(worker.ctx)
+  const status = async () => JSON.parse((await worker.tools.find((tool) => tool.name === "office_status").execute({}, {})).content)
+  const blocked = (id: string) => taskUpdates(id).filter((update) => update.status === "blocked").map((update) => update.waiting_on)
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+  // The Office knows no agent ghost, and refuses any blocked update for the second task.
+  office.state.refuse = (name, args) => name === "update_task" && args?.status === "blocked" && (args.waiting_on === "ghost" || args.task_id === "task-never-blocked")
+  try {
+    office.state.openTasks = [...office.state.openTasks, ...["task-by-ghost", "task-never-blocked"].map((id) => ({ id, title: id, status: "todo" }))]
+    await until(() => blocked("task-by-ghost").length === 2, "the retried blocked update")
+    await until(() => warnings.some((line) => /could not mark the Office task blocked.*task-never-blocked/.test(line)), "the logged blocked failure")
+    assert.deepEqual(blocked("task-by-ghost"), ["ghost", "azri"])
+    assert.deepEqual(blocked("task-never-blocked"), ["ghost", "azri"])
+    assert.deepEqual((await status()).dispatching, [])
+    // Left as it is: no further claim or update.
+    await new Promise((resolve) => setTimeout(resolve, 1_500))
+    assert.equal(taskUpdates("task-never-blocked").length, 3)
+  } finally {
+    office.state.refuse = undefined
+  }
   await cleanup()
   office.calls.length = 0
 })
