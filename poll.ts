@@ -23,6 +23,7 @@ import {
   acquireDispatch,
   addWorktree,
   agentStateDir,
+  blockTask,
   claimNotice,
   claimTask,
   createBearer,
@@ -171,14 +172,18 @@ async function main(): Promise<number> {
       }
       runs.push(
         (async () => {
+          let claimed = false
+          let detail: any
           try {
-            const detail = await call("get_task", { task_id: id }).catch(() => undefined)
+            detail = await call("get_task", { task_id: id }).catch(() => undefined)
             await claimTask(call, id)
+            claimed = true
             const { path, branch } = await addWorktree(canonicalRoot(directory), id)
             log(`dispatching task ${id} to ${path}`)
             log(`task ${id} run exited ${await runOpencode(path, `Office task ${id}`, supervisorPrompt(id, detail?.task ?? detail, path, branch), DISPATCH_STALE_MS)}`)
           } catch (err) {
             log(`could not dispatch task ${id}: ${String(err)}`)
+            if (claimed) await blockTask(call, id, err, detail?.task ?? detail, me.agent?.slug).catch((blockErr) => log(`could not mark task ${id} blocked: ${String(blockErr)}`))
           } finally {
             releaseDispatch(dispatchDir, id)
           }

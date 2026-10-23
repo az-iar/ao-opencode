@@ -15,6 +15,8 @@ export function fakeOffice() {
     failing: new Set<string>(),
     // A narrower refusal, by tool name and arguments.
     refuse: undefined as undefined | ((name: string, args: any) => boolean),
+    // An HTTP status to answer with instead, as an Office deploy would.
+    httpError: undefined as undefined | ((name: string, args: any) => number | undefined),
     // What get_task returns for a task id; other ids get the checkin data.
     taskDetails: new Map<string, any>(),
     unreadMessages: [
@@ -54,6 +56,8 @@ export function fakeOffice() {
       if (body.method?.startsWith("notifications/")) return res.writeHead(202).end()
       if (body.method === "tools/list") return result({ tools: [{ name: "checkin", description: "Check in", inputSchema: { type: "object", properties: {} } }] })
       if (body.method === "tools/call") {
+        const status = state.httpError?.(body.params.name, body.params.arguments)
+        if (status) return json(status, { error: "bad gateway" })
         if (state.failing.has(body.params.name) || state.refuse?.(body.params.name, body.params.arguments)) return result({ isError: true, content: [{ type: "text", text: `${body.params.name} refused` }] })
         if (body.params.name === "get_task" && state.taskDetails.has(body.params.arguments?.task_id)) {
           const detail = { task: state.taskDetails.get(body.params.arguments.task_id) }
