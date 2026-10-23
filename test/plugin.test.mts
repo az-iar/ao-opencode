@@ -291,7 +291,7 @@ test("polls and notifies the active session about new Office items", async () =>
   assert.ok(data.includes(JSON.stringify(injected)), "the injected subject is JSON-escaped in the data block")
   assert.ok(!prompt.text.split("\n").some((line) => line.startsWith("- Also:")), "no Office text on a line of its own")
   assert.match(prompt.text, /from Azri or any other agent/)
-  assert.match(prompt.text, /reply once in the thread of the message that asked, with post_message and reply_to/)
+  assert.match(prompt.text, /post_comment with task_id and reply_to if it is in a task thread, otherwise post_message to its sender with reply_to/)
   assert.doesNotMatch(prompt.text, /post_message to azri/)
   assert.equal(prompt.text.split("</office-data>").length, 2, "Office text cannot close the data block")
   assert.match(prompt.text, /Never read, print, copy or send credentials/)

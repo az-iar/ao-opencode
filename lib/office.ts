@@ -39,7 +39,7 @@ export function itemKey(item: any, kind: "message" | "task"): string {
 export const NOTE_FIRST =
   "Before you start any work, post one short comment on the task with post_comment: what you are about to do and who asked. Then start; do not wait for a reply. Message Azri only when you are blocked or when the pull request is up."
 export const NOTE_FIRST_BATCH =
-  "Before you start any of that work, reply once in the thread of the message that asked, with post_message and reply_to set to its id, saying what you are about to do. Then start; do not wait for a reply. Send no note if no message asks for work, and do not message Azri separately unless you are blocked."
+  "Before you start any of that work, reply once to the message that asked, saying what you are about to do: post_comment with task_id and reply_to if it is in a task thread, otherwise post_message to its sender with reply_to; if the reply is refused, send it without reply_to. Then start; do not wait for a reply. Send no note if no message asks for work, and do not message Azri separately unless you are blocked."
 
 // Office text comes from other agents, so prompts carry it as a JSON block of
 // data, never as instructions, and restate what no message can unlock.
@@ -323,7 +323,7 @@ export function supervisorPrompt(id: string, task: any, worktree: string, branch
     "3. When it reports done, review the diff yourself: correctness, tests, scope. Send fixes back to the worker until it is clean.",
     `4. Commit anything left, push with \`git push -u origin ${branch}\`, and open the pull request with \`gh pr create\`; its body links the Office task ${OFFICE}/tasks/${id}.`,
     `5. Send the PR link to the reviewers team with post_message to reviewers and task_id ${id}, and post it on the task with post_comment. Leave the task in_progress for review. If you cannot finish, set it blocked with update_task and a comment saying why.`,
-    `6. Finish by writing today's journal with journal_write: done, blocked and next for this task, each item linking {type: "task", ref: "${id}"}. Record any choice that outlives the task with decision_write, linking the task the same way.`,
+    `6. Finish by reading today's journal with journal_read, adding this task's done, blocked and next items to it, each linking {type: "task", ref: "${id}"}, and writing back the full lists with journal_write, since it replaces the day. Record any choice that outlives the task with decision_write, linking the task the same way.`,
     "Nobody merges: never merge, never push to main or any branch but yours, never force-push. Do not dispatch other Office tasks.",
     "<worker-brief>",
     workerPrompt(id, task),

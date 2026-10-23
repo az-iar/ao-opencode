@@ -42,14 +42,14 @@ test("only the supervisor posts the first note, on the task; both carry the safe
 test("the supervisor checks for earlier work and ends with the journal", () => {
   assert.match(supervisor, /resuming earlier work/)
   assert.match(supervisor, /Never recreate the branch/)
-  assert.match(supervisor, /6\. Finish by writing today's journal with journal_write/)
+  assert.match(supervisor, /6\. Finish by reading today's journal with journal_read/)
   assert.match(supervisor, /\{type: "task", ref: "task-1"\}/)
   assert.match(supervisor, /decision_write/)
 })
 
 test("the inbox prompt answers in the asking thread, not in a DM to Azri", () => {
   const inbox = inboxPrompt([{ id: "m-1", from: "azri", subject: "Please fix it" }])
-  assert.match(inbox, /reply once in the thread of the message that asked, with post_message and reply_to set to its id/)
+  assert.match(inbox, /post_comment with task_id and reply_to if it is in a task thread, otherwise post_message to its sender with reply_to; if the reply is refused, send it without reply_to/)
   assert.doesNotMatch(inbox, /post_message to azri/)
   assert.match(inbox, /do not message Azri separately unless you are blocked/)
 })
