@@ -180,3 +180,72 @@ test("an overlapping run exits at once", async () => {
   assert.deepEqual(ws.recorded(), [])
   assert.equal(existsSync(join(ws.state("poll"), "seen.json")), false)
 })
+
+const taskUpdates = (id: string) => office.calls.filter((c) => c.body?.params?.name === "update_task" && c.body.params.arguments?.task_id === id).map((c) => c.body.params.arguments)
+const short = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 8)
+
+test("a claimed task whose worktree fails is blocked on its creating agent and not claimed again", async () => {
+  reset()
+  const ws = workspace()
+  await ws.poll()
+  office.calls.length = 0
+  execFileSync("git", ["-C", ws.dir, "branch", `office/${short("task-wt")}`])
+  office.state.taskDetails.set("task-wt", { id: "task-wt", title: "Fix it", created_by: "agent:planner" })
+  office.state.openTasks = [...office.state.openTasks, { id: "task-wt", title: "Fix it", status: "todo" }]
+  const result = await ws.poll()
+  assert.equal(result.code, 0, result.stderr)
+  assert.equal(ws.recorded().length, 1, "no supervisor run")
+  const [claim, block] = taskUpdates("task-wt")
+  assert.equal(claim.status, "in_progress")
+  assert.equal(block.status, "blocked")
+  assert.equal(block.waiting_on, "planner")
+  assert.match(block.reason, /^OpenCode could not start this task: Error: git worktree add failed/)
+  assert.deepEqual(readdirSync(ws.state("dispatch")), [])
+  await ws.poll()
+  assert.equal(taskUpdates("task-wt").length, 2, "never set back to todo or claimed again")
+})
+
+test("a failed opencode start is blocked with a masked reason, on Azri when the Office refuses the creator", async () => {
+  reset()
+  const ws = workspace()
+  await ws.poll()
+  office.calls.length = 0
+  office.state.taskDetails.set("task-ghost", { id: "task-ghost", title: "From a gone agent", created_by: "agent:ghost" })
+  office.state.openTasks = [...office.state.openTasks, { id: "task-ghost", title: "From a gone agent", status: "todo" }]
+  office.state.refuse = (name, args) => name === "update_task" && args?.waiting_on === "ghost"
+  try {
+    const result = await ws.poll([], { AGENT_OFFICE_OPENCODE_BIN: join(ws.dir, "missing", "opencode") })
+    assert.equal(result.code, 0, result.stderr)
+  } finally {
+    office.state.refuse = undefined
+  }
+  const blocked = taskUpdates("task-ghost").filter((update) => update.status === "blocked")
+  assert.deepEqual(blocked.map((update) => update.waiting_on), ["ghost", "azri"])
+  assert.equal(blocked[1].reason, "OpenCode could not start this task: Error: spawn <path> ENOENT")
+  assert.deepEqual(readdirSync(ws.state("dispatch")), [])
+})
+
+test("an HTTP error on the blocked update is logged, not retried on Azri, and a refused claim is not blocked", async () => {
+  reset()
+  const ws = workspace()
+  await ws.poll()
+  office.calls.length = 0
+  for (const id of ["task-5xx", "task-taken"]) {
+    execFileSync("git", ["-C", ws.dir, "branch", `office/${short(id)}`])
+    office.state.taskDetails.set(id, { id, title: id, created_by: "agent:planner" })
+  }
+  office.state.openTasks = [...office.state.openTasks, ...["task-5xx", "task-taken"].map((id) => ({ id, title: id, status: "todo" }))]
+  office.state.httpError = (name, args) => (name === "update_task" && args?.status === "blocked" ? 502 : undefined)
+  office.state.refuse = (name, args) => name === "update_task" && args?.task_id === "task-taken"
+  try {
+    const result = await ws.poll()
+    assert.equal(result.code, 0, result.stderr)
+    assert.match(result.stderr, /could not mark task task-5xx blocked: Error: Office update_task: HTTP 502/)
+  } finally {
+    office.state.httpError = undefined
+    office.state.refuse = undefined
+  }
+  assert.deepEqual(taskUpdates("task-5xx").map((update) => update.waiting_on ?? update.status), ["in_progress", "planner"])
+  assert.deepEqual(taskUpdates("task-taken").map((update) => update.status), ["in_progress"])
+  assert.deepEqual(readdirSync(ws.state("dispatch")), [])
+})

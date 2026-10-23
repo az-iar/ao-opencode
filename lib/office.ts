@@ -217,6 +217,10 @@ export function createBearer(credentialsFile: () => string, credentials?: Creden
   return auth
 }
 
+// The Office answered and said no: a tool error or a JSON-RPC error, not an
+// HTTP failure or a call that never arrived.
+export class OfficeRefusal extends Error {}
+
 export function createClient(bearer: () => Promise<string | undefined>) {
   const call = async (name: string, args: Record<string, unknown> = {}) => {
     const token = await bearer()
@@ -240,8 +244,8 @@ export function createClient(bearer: () => Promise<string | undefined>) {
     })
     if (!res.ok) throw new Error(`Office ${name}: HTTP ${res.status}`)
     const body = (await res.json()) as { result?: { isError?: boolean; structuredContent?: Record<string, any>; content?: { text?: string }[] }; error?: { message: string } }
-    if (body.error) throw new Error(`Office ${name}: ${body.error.message}`)
-    if (body.result?.isError) throw new Error(`Office ${name}: ${body.result.content?.[0]?.text ?? "tool error"}`)
+    if (body.error) throw new OfficeRefusal(`Office ${name}: ${body.error.message}`)
+    if (body.result?.isError) throw new OfficeRefusal(`Office ${name}: ${body.result.content?.[0]?.text ?? "tool error"}`)
     return body.result?.structuredContent ?? {}
   }
 
@@ -350,6 +354,8 @@ export function failureReason(err: unknown) {
   const message = (err instanceof Error ? err.message : String(err))
     .split("\n")[0]
     .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ")
+    .replace(/("\w*(?:token|secret|key|password|authorization)\w*"\s*:\s*)"(?:[^"\\]|\\.)*"?/gi, '$1"<secret>"')
+    .replace(/\b(authorization\s*:\s*)(?:(?:bearer|basic)\s+)?\S+/gi, "$1<secret>")
     .replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, "<url>")
     .replace(/\b(?:bearer|basic)\s+\S+/gi, "<secret>")
     .replace(/(\w*(?:token|secret|key|password)\w*)=\S+/gi, "$1=<secret>")
@@ -376,8 +382,8 @@ export async function blockTask(call: (name: string, args?: Record<string, unkno
   try {
     await block(waiting)
   } catch (refused) {
-    // Only an answer from the Office is a refusal; a lost call is not retried.
-    if (waiting === "azri" || !String((refused as Error)?.message).startsWith("Office update_task:")) throw refused
+    // Only a refusal is retried; an HTTP error or a lost call is not.
+    if (waiting === "azri" || !(refused instanceof OfficeRefusal)) throw refused
     await block("azri")
   }
 }
