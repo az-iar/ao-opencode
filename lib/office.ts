@@ -341,6 +341,47 @@ export async function claimTask(call: (name: string, args?: Record<string, unkno
   await call("update_task", { task_id: id, status: "in_progress", comment: "OpenCode dispatched this task to a supervisor and a worker." })
 }
 
+// A blocked reason is shown in the Office, so it keeps only the error's kind
+// and first line, with URLs, credentials and paths taken out, and none of the
+// control or bidi characters the Office refuses.
+export function failureReason(err: unknown) {
+  const tag = (err as { _tag?: unknown } | undefined)?._tag
+  const kind = typeof tag === "string" ? tag : err instanceof Error ? err.name : "Error"
+  const message = (err instanceof Error ? err.message : String(err))
+    .split("\n")[0]
+    .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ")
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, "<url>")
+    .replace(/\b(?:bearer|basic)\s+\S+/gi, "<secret>")
+    .replace(/(\w*(?:token|secret|key|password)\w*)=\S+/gi, "$1=<secret>")
+    .replace(/(^|[^\w.~-])~?\/[^\s'"),;\]]*/g, "$1<path>")
+  return Array.from(`${kind}: ${message}`).slice(0, 300).join("")
+}
+
+// Who a task blocked by a failed start waits on: the agent that created it,
+// so Azri is not paged for every failure, or Azri for a task an admin or
+// this agent created, or one whose detail could not be read.
+export function blockedOn(task: any, self?: string) {
+  const creator = typeof task?.created_by === "string" ? task.created_by.trim().toLowerCase() : ""
+  const slug = creator.startsWith("agent:") ? creator.slice("agent:".length) : ""
+  return slug && slug !== self?.toLowerCase() ? slug : "azri"
+}
+
+// A dispatch that fails after its claim would leave the task in_progress for
+// good. Blocked shows why; todo would only be claimed and fail again. When the
+// Office refuses the creator (an unknown agent, or the assignee itself), it is
+// blocked on Azri instead.
+export async function blockTask(call: (name: string, args?: Record<string, unknown>) => Promise<unknown>, id: string, err: unknown, task?: any, self?: string) {
+  const block = (waiting_on: string) => call("update_task", { task_id: id, status: "blocked", reason: `OpenCode could not start this task: ${failureReason(err)}`, waiting_on })
+  const waiting = blockedOn(task, self)
+  try {
+    await block(waiting)
+  } catch (refused) {
+    // Only an answer from the Office is a refusal; a lost call is not retried.
+    if (waiting === "azri" || !String((refused as Error)?.message).startsWith("Office update_task:")) throw refused
+    await block("azri")
+  }
+}
+
 // A task worktree's own OpenCode belongs to its supervisor: it must not poll
 // the inbox or dispatch, or it would pull Office work into that session.
 export function onTaskBranch(directory: string) {

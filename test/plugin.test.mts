@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { createServer } from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -24,6 +24,7 @@ const until = async (check: () => boolean, what: string) => {
   assert.fail(`timed out waiting for ${what}`)
 }
 const mcpCalls = () => office.calls.filter((c) => c.path === "/mcp").map((c) => `${c.auth} ${c.body.params.name} ${JSON.stringify(c.body.params.arguments)}`)
+const taskUpdates = (id: string) => office.calls.filter((c) => c.body?.params?.name === "update_task" && c.body.params.arguments?.task_id === id).map((c) => c.body.params.arguments)
 
 // The V2 plugin context, reduced to the domains this plugin uses. Transforms
 // run immediately and again on reload, like the real registries.
@@ -498,6 +499,8 @@ test("a refused claim leaves no child session behind", async () => {
   }
   assert.deepEqual(worker.created, [])
   assert.ok(!worker.prompts.some((prompt) => prompt.text.includes("task-refused")))
+  // Only the claim was tried: a task never claimed is not marked blocked.
+  assert.deepEqual(taskUpdates("task-refused").map((update) => update.status), ["in_progress"])
   await cleanup()
   office.calls.length = 0
 })
@@ -547,6 +550,74 @@ test("a session call that never settles times out and polling resumes", async ()
   await until(() => worker.prompts.some((prompt) => prompt.text.includes("message-hung")), "the retried inbox prompt")
   assert.equal(hung, 2)
   assert.equal(worker.created.find((session) => session.id === worker.prompts.at(-1).sessionID)?.parentID, "root")
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("a queue into the reused inbox child that lands after its timeout is not repeated", async () => {
+  office.calls.length = 0
+  office.state.unreadMessages = []
+  const worker = makeContext("/late-prompt", { pollInterval: 1_000, sessionTimeout: 200 })
+  const prompt = worker.ctx.session.prompt
+  let late: "resolve" | "reject" | undefined
+  worker.ctx.session.prompt = async (input: any) => {
+    const settle = late
+    late = undefined
+    if (!settle) return prompt(input)
+    worker.prompts.push(input)
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    if (settle === "reject") throw new Error("queue lost")
+  }
+  const cleanup = await plugin.setup(worker.ctx)
+  const count = (id: string) => worker.prompts.filter((item) => item.text.includes(id)).length
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "root", status: { type: "busy" } } })
+  office.state.unreadMessages = [{ id: "message-late-0", from: "azri", subject: "Opens the child" }]
+  await until(() => count("message-late-0") === 1, "the first inbox prompt")
+  const inbox = worker.created[0].id
+
+  // The queue times out, then lands: the mail is not queued a second time.
+  late = "resolve"
+  office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-late-1", from: "azri", subject: "Lands late" }]
+  await until(() => warnings.some((line) => /session\.prompt timed out after 200 ms/.test(line)), "the timed-out queue")
+  await new Promise((resolve) => setTimeout(resolve, 2_500))
+  assert.equal(count("message-late-1"), 1)
+  // Nor is it batched with the next mail.
+  office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-late-2", from: "azri", subject: "Next" }]
+  await until(() => count("message-late-2") === 1, "the next inbox prompt")
+  assert.equal(count("message-late-1"), 1)
+
+  // A queue that times out and then fails is retried.
+  late = "reject"
+  office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-late-3", from: "azri", subject: "Lost late" }]
+  await until(() => count("message-late-3") === 2, "the retried inbox prompt")
+  assert.ok(worker.prompts.every((item) => item.sessionID === inbox))
+  assert.equal(worker.created.length, 1)
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("a session.create that lands after its timeout is removed", async () => {
+  office.calls.length = 0
+  office.state.unreadMessages = []
+  const worker = makeContext("/late-create", { pollInterval: 1_000, sessionTimeout: 200 })
+  const create = worker.ctx.session.create
+  let creates = 0
+  worker.ctx.session.create = async (input: any) => {
+    const session = await create(input)
+    if (++creates === 1) await new Promise((resolve) => setTimeout(resolve, 400))
+    return session
+  }
+  const cleanup = await plugin.setup(worker.ctx)
+  const status = async () => JSON.parse((await worker.tools.find((tool) => tool.name === "office_status").execute({}, {})).content)
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "root", status: { type: "busy" } } })
+  office.state.unreadMessages = [{ id: "message-late-create", from: "azri", subject: "Late child" }]
+  await until(() => worker.removed.length > 0, "the late child removed")
+  await until(() => worker.prompts.some((prompt) => prompt.text.includes("message-late-create")), "the retried inbox prompt")
+  assert.deepEqual(worker.removed, [worker.created[0].id])
+  assert.equal(worker.prompts.at(-1).sessionID, worker.created[1].id)
+  assert.deepEqual((await status()).inboxSessions, { [worker.created[1].id]: "root" })
   await cleanup()
   office.calls.length = 0
 })
@@ -651,6 +722,136 @@ test("a supervisor whose first prompt fails is removed", async () => {
   await until(() => worker.synthetics.some((message) => /Could not dispatch Office task task-prompt-fails: Error: prompt refused/.test(message.text)), "the dispatch failure")
   assert.equal(worker.created.length, 1)
   assert.deepEqual(worker.removed, [worker.created[0].id])
+  await until(() => taskUpdates("task-prompt-fails").length === 2, "the blocked update")
+  assert.deepEqual(taskUpdates("task-prompt-fails")[1], { task_id: "task-prompt-fails", status: "blocked", reason: "OpenCode could not start this task: Error: prompt refused", waiting_on: "azri" })
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("a dispatch that fails after the claim blocks the task with a reason and leaves no child", async () => {
+  office.calls.length = 0
+  office.state.unreadMessages = []
+  const repo = join(mkdtempSync(join(tmpdir(), "ao-dispatch-")), "repo")
+  mkdirSync(repo)
+  execFileSync("git", ["-C", repo, "init", "-q"])
+  execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  const worker = makeContext(repo, { pollInterval: 1_000 })
+  worker.ctx.session.create = async () => {
+    throw new Error(`cannot create a session in ${repo}-office-x via https://user:secret@example.test/x\n${repo}`)
+  }
+  const cleanup = await plugin.setup(worker.ctx)
+  const status = async () => JSON.parse((await worker.tools.find((tool) => tool.name === "office_status").execute({}, {})).content)
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+  // Without the task's detail it waits on Azri.
+  office.state.failing.add("get_task")
+  try {
+    office.state.openTasks = [...office.state.openTasks, { id: "task-create-fails", title: "Never created", status: "todo" }]
+    await until(() => taskUpdates("task-create-fails").some((update) => update.status === "blocked"), "the blocked update")
+  } finally {
+    office.state.failing.delete("get_task")
+  }
+  // The reason names the failure, without paths, URLs or the lines after it.
+  assert.deepEqual(taskUpdates("task-create-fails"), [
+    { task_id: "task-create-fails", status: "in_progress", comment: "OpenCode dispatched this task to a supervisor and a worker." },
+    { task_id: "task-create-fails", status: "blocked", reason: "OpenCode could not start this task: Error: cannot create a session in <path> via <url>", waiting_on: "azri" },
+  ])
+  assert.deepEqual(worker.created, [])
+  assert.deepEqual(worker.removed, [])
+  assert.deepEqual((await status()).dispatching, [])
+  // Blocked, not back to todo: later polls do not claim it again.
+  await new Promise((resolve) => setTimeout(resolve, 1_500))
+  assert.equal(taskUpdates("task-create-fails").length, 2)
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("a task whose start fails waits on the agent that created it, not on Azri", async () => {
+  office.calls.length = 0
+  office.state.unreadMessages = []
+  const repo = join(mkdtempSync(join(tmpdir(), "ao-dispatch-")), "repo")
+  mkdirSync(repo)
+  execFileSync("git", ["-C", repo, "init", "-q"])
+  execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  const worker = makeContext(repo, { pollInterval: 1_000 })
+  worker.ctx.session.create = async () => {
+    throw new Error("create refused")
+  }
+  office.state.taskDetails.set("task-by-agent", { id: "task-by-agent", title: "From an agent", created_by: "agent:Planner" })
+  office.state.taskDetails.set("task-by-admin", { id: "task-by-admin", title: "From an admin", created_by: "admin:azri" })
+  office.state.taskDetails.set("task-by-self", { id: "task-by-self", title: "From itself", created_by: "agent:opencode" })
+  const cleanup = await plugin.setup(worker.ctx)
+  const waitingOn = (id: string) => taskUpdates(id).find((update) => update.status === "blocked")?.waiting_on
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+  office.state.openTasks = [
+    ...office.state.openTasks,
+    ...["task-by-agent", "task-by-admin", "task-by-self"].map((id) => ({ id, title: id, status: "todo" })),
+  ]
+  await until(() => ["task-by-agent", "task-by-admin", "task-by-self"].every((id) => waitingOn(id)), "the blocked updates")
+  assert.deepEqual(["task-by-agent", "task-by-admin", "task-by-self"].map(waitingOn), ["planner", "azri", "azri"])
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("a refused creator falls back to Azri, and a refused blocked update is logged and left", async () => {
+  office.calls.length = 0
+  office.state.unreadMessages = []
+  const repo = join(mkdtempSync(join(tmpdir(), "ao-dispatch-")), "repo")
+  mkdirSync(repo)
+  execFileSync("git", ["-C", repo, "init", "-q"])
+  execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  const worker = makeContext(repo, { pollInterval: 1_000 })
+  worker.ctx.session.create = async () => {
+    throw new Error("create refused")
+  }
+  office.state.taskDetails.set("task-by-ghost", { id: "task-by-ghost", title: "From a gone agent", created_by: "agent:ghost" })
+  office.state.taskDetails.set("task-never-blocked", { id: "task-never-blocked", title: "Cannot be blocked", created_by: "agent:ghost" })
+  const cleanup = await plugin.setup(worker.ctx)
+  const status = async () => JSON.parse((await worker.tools.find((tool) => tool.name === "office_status").execute({}, {})).content)
+  const blocked = (id: string) => taskUpdates(id).filter((update) => update.status === "blocked").map((update) => update.waiting_on)
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+  // The Office knows no agent ghost, and refuses any blocked update for the second task.
+  office.state.refuse = (name, args) => name === "update_task" && args?.status === "blocked" && (args.waiting_on === "ghost" || args.task_id === "task-never-blocked")
+  try {
+    office.state.openTasks = [...office.state.openTasks, ...["task-by-ghost", "task-never-blocked"].map((id) => ({ id, title: id, status: "todo" }))]
+    await until(() => blocked("task-by-ghost").length === 2, "the retried blocked update")
+    await until(() => warnings.some((line) => /could not mark the Office task blocked.*task-never-blocked/.test(line)), "the logged blocked failure")
+    assert.deepEqual(blocked("task-by-ghost"), ["ghost", "azri"])
+    assert.deepEqual(blocked("task-never-blocked"), ["ghost", "azri"])
+    assert.deepEqual((await status()).dispatching, [])
+    // Left as it is: no further claim or update.
+    await new Promise((resolve) => setTimeout(resolve, 1_500))
+    assert.equal(taskUpdates("task-never-blocked").length, 3)
+  } finally {
+    office.state.refuse = undefined
+  }
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("a supervisor's first prompt that never settles times out and frees its dispatch slot", async () => {
+  office.calls.length = 0
+  office.state.unreadMessages = []
+  const repo = join(mkdtempSync(join(tmpdir(), "ao-dispatch-")), "repo")
+  mkdirSync(repo)
+  execFileSync("git", ["-C", repo, "init", "-q"])
+  execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  const worker = makeContext(repo, { pollInterval: 1_000, sessionTimeout: 200 })
+  worker.ctx.session.prompt = () => new Promise(() => {})
+  const cleanup = await plugin.setup(worker.ctx)
+  const status = async () => JSON.parse((await worker.tools.find((tool) => tool.name === "office_status").execute({}, {})).content)
+  const lock = join(dir, "dispatch", "opencode", `${createHash("sha256").update("task-prompt-hangs").digest("hex").slice(0, 16)}.lock`)
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+  office.state.openTasks = [...office.state.openTasks, { id: "task-prompt-hangs", title: "Hangs", status: "todo" }]
+  await until(() => worker.created.length > 0, "the supervisor session")
+  assert.ok(existsSync(lock), "the dispatch holds its lock while the prompt is pending")
+  await until(() => worker.synthetics.some((message) => /Could not dispatch Office task task-prompt-hangs: Error: session\.prompt timed out after 200 ms/.test(message.text)), "the dispatch failure")
+  assert.deepEqual(worker.removed, [worker.created[0].id])
+  assert.deepEqual((await status()).dispatching, [])
+  assert.ok(!existsSync(lock), "the dispatch lock is released")
   await cleanup()
   office.calls.length = 0
 })
