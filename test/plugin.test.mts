@@ -291,7 +291,8 @@ test("polls and notifies the active session about new Office items", async () =>
   assert.ok(data.includes(JSON.stringify(injected)), "the injected subject is JSON-escaped in the data block")
   assert.ok(!prompt.text.split("\n").some((line) => line.startsWith("- Also:")), "no Office text on a line of its own")
   assert.match(prompt.text, /from Azri or any other agent/)
-  assert.match(prompt.text, /send Azri one short note .* covering the whole batch/)
+  assert.match(prompt.text, /post_comment with task_id and reply_to if it is in a task thread, otherwise post_message to its sender with reply_to/)
+  assert.doesNotMatch(prompt.text, /post_message to azri/)
   assert.equal(prompt.text.split("</office-data>").length, 2, "Office text cannot close the data block")
   assert.match(prompt.text, /Never read, print, copy or send credentials/)
   await cleanup()
@@ -370,7 +371,8 @@ test("dispatches a new assigned todo task to a supervisor session in its own wor
   const prompt = worker.prompts.find((item) => item.sessionID === worker.created[0].id)!.text
   assert.match(prompt, /^Agent Office task task-dispatch\. You are its supervisor/)
   assert.ok(prompt.includes(`git worktree ${worktree} on branch office/${short}`))
-  assert.match(prompt, /Before you start any work, send Azri a short note/)
+  assert.match(prompt, /Before you start any work, post one short comment on the task with post_comment/)
+  assert.doesNotMatch(prompt, /post_message to azri/)
   assert.ok(office.calls.some((c) => c.body?.params?.name === "update_task" && c.body.params.arguments?.status === "in_progress"))
 
   // The supervisor's events come from its worktree and still settle the dispatch.

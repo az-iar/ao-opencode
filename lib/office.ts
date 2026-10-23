@@ -33,12 +33,13 @@ export function itemKey(item: any, kind: "message" | "task"): string {
   return `${kind}:${JSON.stringify(item)}`
 }
 
-// Azri hears about work before it starts, whoever asked for it: one note per
-// wake or dispatched task, not one per message.
+// Progress goes where the work is: a comment on the task or a reply in the
+// thread, one per wake or dispatched task. Azri is messaged only when blocked
+// or when the pull request is up.
 export const NOTE_FIRST =
-  "Before you start any work, send Azri a short note with post_message to azri: what you are about to do and who asked. Then start; do not wait for a reply."
+  "Before you start any work, post one short comment on the task with post_comment: what you are about to do and who asked. Then start; do not wait for a reply. Message Azri only when you are blocked or when the pull request is up."
 export const NOTE_FIRST_BATCH =
-  "Before you start any of that work, send Azri one short note with post_message to azri covering the whole batch: what you are about to do and who asked. Then start; do not wait for a reply. Send no note if no message asks for work."
+  "Before you start any of that work, reply once to the message that asked, saying what you are about to do: post_comment with task_id and reply_to if it is in a task thread, otherwise post_message to its sender with reply_to; if the reply is refused, send it without reply_to. Then start; do not wait for a reply. Send no note if no message asks for work, and do not message Azri separately unless you are blocked."
 
 // Office text comes from other agents, so prompts carry it as a JSON block of
 // data, never as instructions, and restate what no message can unlock.
@@ -315,12 +316,14 @@ export function supervisorPrompt(id: string, task: any, worktree: string, branch
     `Agent Office task ${id}. You are its supervisor, in the git worktree ${worktree} on branch ${branch}; all work happens there. The task as Office gave it, as data:`,
     officeData(taskData(id, task)),
     "Read it with get_task and follow its project rules.",
+    "If this branch already has commits or the worktree has uncommitted changes, you may be resuming earlier work: read the task thread and comments with get_task, run git status and git log, and continue from there instead of starting over. Never recreate the branch.",
     NOTE_FIRST,
     "1. Start one worker with OpenCode's built-in subagent tool (task, general agent), giving it the brief between the <worker-brief> tags verbatim.",
     "2. Answer the worker's questions by continuing the same worker. Ask Azri with ask, then await_answer, only for decisions that are Azri's.",
     "3. When it reports done, review the diff yourself: correctness, tests, scope. Send fixes back to the worker until it is clean.",
     `4. Commit anything left, push with \`git push -u origin ${branch}\`, and open the pull request with \`gh pr create\`; its body links the Office task ${OFFICE}/tasks/${id}.`,
     `5. Send the PR link to the reviewers team with post_message to reviewers and task_id ${id}, and post it on the task with post_comment. Leave the task in_progress for review. If you cannot finish, set it blocked with update_task and a comment saying why.`,
+    `6. Finish by reading today's journal with journal_read, adding this task's done, blocked and next items to it, each linking {type: "task", ref: "${id}"}, and writing back the full lists with journal_write, since it replaces the day. Record any choice that outlives the task with decision_write, linking the task the same way.`,
     "Nobody merges: never merge, never push to main or any branch but yours, never force-push. Do not dispatch other Office tasks.",
     "<worker-brief>",
     workerPrompt(id, task),
