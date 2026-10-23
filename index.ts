@@ -73,6 +73,7 @@ const SCOPES = "office:read office:write office:events"
 const HEARTBEAT_MS = 90_000
 const APPROVAL_TIMEOUT_MS = 5 * 60_000
 const DEFAULT_POLL_MS = 60_000
+const SESSION_TIMEOUT_MS = 60_000
 // The inbox child's first line: nobody in the human's chat sees its replies.
 const INBOX_SESSION = "This is your Office inbox session, apart from the human's chat; nobody reads your replies here, so answer and ask only through Agent Office."
 
@@ -131,6 +132,20 @@ function run(command: string, args: string[], timeoutMs = 30_000): Promise<{ cod
     })
   })
 }
+
+// OpenCode's session and storage calls have no timeout of their own; one that
+// never settles must not hold the poll guard for good.
+function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms} ms`)), ms)
+    timer.unref()
+  })
+  return Promise.race([promise, expired]).finally(() => clearTimeout(timer))
+}
+
+// The client's own check: OpenCode tags a missing session's error.
+const sessionNotFound = (err: unknown) => typeof err === "object" && err !== null && (err as { _tag?: unknown })._tag === "SessionNotFoundError"
 
 function jsonResult(output: string): any {
   try {
@@ -350,6 +365,10 @@ export default Plugin.define({
     const ensureConnected = () => (connected ??= connectMcp().catch((err) => warn("could not connect the Office MCP server", { error: String(err) })))
 
     const note = `opencode: ${basename(ctx.location.directory)}`
+    // Tests shorten it.
+    const configuredTimeout = Number(ctx.options.sessionTimeout ?? SESSION_TIMEOUT_MS)
+    const sessionTimeout = Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : SESSION_TIMEOUT_MS
+    const bounded = <T>(promise: Promise<T>, what: string) => withTimeout(promise, sessionTimeout, what)
     const busy = new Set<string>()
     let lastSessionID: string | undefined
     let heartbeat: ReturnType<typeof setInterval> | undefined
@@ -408,7 +427,7 @@ export default Plugin.define({
       if (officeChild(sessionID)) return Promise.resolve(true)
       let owned = ownership.get(sessionID)
       if (!owned) {
-        owned = ctx.session.get({ sessionID }).then(
+        owned = bounded(ctx.session.get({ sessionID }), "session.get").then(
           // A subagent's session is its parent's business, never a mail target.
           (info) => !info.parentID && info.location.directory === ctx.location.directory,
           () => {
@@ -425,7 +444,7 @@ export default Plugin.define({
       const known = targetSession()
       const key = sessionStoreKey()
       if (known || !key) return known
-      const stored = await ctx.storage.get(key).catch(() => undefined)
+      const stored = await bounded(ctx.storage.get(key), "storage.get").catch(() => undefined)
       if (typeof stored !== "string" || !(await ownsSession(stored))) return undefined
       lastSessionID = stored
       return stored
@@ -440,41 +459,69 @@ export default Plugin.define({
       void ctx.session.synthetic({ sessionID, text, description: "Agent Office" }).catch((err) => warn("could not notify the session", { error: String(err) }))
     }
 
-    // Office children run on their root session's model and agent, not on
-    // OpenCode's defaults. A root without an explicit model still gets its
-    // child, on the default model, and its chat is told once.
+    // Office children run on their root session's model, not on OpenCode's
+    // default. The agent is not copied: a read-only one such as Plan would
+    // leave the child's permission asks where nobody is watching, and the
+    // SDK does not say which agents can edit. A root without an explicit
+    // model still gets its child, on the default model, and its chat is told
+    // once.
     const defaultModelNoticed = new Set<string>()
+    // Roots with a child being created; a deletion meanwhile marks them.
+    const creating = new Set<{ parent: string; deleted: boolean }>()
     const createChild = async (parent: string, title: string, location?: { directory: string }) => {
-      const info = await ctx.session.get({ sessionID: parent })
-      if (!info.model && !defaultModelNoticed.has(parent)) {
-        defaultModelNoticed.add(parent)
-        notify(parent, "Office work is using OpenCode's default model; pick a model in this chat to choose one.")
+      const pending = { parent, deleted: false }
+      creating.add(pending)
+      try {
+        const info = await bounded(ctx.session.get({ sessionID: parent }), "session.get")
+        const child = await bounded(
+          ctx.session.create({
+            parentID: parent,
+            title,
+            location: location ?? { directory: info.location.directory },
+            ...(info.model ? { model: info.model } : {}),
+          }),
+          "session.create",
+        )
+        if (pending.deleted) {
+          void ctx.session.remove({ sessionID: child.id }).catch(() => {})
+          throw new Error(`session ${parent} was deleted while its Office child was created`)
+        }
+        if (!info.model && !defaultModelNoticed.has(parent)) {
+          defaultModelNoticed.add(parent)
+          notify(parent, "Office work is using OpenCode's default model; pick a model in this chat to choose one.")
+        }
+        return child
+      } finally {
+        creating.delete(pending)
       }
-      return ctx.session.create({
-        parentID: parent,
-        title,
-        location: location ?? { directory: info.location.directory },
-        ...(info.agent ? { agent: info.agent } : {}),
-        ...(info.model ? { model: info.model } : {}),
-      })
     }
 
     // New mail runs in one inbox child per root session, reused while it
-    // lives, so Office work stays out of the human's chat history.
+    // lives, so Office work stays out of the human's chat history. Only a
+    // session OpenCode reports missing is replaced; any other error is retried.
     const deliverInbox = async (parent: string, text: string) => {
       let sessionID = [...inboxSessions].find(([, root]) => root === parent)?.[0]
-      if (sessionID && !(await ctx.session.get({ sessionID }).then(() => true, () => false))) {
-        inboxSessions.delete(sessionID)
-        sessionID = undefined
+      if (sessionID) {
+        const gone = await bounded(ctx.session.get({ sessionID }), "session.get").then(
+          () => false,
+          (err) => {
+            if (sessionNotFound(err)) return true
+            throw err
+          },
+        )
+        if (gone) {
+          inboxSessions.delete(sessionID)
+          sessionID = undefined
+        }
       }
       if (sessionID) {
-        await ctx.session.prompt({ sessionID, text, delivery: "queue" })
+        await bounded(ctx.session.prompt({ sessionID, text, delivery: "queue" }), "session.prompt")
         return
       }
       const child = await createChild(parent, "Office inbox")
       inboxSessions.set(child.id, parent)
       try {
-        await ctx.session.prompt({ sessionID: child.id, text, delivery: "queue" })
+        await bounded(ctx.session.prompt({ sessionID: child.id, text, delivery: "queue" }), "session.prompt")
       } catch (err) {
         inboxSessions.delete(child.id)
         void ctx.session.remove({ sessionID: child.id }).catch(() => {})
@@ -879,6 +926,7 @@ export default Plugin.define({
             case "session.deleted": {
               ownership.delete(event.data.sessionID)
               defaultModelNoticed.delete(event.data.sessionID)
+              for (const pending of creating) if (pending.parent === event.data.sessionID) pending.deleted = true
               // A deleted inbox child is recreated on the next mail.
               for (const [child, root] of inboxSessions) if (child === event.data.sessionID || root === event.data.sessionID) inboxSessions.delete(child)
               const key = sessionStoreKey()

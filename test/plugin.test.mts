@@ -89,7 +89,7 @@ function makeContext(directory = "/home/x/agent-office", options: Record<string,
       get: async ({ sessionID }: { sessionID: string }) => {
         const made = created.find((session) => session.id === sessionID)
         const own = made?.location?.directory ?? (sessions ? sessions.get(sessionID) : directory)
-        if (!own || removed.includes(sessionID)) throw new Error(`no session ${sessionID}`)
+        if (!own || removed.includes(sessionID)) throw Object.assign(new Error(`no session ${sessionID}`), { _tag: "SessionNotFoundError" })
         return { id: sessionID, location: { directory: own }, ...(sessionID.startsWith("sub-") ? { parentID: "parent" } : {}), ...(made ? { parentID: made.parentID } : {}), ...details.get(sessionID) }
       },
       remove: async ({ sessionID }: { sessionID: string }) => void removed.push(sessionID),
@@ -382,9 +382,9 @@ test("dispatches a new assigned todo task to a supervisor session in its own wor
   const worktree = `${repo}-office-${short}`
   assert.equal(worker.created[0].parentID, "parent")
   assert.deepEqual(worker.created[0].location, { directory: worktree })
-  // The supervisor runs on the parent's model and agent, not OpenCode's defaults.
+  // The supervisor runs on the parent's model, but on OpenCode's default agent.
   assert.deepEqual(worker.created[0].model, { providerID: "test", id: "chosen" })
-  assert.equal(worker.created[0].agent, "build")
+  assert.ok(!("agent" in worker.created[0]))
   assert.equal(execFileSync("git", ["-C", worktree, "branch", "--show-current"], { encoding: "utf8" }).trim(), `office/${short}`)
   await until(() => worker.prompts.some((prompt) => prompt.sessionID === worker.created[0].id), "the supervisor prompt")
   const prompt = worker.prompts.find((item) => item.sessionID === worker.created[0].id)!.text
@@ -402,7 +402,7 @@ test("dispatches a new assigned todo task to a supervisor session in its own wor
   office.calls.length = 0
 })
 
-test("inbox work reuses one child per root session, on the root's model and agent", async () => {
+test("inbox work reuses one child per root session, on the root's model but not its Plan agent", async () => {
   office.calls.length = 0
   // The inbox prompt lists ten messages, so earlier tests' mail is cleared.
   office.state.unreadMessages = []
@@ -422,7 +422,8 @@ test("inbox work reuses one child per root session, on the root's model and agen
   const inbox = worker.created[0]
   assert.equal(promptFor("message-reuse-1").sessionID, inbox.id)
   assert.equal(inbox.parentID, "root")
-  assert.equal(inbox.agent, "plan")
+  // A read-only agent would leave the child's permission asks unwatched.
+  assert.ok(!("agent" in inbox))
   assert.deepEqual(inbox.model, { providerID: "test", id: "chosen", variant: "high" })
   assert.deepEqual(inbox.location, { directory: "/reuse" })
   assert.ok(!worker.synthetics.some((message) => /default model/.test(message.text)))
@@ -527,6 +528,129 @@ test("a poll still waiting on its inbox prompt is not overlapped by the next", a
     void lastPollAt().then((at) => (next = at))
     return next !== stuck
   }, "the next poll")
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("a session call that never settles times out and polling resumes", async () => {
+  office.calls.length = 0
+  office.state.unreadMessages = []
+  const worker = makeContext("/hung-call", { pollInterval: 1_000, sessionTimeout: 200 })
+  const create = worker.ctx.session.create
+  let hung = 0
+  worker.ctx.session.create = (input: any) => (++hung === 1 ? new Promise(() => {}) : create(input))
+  const cleanup = await plugin.setup(worker.ctx)
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "root", status: { type: "busy" } } })
+  office.state.unreadMessages = [{ id: "message-hung", from: "azri", subject: "Hung" }]
+  await until(() => warnings.some((line) => /session\.create timed out after 200 ms/.test(line)), "the timed-out create")
+  await until(() => worker.prompts.some((prompt) => prompt.text.includes("message-hung")), "the retried inbox prompt")
+  assert.equal(hung, 2)
+  assert.equal(worker.created.find((session) => session.id === worker.prompts.at(-1).sessionID)?.parentID, "root")
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("a root deleted while its inbox child is created keeps no child and no notice", async () => {
+  office.calls.length = 0
+  office.state.unreadMessages = []
+  const worker = makeContext("/deleted-root", { pollInterval: 1_000 })
+  const create = worker.ctx.session.create
+  worker.ctx.session.create = async (input: any) => {
+    const child = await create(input)
+    worker.push({ type: "session.deleted", data: { sessionID: "root" } })
+    await tick()
+    return child
+  }
+  const cleanup = await plugin.setup(worker.ctx)
+  const status = async () => JSON.parse((await worker.tools.find((tool) => tool.name === "office_status").execute({}, {})).content)
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "root", status: { type: "busy" } } })
+  office.state.unreadMessages = [{ id: "message-deleted-root", from: "azri", subject: "Gone" }]
+  await until(() => worker.removed.length > 0, "the removed child")
+  assert.deepEqual(worker.removed, [worker.created[0].id])
+  assert.deepEqual(worker.prompts, [])
+  assert.deepEqual((await status()).inboxSessions, {})
+  assert.ok(!worker.synthetics.some((message) => /default model/.test(message.text)))
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("a transient error on the reuse check keeps the live inbox child", async () => {
+  office.calls.length = 0
+  office.state.unreadMessages = []
+  const worker = makeContext("/transient", { pollInterval: 1_000 })
+  const cleanup = await plugin.setup(worker.ctx)
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "root", status: { type: "busy" } } })
+  office.state.unreadMessages = [{ id: "message-transient-1", from: "azri", subject: "First" }]
+  await until(() => worker.prompts.some((prompt) => prompt.text.includes("message-transient-1")), "the first inbox prompt")
+  const inbox = worker.created[0].id
+  const get = worker.ctx.session.get
+  let failed = false
+  worker.ctx.session.get = async (input: any) => {
+    if (input.sessionID === inbox && !failed) {
+      failed = true
+      throw new Error("connection reset")
+    }
+    return get(input)
+  }
+  office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-transient-2", from: "azri", subject: "Second" }]
+  await until(() => worker.prompts.some((prompt) => prompt.text.includes("message-transient-2")), "the retried inbox prompt")
+  assert.ok(failed)
+  assert.ok(warnings.some((line) => /could not wake the session for new Office messages.*connection reset/.test(line)))
+  assert.equal(worker.prompts.find((prompt) => prompt.text.includes("message-transient-2"))!.sessionID, inbox)
+  assert.equal(worker.created.length, 1)
+  assert.deepEqual(worker.removed, [])
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("an inbox child whose first prompt fails is removed, and the mail retried in a new one", async () => {
+  office.calls.length = 0
+  office.state.unreadMessages = []
+  const worker = makeContext("/inbox-prompt-fails", { pollInterval: 1_000 })
+  const prompt = worker.ctx.session.prompt
+  let failed = false
+  worker.ctx.session.prompt = async (input: any) => {
+    if (!failed) {
+      failed = true
+      throw new Error("prompt refused")
+    }
+    return prompt(input)
+  }
+  const cleanup = await plugin.setup(worker.ctx)
+  const status = async () => JSON.parse((await worker.tools.find((tool) => tool.name === "office_status").execute({}, {})).content)
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "root", status: { type: "busy" } } })
+  office.state.unreadMessages = [{ id: "message-prompt-fails", from: "azri", subject: "Retry me" }]
+  await until(() => worker.prompts.some((item) => item.text.includes("message-prompt-fails")), "the retried inbox prompt")
+  assert.equal(worker.created.length, 2)
+  assert.deepEqual(worker.removed, [worker.created[0].id])
+  assert.equal(worker.prompts.at(-1).sessionID, worker.created[1].id)
+  assert.deepEqual((await status()).inboxSessions, { [worker.created[1].id]: "root" })
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("a supervisor whose first prompt fails is removed", async () => {
+  office.calls.length = 0
+  office.state.unreadMessages = []
+  const repo = join(mkdtempSync(join(tmpdir(), "ao-dispatch-")), "repo")
+  mkdirSync(repo)
+  execFileSync("git", ["-C", repo, "init", "-q"])
+  execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  const worker = makeContext(repo, { pollInterval: 1_000 })
+  worker.ctx.session.prompt = async () => {
+    throw new Error("prompt refused")
+  }
+  const cleanup = await plugin.setup(worker.ctx)
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+  office.state.openTasks = [...office.state.openTasks, { id: "task-prompt-fails", title: "Never starts", status: "todo" }]
+  await until(() => worker.synthetics.some((message) => /Could not dispatch Office task task-prompt-fails: Error: prompt refused/.test(message.text)), "the dispatch failure")
+  assert.equal(worker.created.length, 1)
+  assert.deepEqual(worker.removed, [worker.created[0].id])
   await cleanup()
   office.calls.length = 0
 })
