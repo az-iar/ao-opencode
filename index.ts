@@ -34,6 +34,7 @@ import {
   addWorktree,
   agentCredentialsPath,
   agentStateDir,
+  blockTask,
   CREDENTIALS_OVERRIDE,
   claimNotice,
   claimTask,
@@ -647,6 +648,7 @@ export default Plugin.define({
 
     const dispatchTask = async (id: string) => {
       let held = false
+      let claimed = false
       const parent = await targetSessionAsync()
       try {
         if (!parent) return
@@ -654,6 +656,7 @@ export default Plugin.define({
         const task = detail?.task ?? detail
         const title = String(task?.title ?? id)
         await claimTask(call, id)
+        claimed = true
         if (dispatchMode === "herdr") {
           await dispatchHerdr(id, task, title, parent)
         } else {
@@ -663,6 +666,9 @@ export default Plugin.define({
       } catch (err) {
         warn("could not dispatch Office task", { task: id, error: String(err) })
         notify(parent, `Could not dispatch Office task ${id}: ${String(err)}`)
+        // The finally drops it from the dispatch state, and it stays seen, so
+        // a lasting failure is not claimed again.
+        if (claimed) await blockTask(call, id, err).catch((blockErr) => warn("could not mark the Office task blocked", { task: id, error: String(blockErr) }))
       } finally {
         if (!held) {
           releaseDispatch(dispatchDir(), id)

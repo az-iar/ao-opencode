@@ -341,6 +341,26 @@ export async function claimTask(call: (name: string, args?: Record<string, unkno
   await call("update_task", { task_id: id, status: "in_progress", comment: "OpenCode dispatched this task to a supervisor and a worker." })
 }
 
+// A blocked reason is shown in the Office, so it keeps only the error's kind
+// and first line, with URLs and paths taken out and no control characters.
+export function failureReason(err: unknown) {
+  const tag = (err as { _tag?: unknown } | undefined)?._tag
+  const kind = typeof tag === "string" ? tag : err instanceof Error ? err.name : "Error"
+  const message = (err instanceof Error ? err.message : String(err))
+    .split("\n")[0]
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, "<url>")
+    .replace(/(^|[\s'"(=:])~?\/[^\s'"),;]*/g, "$1<path>")
+  return `${kind}: ${message}`.slice(0, 300)
+}
+
+// A dispatch that fails after its claim would leave the task in_progress for
+// good. Blocked shows why and waits for Azri; todo would only be claimed and
+// fail again.
+export async function blockTask(call: (name: string, args?: Record<string, unknown>) => Promise<unknown>, id: string, err: unknown) {
+  await call("update_task", { task_id: id, status: "blocked", reason: `OpenCode could not start this task: ${failureReason(err)}`, waiting_on: "azri" })
+}
+
 // A task worktree's own OpenCode belongs to its supervisor: it must not poll
 // the inbox or dispatch, or it would pull Office work into that session.
 export function onTaskBranch(directory: string) {

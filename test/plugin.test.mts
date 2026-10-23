@@ -24,6 +24,7 @@ const until = async (check: () => boolean, what: string) => {
   assert.fail(`timed out waiting for ${what}`)
 }
 const mcpCalls = () => office.calls.filter((c) => c.path === "/mcp").map((c) => `${c.auth} ${c.body.params.name} ${JSON.stringify(c.body.params.arguments)}`)
+const taskUpdates = (id: string) => office.calls.filter((c) => c.body?.params?.name === "update_task" && c.body.params.arguments?.task_id === id).map((c) => c.body.params.arguments)
 
 // The V2 plugin context, reduced to the domains this plugin uses. Transforms
 // run immediately and again on reload, like the real registries.
@@ -498,6 +499,8 @@ test("a refused claim leaves no child session behind", async () => {
   }
   assert.deepEqual(worker.created, [])
   assert.ok(!worker.prompts.some((prompt) => prompt.text.includes("task-refused")))
+  // Only the claim was tried: a task never claimed is not marked blocked.
+  assert.deepEqual(taskUpdates("task-refused").map((update) => update.status), ["in_progress"])
   await cleanup()
   office.calls.length = 0
 })
@@ -719,6 +722,40 @@ test("a supervisor whose first prompt fails is removed", async () => {
   await until(() => worker.synthetics.some((message) => /Could not dispatch Office task task-prompt-fails: Error: prompt refused/.test(message.text)), "the dispatch failure")
   assert.equal(worker.created.length, 1)
   assert.deepEqual(worker.removed, [worker.created[0].id])
+  await until(() => taskUpdates("task-prompt-fails").length === 2, "the blocked update")
+  assert.deepEqual(taskUpdates("task-prompt-fails")[1], { task_id: "task-prompt-fails", status: "blocked", reason: "OpenCode could not start this task: Error: prompt refused", waiting_on: "azri" })
+  await cleanup()
+  office.calls.length = 0
+})
+
+test("a dispatch that fails after the claim blocks the task with a reason and leaves no child", async () => {
+  office.calls.length = 0
+  office.state.unreadMessages = []
+  const repo = join(mkdtempSync(join(tmpdir(), "ao-dispatch-")), "repo")
+  mkdirSync(repo)
+  execFileSync("git", ["-C", repo, "init", "-q"])
+  execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  const worker = makeContext(repo, { pollInterval: 1_000 })
+  worker.ctx.session.create = async () => {
+    throw new Error(`cannot create a session in ${repo}-office-x via https://user:secret@example.test/x\n${repo}`)
+  }
+  const cleanup = await plugin.setup(worker.ctx)
+  const status = async () => JSON.parse((await worker.tools.find((tool) => tool.name === "office_status").execute({}, {})).content)
+  await until(() => mcpCalls().length > 0, "the baseline poll")
+  worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+  office.state.openTasks = [...office.state.openTasks, { id: "task-create-fails", title: "Never created", status: "todo" }]
+  await until(() => taskUpdates("task-create-fails").some((update) => update.status === "blocked"), "the blocked update")
+  // The reason names the failure, without paths, URLs or the lines after it.
+  assert.deepEqual(taskUpdates("task-create-fails"), [
+    { task_id: "task-create-fails", status: "in_progress", comment: "OpenCode dispatched this task to a supervisor and a worker." },
+    { task_id: "task-create-fails", status: "blocked", reason: "OpenCode could not start this task: Error: cannot create a session in <path> via <url>", waiting_on: "azri" },
+  ])
+  assert.deepEqual(worker.created, [])
+  assert.deepEqual(worker.removed, [])
+  assert.deepEqual((await status()).dispatching, [])
+  // Blocked, not back to todo: later polls do not claim it again.
+  await new Promise((resolve) => setTimeout(resolve, 1_500))
+  assert.equal(taskUpdates("task-create-fails").length, 2)
   await cleanup()
   office.calls.length = 0
 })
