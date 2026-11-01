@@ -638,11 +638,11 @@ export default Plugin.define({
         // a lasting failure is not claimed again.
         if (claimed) await blockTask(call, id, err, task, ownAgent?.slug).catch((blockErr) => warn("could not mark the Office task blocked", { task: id, error: String(blockErr) }))
       } finally {
-        if (!held) {
-          releaseDispatch(dispatchDir(), id)
-          dispatching.delete(id)
-          pumpDispatch()
-        }
+        if (!held) releaseDispatch(dispatchDir(), id)
+        // The cap is the lock files, not this set: holding the id here would
+        // stop every later pump in a long-lived OpenCode.
+        dispatching.delete(id)
+        pumpDispatch()
       }
     }
 
