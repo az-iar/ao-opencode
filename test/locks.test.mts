@@ -43,3 +43,30 @@ test("a working terminal keeps the slot, and a launch with no terminal yet keeps
     delete process.env.AGENT_OFFICE_HC_BIN
   }
 })
+
+test("a just-held lock that reads idle stays busy; a finished one is free", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ao-locks-"))
+  const idle = join(dir, "hc-idle")
+  writeFileSync(idle, "#!/bin/sh\necho '{\"state\":\"live\",\"status\":{\"state\":\"idle\"}}'\nexit 0\n", { mode: 0o755 })
+  process.env.AGENT_OFFICE_HC_BIN = idle
+  try {
+    // A worker that has not taken its first turn yet must not free its slot.
+    assert.equal(acquireDispatch(dir, "task-a"), "ok")
+    holdDispatch(dir, "task-a", { terminal: "office-a" })
+    assert.equal(acquireDispatch(dir, "task-b"), "ok")
+    holdDispatch(dir, "task-b", { terminal: "office-b" })
+    assert.equal(acquireDispatch(dir, "task-c"), "full", "two young idle terminals still hold both slots")
+  } finally {
+    delete process.env.AGENT_OFFICE_HC_BIN
+  }
+  const finishedBin = finishedHc()
+  process.env.AGENT_OFFICE_HC_BIN = finishedBin
+  try {
+    const other = mkdtempSync(join(tmpdir(), "ao-locks-"))
+    assert.equal(acquireDispatch(other, "task-a"), "ok")
+    holdDispatch(other, "task-a", { terminal: "office-a" })
+    assert.equal(acquireDispatch(other, "task-b"), "ok", "a finished young terminal is free")
+  } finally {
+    delete process.env.AGENT_OFFICE_HC_BIN
+  }
+})

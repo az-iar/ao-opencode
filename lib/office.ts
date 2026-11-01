@@ -428,6 +428,11 @@ export function addWorktree(repo: string, id: string): Promise<{ path: string; b
 // agent. That keeps the two-dispatch cap across child agents and cron too.
 const lockPath = (dir: string, id: string) => join(dir, `${createHash("sha256").update(id).digest("hex").slice(0, 16)}.lock`)
 
+// A lock younger than this may still be booting: hc reports a just-started
+// opencode as idle (or done at turn 0) until its first turn, which must not
+// free the slot. Only a finished or missing terminal frees a young lock.
+export const DISPATCH_GRACE_MS = 3 * 60_000
+
 // An hc task's claude runs in a terminal hc keeps: the slot is held while hc
 // reports the terminal live and working or blocked. Finished, gone, idle or
 // done frees it. Undefined when hc cannot say, so the lock is kept.
@@ -467,11 +472,32 @@ function lockStale(path: string): boolean {
     // Once a terminal exists it is the holder, even though the process that
     // wrote the lock (OpenCode) is still running. A launch in flight has no
     // terminal yet, so its pid keeps the slot until holdDispatch replaces it.
-    if (lock.terminal) return hcTerminalBusy(lock.terminal) === false
+    if (lock.terminal) {
+      const age = Date.now() - (typeof lock.created === "number" ? lock.created : 0)
+      // A fresh terminal can read idle before its first turn: only finished
+      // or gone frees it during the grace window.
+      if (age < DISPATCH_GRACE_MS) return hcTerminalGone(lock.terminal) === true
+      return hcTerminalBusy(lock.terminal) === false
+    }
     if (typeof lock.pid === "number" && pidAlive(lock.pid)) return false
     return true
   } catch {
     return false
+  }
+}
+
+// True only when hc says the terminal is finished or gone; any live state
+// (working, blocked, idle, done) is false, and undefined when hc cannot say.
+export function hcTerminalGone(terminal: string): boolean | undefined {
+  const got = spawnSync(hcBin(), ["get", terminal, "--json"], { encoding: "utf8", timeout: 10_000 })
+  if (got.error) return undefined
+  try {
+    const body = JSON.parse(got.stdout)
+    if (body?.error?.kind === "not_found") return true
+    if (body?.state === "finished") return true
+    return typeof body?.state === "string" ? false : undefined
+  } catch {
+    return got.status === 3 ? true : undefined
   }
 }
 
