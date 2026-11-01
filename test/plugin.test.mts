@@ -365,31 +365,42 @@ test("two windows on one event stream track and wake only their own sessions", a
   office.calls.length = 0
 })
 
-test("dispatches a new assigned todo task into the session that will do it, with no subagent session", async () => {
+test("dispatches a new assigned todo task to one hc worker in its worktree", async () => {
   office.calls.length = 0
   const repo = join(mkdtempSync(join(tmpdir(), "ao-dispatch-")), "repo")
   mkdirSync(repo)
   execFileSync("git", ["-C", repo, "init", "-q"])
   execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
-  const worker = makeContext(repo, { pollInterval: 1_000 })
-  const cleanup = await plugin.setup(worker.ctx)
-  await until(() => mcpCalls().length > 0, "the baseline poll")
-  worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
-  await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
-  office.state.openTasks = [...office.state.openTasks, { id: "task-dispatch", title: "Fix it", status: "todo" }]
-  await until(() => worker.prompts.some((item) => item.text.startsWith("Agent Office task task-dispatch.")), "the task prompt")
-  const short = createHash("sha256").update("task-dispatch").digest("hex").slice(0, 8)
-  const worktree = `${repo}-office-${short}`
-  assert.equal(worker.created.length, 0, "no child session is created")
-  const prompted = worker.prompts.find((item) => item.text.startsWith("Agent Office task task-dispatch."))!
-  assert.equal(prompted.sessionID, "parent", "the task is queued in the session that will do it")
-  assert.match(prompted.text, /You are its worker/)
-  assert.doesNotMatch(prompted.text, /subagent tool/)
-  assert.ok(prompted.text.includes(`git worktree ${worktree} on branch office/${short}`))
-  assert.equal(execFileSync("git", ["-C", worktree, "branch", "--show-current"], { encoding: "utf8" }).trim(), `office/${short}`)
-  assert.ok(office.calls.some((c) => c.body?.params?.name === "update_task" && c.body.params.arguments?.status === "in_progress"))
-  await cleanup()
-  office.calls.length = 0
+  // A fake hc records the argv it is given; the plugin never starts a real one.
+  const bin = join(mkdtempSync(join(tmpdir(), "ao-hc-")), "hc")
+  const log = `${bin}.log`
+  writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\nexit 0\n`, { mode: 0o755 })
+  process.env.AGENT_OFFICE_HC_BIN = bin
+  try {
+    const worker = makeContext(repo, { pollInterval: 1_000 })
+    const cleanup = await plugin.setup(worker.ctx)
+    await until(() => mcpCalls().length > 0, "the baseline poll")
+    worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+    await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
+    office.state.openTasks = [...office.state.openTasks, { id: "task-dispatch", title: "Fix it", status: "todo" }]
+    await until(() => existsSync(log) && readFileSync(log, "utf8").includes("run --bg"), "the hc launch")
+    const argv = readFileSync(log, "utf8")
+    const short = createHash("sha256").update("task-dispatch").digest("hex").slice(0, 8)
+    const worktree = `${repo}-office-${short}`
+    assert.match(argv, /--outlive-parent/)
+    assert.match(argv, /--no-notify/)
+    assert.ok(argv.includes(`--cwd ${worktree}`))
+    assert.ok(argv.includes(`--name office-${short}-`), "the terminal name is unique per launch")
+    assert.match(argv, /opencode --prompt Agent Office task task-dispatch\./)
+    assert.doesNotMatch(argv, /subagent tool/)
+    assert.equal(worker.created.length, 0, "no child session is created")
+    assert.equal(execFileSync("git", ["-C", worktree, "branch", "--show-current"], { encoding: "utf8" }).trim(), `office/${short}`)
+    assert.ok(office.calls.some((c) => c.body?.params?.name === "update_task" && c.body.params.arguments?.status === "in_progress"))
+    await cleanup()
+  } finally {
+    delete process.env.AGENT_OFFICE_HC_BIN
+    office.calls.length = 0
+  }
 })
 
 test("cleanup reports idle while a session is still busy", async () => {

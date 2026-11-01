@@ -416,6 +416,58 @@ export function addWorktree(repo: string, id: string): Promise<{ path: string; b
 // One lock per dispatched task, shared by every OpenCode process using this
 // agent. That keeps the two-dispatch cap across child agents and cron too.
 const lockPath = (dir: string, id: string) => join(dir, `${createHash("sha256").update(id).digest("hex").slice(0, 16)}.lock`)
+
+// An hc task's claude runs in a terminal hc keeps: the slot is held while hc
+// reports the terminal live and working or blocked. Finished, gone, idle or
+// done frees it. Undefined when hc cannot say, so the lock is kept.
+export const hcBin = (env = process.env) => env.AGENT_OFFICE_HC_BIN || "hc"
+
+export function hcTerminalBusy(terminal: string): boolean | undefined {
+  const got = spawnSync(hcBin(), ["get", terminal, "--json"], { encoding: "utf8", timeout: 10_000 })
+  if (got.error) return undefined
+  try {
+    const body = JSON.parse(got.stdout)
+    if (body?.error?.kind === "not_found") return false
+    if (body?.state === "finished") return false
+    const status = body?.status?.state
+    if (typeof status !== "string") return undefined
+    return status === "working" || status === "blocked"
+  } catch {
+    return got.status === 3 ? false : undefined
+  }
+}
+
+type DispatchLock = { task?: string; pid?: number; terminal?: string; created?: number }
+const pidAlive = (pid: number) => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM"
+  }
+}
+// A lock is stale when it is older than six hours or its holder is gone and
+// hc says its terminal is not working any more. A terminal hc cannot answer
+// for keeps the lock, the safe side of the two-task cap.
+function lockStale(path: string): boolean {
+  try {
+    if (Date.now() - statSync(path).mtimeMs > DISPATCH_STALE_MS) return true
+    const lock = JSON.parse(readFileSync(path, "utf8")) as DispatchLock
+    if (typeof lock.pid === "number" && pidAlive(lock.pid)) return false
+    if (lock.terminal) return hcTerminalBusy(lock.terminal) === false
+    return true
+  } catch {
+    return false
+  }
+}
+
+// The slot outlives the poller: after hc starts the child, the lock names its
+// terminal, and the next acquire frees the slot when that terminal is done.
+export function holdDispatch(dir: string, id: string, holder: { terminal?: string }) {
+  try {
+    writeFileSync(lockPath(dir, id), JSON.stringify({ task: id, pid: process.pid, ...holder, created: Date.now() }) + "\n", { mode: 0o600 })
+  } catch {}
+}
 export function acquireDispatch(dir: string, id: string): "ok" | "busy" | "full" {
   const own = lockPath(dir, id)
   try {
@@ -433,7 +485,7 @@ export function acquireDispatch(dir: string, id: string): "ok" | "busy" | "full"
       if (!file.endsWith(".lock")) continue
       const path = join(dir, file)
       try {
-        if (Date.now() - statSync(path).mtimeMs > DISPATCH_STALE_MS) {
+        if (lockStale(path)) {
           unlinkSync(path)
           continue
         }

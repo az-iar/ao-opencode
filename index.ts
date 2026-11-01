@@ -33,6 +33,8 @@ import {
   type Credentials,
   acquireDispatch,
   addWorktree,
+  hcBin,
+  holdDispatch,
   agentCredentialsPath,
   agentStateDir,
   blockTask,
@@ -325,7 +327,11 @@ export default Plugin.define({
     const dispatchDir = () => agentStateDir(legacyCredentialsFile, "dispatch", ownAgent?.slug ?? locationKey)
     const noticeDir = () => agentStateDir(legacyCredentialsFile, "notices", ownAgent?.slug ?? locationKey)
     const configuredDispatch = String(ctx.options.autoDispatch ?? process.env.AGENT_OFFICE_AUTODISPATCH ?? "on").toLowerCase()
-    const dispatchMode = configuredDispatch === "off" || configuredDispatch === "false" ? "off" : configuredDispatch === "herdr" || configuredDispatch === "hc" ? "hc" : configuredDispatch === "session" ? "session" : process.env.HERDR_ENV === "1" ? "hc" : "session"
+    // ao-claude never queues a task into the user's session: every mode spawns
+    // its own worker in the worktree. "session" and "herdr" are kept as aliases
+    // for hc, so an old setting still dispatches and no longer edits the main
+    // checkout.
+    const dispatchMode = configuredDispatch === "off" || configuredDispatch === "false" ? "off" : "hc"
     const bearer = auth.bearer
     const { call, checkin } = createClient(bearer)
 
@@ -585,15 +591,6 @@ export default Plugin.define({
 
     const repo = ctx.location.project?.canonical ?? ctx.location.directory
 
-    // No child session: the task is queued in the session that will do it, so
-    // there is one agent doing the work, not a supervisor plus a worker.
-    const dispatchInline = async (id: string, task: any, title: string, parent: string) => {
-      const { path, branch } = await addWorktree(repo, id)
-      await bounded(ctx.session.prompt({ sessionID: parent, text: taskPrompt(id, task, path, branch), delivery: "queue" }), "session.prompt")
-      lastPromptAt = Date.now()
-      notify(parent, `Office task ${id} is queued in this session (${branch}) at ${path}. Do it here; do not hand it to a subagent.`)
-    }
-
     // Herdr-core mode: one `hc` child does the whole task. The worktree is
     // ours (git), and `hc run --bg` starts an OpenCode with the task as its
     // first prompt, so there is no supervisor and no worker subagent.
@@ -603,17 +600,14 @@ export default Plugin.define({
       // child still runs would otherwise fail the launch.
       const name = `office-${taskShort(id)}-${randomBytes(2).toString("hex")}`
       const started = await run(
-        "hc",
+        hcBin(),
         ["run", "--bg", "--outlive-parent", "--no-notify", "--name", name, "--cwd", path, "opencode", "--prompt", taskPrompt(id, task, path, branch)],
         60_000,
       )
       if (started.code !== 0) throw new Error(`hc run failed: ${started.stderr || started.stdout}`)
-      // The slot is held until the child exits, not just until it starts.
-      void run("hc", ["wait", name], DISPATCH_STALE_MS).finally(() => {
-        releaseDispatch(dispatchDir(), id)
-        dispatching.delete(id)
-        pumpDispatch()
-      })
+      // The slot outlives this process: the lock names the terminal, and the
+      // next acquire frees it once hc says it is finished or gone.
+      holdDispatch(dispatchDir(), id, { terminal: name })
       notify(parent, `Office task ${id} dispatched to hc worker ${name} (${branch}) at ${path}.`)
     }
 
@@ -629,12 +623,8 @@ export default Plugin.define({
         const title = String(task?.title ?? id)
         await claimTask(call, id)
         claimed = true
-        if (dispatchMode === "hc") {
-          await dispatchHc(id, task, title, parent)
-          held = true
-        } else {
-          await dispatchInline(id, task, title, parent)
-        }
+        await dispatchHc(id, task, title, parent)
+        held = true
       } catch (err) {
         warn("could not dispatch Office task", { task: id, error: String(err) })
         notify(parent, `Could not dispatch Office task ${id}: ${String(err)}`)
