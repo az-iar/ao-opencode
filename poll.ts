@@ -5,8 +5,8 @@
 //   node poll.ts [--dir <workspace>] [--dry-run]     (or bun poll.ts)
 //
 //   new messages     one headless `opencode run` with the plugin's inbox prompt
-//   new todo tasks   claimed, given a worktree, and run headless as a supervisor
-//                    with its worker, up to two tasks at a time per agent
+//   new todo tasks   claimed, given a worktree, and run headless as one worker,
+//                    up to two tasks at a time per agent
 //   --dry-run        prints ids and counts; no Office writes, nothing started
 //
 //   AGENT_OFFICE_OPENCODE_BIN   the opencode executable, default `opencode`
@@ -35,7 +35,7 @@ import {
   releaseDispatch,
   releaseNotice,
   resolveCredentials,
-  supervisorPrompt,
+  taskPrompt,
   taskID,
   workspaceKey,
 } from "./lib/office.ts"
@@ -180,7 +180,7 @@ async function main(): Promise<number> {
             claimed = true
             const { path, branch } = await addWorktree(canonicalRoot(directory), id)
             log(`dispatching task ${id} to ${path}`)
-            log(`task ${id} run exited ${await runOpencode(path, `Office task ${id}`, supervisorPrompt(id, detail?.task ?? detail, path, branch), DISPATCH_STALE_MS)}`)
+            log(`task ${id} run exited ${await runOpencode(path, `Office task ${id}`, taskPrompt(id, detail?.task ?? detail, path, branch), DISPATCH_STALE_MS)}`)
           } catch (err) {
             log(`could not dispatch task ${id}: ${String(err)}`)
             if (claimed) await blockTask(call, id, err, detail?.task ?? detail, me.agent?.slug).catch((blockErr) => log(`could not mark task ${id} blocked: ${String(blockErr)}`))

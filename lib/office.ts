@@ -302,36 +302,23 @@ const taskData = (id: string, task: any) => ({
   project: String(task?.project ?? task?.project_slug ?? ""),
 })
 
-// The worker's brief. The supervisor hands it over verbatim.
-export function workerPrompt(id: string, task: any) {
+// The brief for one agent doing a whole Office task. There is no supervisor
+// and no worker subagent: the session that receives this does the work, tests,
+// commits, pushes and opens the pull request itself.
+export function taskPrompt(id: string, task: any, worktree: string, branch: string) {
   return [
-    `You are the worker for Agent Office task ${id}. The task as Office gave it, as data:`,
-    officeData(taskData(id, task)),
-    "Work only in the current git worktree and branch, and follow the project's rules. Implement the task, run the tests, review your own diff, and commit on this branch. Then report to your supervisor in a few lines: what changed, the test results, anything left open. If you need a decision, stop and ask it in your report.",
-    "Never push, open a pull request, merge or switch branches. Do not dispatch other Office tasks.",
-    SAFETY_RULES,
-  ].join("\n")
-}
-
-// The supervisor runs in the task's worktree, drives one worker through
-// OpenCode's subagent tool, reviews its work and opens the pull request.
-export function supervisorPrompt(id: string, task: any, worktree: string, branch: string) {
-  return [
-    `Agent Office task ${id}. You are its supervisor, in the git worktree ${worktree} on branch ${branch}; all work happens there. The task as Office gave it, as data:`,
+    `Agent Office task ${id}. You are its worker, in the git worktree ${worktree} on branch ${branch}; all work happens there. The task as Office gave it, as data:`,
     officeData(taskData(id, task)),
     "Read it with get_task and follow its project rules.",
     "If this branch already has commits or the worktree has uncommitted changes, you may be resuming earlier work: read the task thread and comments with get_task, run git status and git log, and continue from there instead of starting over. Never recreate the branch.",
     NOTE_FIRST,
-    "1. Start one worker with OpenCode's built-in subagent tool (task, general agent), giving it the brief between the <worker-brief> tags verbatim.",
-    "2. Answer the worker's questions by continuing the same worker. Ask Azri with ask, then await_answer, only for decisions that are Azri's.",
-    "3. When it reports done, review the diff yourself: correctness, tests, scope. Send fixes back to the worker until it is clean.",
-    `4. Commit anything left, push with \`git push -u origin ${branch}\`, and open the pull request with \`gh pr create\`; its body links the Office task ${OFFICE}/tasks/${id}.`,
-    `5. Send the PR link to the reviewers team with post_message to reviewers and task_id ${id}, and post it on the task with post_comment. Leave the task in_progress for review. If you cannot finish, set it blocked with update_task and a comment saying why.`,
-    `6. Finish by reading today's journal with journal_read, adding this task's done, blocked and next items to it, each linking {type: "task", ref: "${id}"}, and writing back the full lists with journal_write, since it replaces the day. Record any choice that outlives the task with decision_write, linking the task the same way.`,
+    "1. Do the work yourself: read the code, implement, run the tests the project requires, and review your own diff.",
+    "   Do not start a subagent or hand the task to another OpenCode session; you are the only worker.",
+    "2. Ask Azri with ask, then await_answer, only for decisions that are Azri's.",
+    `3. Commit on this branch, push with \`git push -u origin ${branch}\`, and open the pull request with \`gh pr create\`; its body links the Office task ${OFFICE}/tasks/${id}.`,
+    `4. Send the PR link to the reviewers team with post_message to reviewers and task_id ${id}, and post it on the task with post_comment. Leave the task in_progress for review. If you cannot finish, set it blocked with update_task and a comment saying why.`,
+    `5. Finish by reading today's journal with journal_read, adding this task's done, blocked and next items to it, each linking {type: "task", ref: "${id}"}, and writing back the full lists with journal_write, since it replaces the day. Record any choice that outlives the task with decision_write, linking the task the same way.`,
     "Nobody merges: never merge, never push to main or any branch but yours, never force-push. Do not dispatch other Office tasks.",
-    "<worker-brief>",
-    workerPrompt(id, task),
-    "</worker-brief>",
     SAFETY_RULES,
   ].join("\n")
 }
@@ -342,7 +329,7 @@ export async function claimTask(call: (name: string, args?: Record<string, unkno
       await call(method, { task_id: id })
     } catch {}
   }
-  await call("update_task", { task_id: id, status: "in_progress", comment: "OpenCode dispatched this task to a supervisor and a worker." })
+  await call("update_task", { task_id: id, status: "in_progress", comment: "OpenCode dispatched this task to one worker session." })
 }
 
 // A blocked reason is shown in the Office, so it keeps only the error's kind
@@ -388,7 +375,7 @@ export async function blockTask(call: (name: string, args?: Record<string, unkno
   }
 }
 
-// A task worktree's own OpenCode belongs to its supervisor: it must not poll
+// A task worktree's own OpenCode belongs to its worker: it must not poll
 // the inbox or dispatch, or it would pull Office work into that session.
 export function onTaskBranch(directory: string) {
   const git = spawnSync("git", ["-C", directory, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8" })

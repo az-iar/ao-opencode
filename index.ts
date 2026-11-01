@@ -6,9 +6,10 @@
 //   while running      `working` while any session runs, a heartbeat every
 //                      90 s, `idle` once every session is quiet; `blocked` is
 //                      never overridden. New mail runs in an inbox child of
-//                      the chat's session. New assigned tasks go to a supervisor
-//                      and its worker in a worktree, through Herdr or a child
-//                      session, up to two tasks at a time.
+//                      the chat's session. A new assigned task is claimed in a
+//                      worktree and queued in this session, or in one Herdr
+//                      agent, up to two tasks at a time. No supervisor/worker
+//                      subagent pair.
 //
 //   AGENT_OFFICE_URL                   dashboard origin, default https://office.byma.tech
 //   AGENT_OFFICE_TOKEN                 an agent API token instead of OAuth (optional)
@@ -57,7 +58,7 @@ import {
   saveAgentPointer,
   saveCredentials,
   summary,
-  supervisorPrompt,
+  taskPrompt,
   taskID,
   taskShort,
   tokenRequest,
@@ -417,8 +418,8 @@ export default Plugin.define({
 
     // Inbox children by id, each mapped to the root session it works for.
     const inboxSessions = new Map<string, string>()
-    // Children this plugin started count as busy work, but never as a target.
-    const officeChild = (sessionID: string) => dispatchedSessions.has(sessionID) || inboxSessions.has(sessionID)
+    // Inbox children this plugin started count as busy work, but never as a target.
+    const officeChild = (sessionID: string) => inboxSessions.has(sessionID)
     const targetSession = () => [...busy].filter((id) => !id.startsWith("herdr:") && !officeChild(id)).at(-1) ?? lastSessionID
     // One OpenCode server can stream events for several windows, so a session
     // counts only when OpenCode places it in this folder or this plugin
@@ -595,32 +596,16 @@ export default Plugin.define({
 
     const backlog = new Set<string>()
     const dispatching = new Set<string>()
-    const dispatchedSessions = new Map<string, { taskID: string; parent: string; title: string }>()
-
-    const settleChild = (sessionID: string) => {
-      const child = dispatchedSessions.get(sessionID)
-      if (!child) return
-      dispatchedSessions.delete(sessionID)
-      releaseDispatch(dispatchDir(), child.taskID)
-      dispatching.delete(child.taskID)
-      notify(child.parent, `Office task ${child.taskID} supervisor session ${sessionID} is idle. Read the session; the supervisor opens the PR and updates the task.`)
-      pumpDispatch()
-    }
 
     const repo = ctx.location.project?.canonical ?? ctx.location.directory
 
-    const dispatchSession = async (id: string, task: any, title: string, parent: string) => {
+    // No child session: the task is queued in the session that will do it, so
+    // there is one agent doing the work, not a supervisor plus a worker.
+    const dispatchInline = async (id: string, task: any, title: string, parent: string) => {
       const { path, branch } = await addWorktree(repo, id)
-      const child = await createChild(parent, `Office: ${title}`.slice(0, 120), { directory: path })
-      dispatchedSessions.set(child.id, { taskID: id, parent, title })
-      try {
-        await bounded(ctx.session.prompt({ sessionID: child.id, text: supervisorPrompt(id, task, path, branch) }), "session.prompt")
-      } catch (err) {
-        dispatchedSessions.delete(child.id)
-        void ctx.session.remove({ sessionID: child.id }).catch(() => {})
-        throw err
-      }
-      notify(parent, `Dispatched Office task ${id} to supervisor session ${child.id} (${branch}) at ${path}.`)
+      await bounded(ctx.session.prompt({ sessionID: parent, text: taskPrompt(id, task, path, branch), delivery: "queue" }), "session.prompt")
+      lastPromptAt = Date.now()
+      notify(parent, `Office task ${id} is queued in this session (${branch}) at ${path}. Do it here; do not hand it to a subagent.`)
     }
 
     const dispatchHerdr = async (id: string, task: any, title: string, parent: string) => {
@@ -638,16 +623,15 @@ export default Plugin.define({
         const started = await run("herdr", ["agent", "start", name, "--kind", "opencode", "--pane", pane, "--timeout", "120000"], 150_000)
         if (started.code !== 0) throw new Error(`herdr agent start failed: ${started.stderr || started.stdout}`)
         const worktree = info?.worktree?.path ?? "of this pane"
-        const prompted = await run("herdr", ["agent", "prompt", name, supervisorPrompt(id, task, worktree, branch), "--wait", "--timeout", String(DISPATCH_STALE_MS)], DISPATCH_STALE_MS + 60_000)
+        const prompted = await run("herdr", ["agent", "prompt", name, taskPrompt(id, task, worktree, branch), "--wait", "--timeout", String(DISPATCH_STALE_MS)], DISPATCH_STALE_MS + 60_000)
         const state = agentState(prompted.stdout) ?? "unknown"
-        notify(parent, `Office task ${id} dispatched to Herdr supervisor ${name} (${branch}) at ${info?.worktree?.path ?? "its worktree"}. State: ${state}.`)
+        notify(parent, `Office task ${id} dispatched to one Herdr worker ${name} (${branch}) at ${info?.worktree?.path ?? "its worktree"}. State: ${state}.`)
       } finally {
         stop(pseudo)
       }
     }
 
     const dispatchTask = async (id: string) => {
-      let held = false
       let claimed = false
       let task: any
       const parent = await targetSessionAsync()
@@ -661,8 +645,7 @@ export default Plugin.define({
         if (dispatchMode === "herdr") {
           await dispatchHerdr(id, task, title, parent)
         } else {
-          await dispatchSession(id, task, title, parent)
-          held = true
+          await dispatchInline(id, task, title, parent)
         }
       } catch (err) {
         warn("could not dispatch Office task", { task: id, error: String(err) })
@@ -671,11 +654,9 @@ export default Plugin.define({
         // a lasting failure is not claimed again.
         if (claimed) await blockTask(call, id, err, task, ownAgent?.slug).catch((blockErr) => warn("could not mark the Office task blocked", { task: id, error: String(blockErr) }))
       } finally {
-        if (!held) {
-          releaseDispatch(dispatchDir(), id)
-          dispatching.delete(id)
-          pumpDispatch()
-        }
+        releaseDispatch(dispatchDir(), id)
+        dispatching.delete(id)
+        pumpDispatch()
       }
     }
 
@@ -936,7 +917,6 @@ export default Plugin.define({
               if (!child) rememberSession(event.data.sessionID)
               if (event.data.status.type === "idle") {
                 stop(event.data.sessionID)
-                settleChild(event.data.sessionID)
               } else start(event.data.sessionID)
               break
             }
@@ -944,7 +924,6 @@ export default Plugin.define({
               const child = officeChild(event.data.sessionID)
               if (!child) rememberSession(event.data.sessionID)
               stop(event.data.sessionID)
-              settleChild(event.data.sessionID)
               break
             }
             case "session.deleted": {
@@ -959,7 +938,6 @@ export default Plugin.define({
                 if (key) void ctx.storage.remove(key).catch(() => {})
               }
               stop(event.data.sessionID)
-              settleChild(event.data.sessionID)
               break
             }
           }
