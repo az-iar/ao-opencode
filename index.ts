@@ -599,14 +599,27 @@ export default Plugin.define({
     // first prompt, so there is no supervisor and no worker subagent.
     const dispatchHc = async (id: string, task: any, title: string, parent: string) => {
       const { path, branch } = await addWorktree(repo, id)
-      const name = `office-${taskShort(id)}`
-      const started = await run("hc", ["run", "--bg", "--name", name, "--cwd", path, "opencode", "--prompt", taskPrompt(id, task, path, branch)], 60_000)
+      // Names must be unique among live terminals: a retry while the first
+      // child still runs would otherwise fail the launch.
+      const name = `office-${taskShort(id)}-${randomBytes(2).toString("hex")}`
+      const started = await run(
+        "hc",
+        ["run", "--bg", "--outlive-parent", "--no-notify", "--name", name, "--cwd", path, "opencode", "--prompt", taskPrompt(id, task, path, branch)],
+        60_000,
+      )
       if (started.code !== 0) throw new Error(`hc run failed: ${started.stderr || started.stdout}`)
+      // The slot is held until the child exits, not just until it starts.
+      void run("hc", ["wait", name], DISPATCH_STALE_MS).finally(() => {
+        releaseDispatch(dispatchDir(), id)
+        dispatching.delete(id)
+        pumpDispatch()
+      })
       notify(parent, `Office task ${id} dispatched to hc worker ${name} (${branch}) at ${path}.`)
     }
 
     const dispatchTask = async (id: string) => {
       let claimed = false
+      let held = false
       let task: any
       const parent = await targetSessionAsync()
       try {
@@ -618,6 +631,7 @@ export default Plugin.define({
         claimed = true
         if (dispatchMode === "hc") {
           await dispatchHc(id, task, title, parent)
+          held = true
         } else {
           await dispatchInline(id, task, title, parent)
         }
@@ -628,9 +642,11 @@ export default Plugin.define({
         // a lasting failure is not claimed again.
         if (claimed) await blockTask(call, id, err, task, ownAgent?.slug).catch((blockErr) => warn("could not mark the Office task blocked", { task: id, error: String(blockErr) }))
       } finally {
-        releaseDispatch(dispatchDir(), id)
-        dispatching.delete(id)
-        pumpDispatch()
+        if (!held) {
+          releaseDispatch(dispatchDir(), id)
+          dispatching.delete(id)
+          pumpDispatch()
+        }
       }
     }
 
