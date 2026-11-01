@@ -415,6 +415,40 @@ test("dispatches a new assigned todo task to one hc worker in its worktree", asy
   }
 })
 
+test("a third task dispatches after two held workers finish", async () => {
+  office.calls.length = 0
+  const repo = join(mkdtempSync(join(tmpdir(), "ao-cap-")), "repo")
+  mkdirSync(repo)
+  execFileSync("git", ["-C", repo, "init", "-q"])
+  execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  const bin = join(mkdtempSync(join(tmpdir(), "ao-hc-")), "hc")
+  const log = `${bin}.log`
+  // run logs a launch; get says the terminals are already finished, so each
+  // held slot frees as soon as it is looked at.
+  writeFileSync(bin, `#!/bin/sh\ncase "$1" in run) printf '%s\\n' "$*" >> '${log}' ;; get) echo '{"state":"finished"}' ;; esac\nexit 0\n`, { mode: 0o755 })
+  process.env.AGENT_OFFICE_HC_BIN = bin
+  try {
+    const worker = makeContext(repo, { pollInterval: 1_000 })
+    const cleanup = await plugin.setup(worker.ctx)
+    await until(() => mcpCalls().length > 0, "the baseline poll")
+    worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+    await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
+    office.state.openTasks = [
+      ...office.state.openTasks,
+      { id: "task-one", title: "One", status: "todo" },
+      { id: "task-two", title: "Two", status: "todo" },
+      { id: "task-three", title: "Three", status: "todo" },
+    ]
+    const launches = () => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter((line) => line.startsWith("run ")) : [])
+    await until(() => launches().length >= 3, "the third launch")
+    assert.equal(launches().length, 3)
+    await cleanup()
+  } finally {
+    delete process.env.AGENT_OFFICE_HC_BIN
+    office.calls.length = 0
+  }
+})
+
 test("cleanup reports idle while a session is still busy", async () => {
   const fresh = makeContext("/tmp/x")
   const cleanup = await plugin.setup(fresh.ctx)

@@ -464,8 +464,11 @@ function lockStale(path: string): boolean {
   try {
     if (Date.now() - statSync(path).mtimeMs > DISPATCH_STALE_MS) return true
     const lock = JSON.parse(readFileSync(path, "utf8")) as DispatchLock
-    if (typeof lock.pid === "number" && pidAlive(lock.pid)) return false
+    // Once a terminal exists it is the holder, even though the process that
+    // wrote the lock (OpenCode) is still running. A launch in flight has no
+    // terminal yet, so its pid keeps the slot until holdDispatch replaces it.
     if (lock.terminal) return hcTerminalBusy(lock.terminal) === false
+    if (typeof lock.pid === "number" && pidAlive(lock.pid)) return false
     return true
   } catch {
     return false
@@ -475,8 +478,10 @@ function lockStale(path: string): boolean {
 // The slot outlives the poller: after hc starts the child, the lock names its
 // terminal, and the next acquire frees the slot when that terminal is done.
 export function holdDispatch(dir: string, id: string, holder: { terminal?: string }) {
+  // The terminal is the holder now; the pid would be the long-lived OpenCode
+  // and would keep the slot after the worker is gone.
   try {
-    writeFileSync(lockPath(dir, id), JSON.stringify({ task: id, pid: process.pid, ...holder, created: Date.now() }) + "\n", { mode: 0o600 })
+    writeFileSync(lockPath(dir, id), JSON.stringify({ task: id, ...holder, created: Date.now() }) + "\n", { mode: 0o600 })
   } catch {}
 }
 export function acquireDispatch(dir: string, id: string): "ok" | "busy" | "full" {
