@@ -149,20 +149,6 @@ function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<
 // The client's own check: OpenCode tags a missing session's error.
 const sessionNotFound = (err: unknown) => typeof err === "object" && err !== null && (err as { _tag?: unknown })._tag === "SessionNotFoundError"
 
-function jsonResult(output: string): any {
-  try {
-    const parsed = JSON.parse(output)
-    return parsed?.result ?? parsed
-  } catch {
-    return undefined
-  }
-}
-
-function agentState(output: string): string | undefined {
-  const result = jsonResult(output)
-  return result?.agent?.agent_status ?? result?.agent_status ?? result?.state
-}
-
 async function registerClient(callback: string, clientName: string): Promise<string> {
   const res = await fetch(`${OFFICE}/oauth/register`, {
     method: "POST",
@@ -339,7 +325,7 @@ export default Plugin.define({
     const dispatchDir = () => agentStateDir(legacyCredentialsFile, "dispatch", ownAgent?.slug ?? locationKey)
     const noticeDir = () => agentStateDir(legacyCredentialsFile, "notices", ownAgent?.slug ?? locationKey)
     const configuredDispatch = String(ctx.options.autoDispatch ?? process.env.AGENT_OFFICE_AUTODISPATCH ?? "on").toLowerCase()
-    const dispatchMode = configuredDispatch === "off" || configuredDispatch === "false" ? "off" : configuredDispatch === "herdr" ? "herdr" : configuredDispatch === "session" ? "session" : process.env.HERDR_ENV === "1" ? "herdr" : "session"
+    const dispatchMode = configuredDispatch === "off" || configuredDispatch === "false" ? "off" : configuredDispatch === "herdr" || configuredDispatch === "hc" ? "hc" : configuredDispatch === "session" ? "session" : process.env.HERDR_ENV === "1" ? "hc" : "session"
     const bearer = auth.bearer
     const { call, checkin } = createClient(bearer)
 
@@ -608,27 +594,15 @@ export default Plugin.define({
       notify(parent, `Office task ${id} is queued in this session (${branch}) at ${path}. Do it here; do not hand it to a subagent.`)
     }
 
-    const dispatchHerdr = async (id: string, task: any, title: string, parent: string) => {
-      const pseudo = `herdr:${id}`
-      start(pseudo)
-      try {
-        const short = taskShort(id)
-        const branch = `office/${short}`
-        const created = await run("herdr", ["worktree", "create", "--cwd", repo, "--branch", branch, "--label", title.slice(0, 80), "--no-focus"], 120_000)
-        if (created.code !== 0) throw new Error(`herdr worktree create failed: ${created.stderr || created.stdout}`)
-        const info = jsonResult(created.stdout)
-        const pane = info?.root_pane?.pane_id
-        if (!pane) throw new Error("herdr worktree create returned no root pane")
-        const name = `office-${short}`
-        const started = await run("herdr", ["agent", "start", name, "--kind", "opencode", "--pane", pane, "--timeout", "120000"], 150_000)
-        if (started.code !== 0) throw new Error(`herdr agent start failed: ${started.stderr || started.stdout}`)
-        const worktree = info?.worktree?.path ?? "of this pane"
-        const prompted = await run("herdr", ["agent", "prompt", name, taskPrompt(id, task, worktree, branch), "--wait", "--timeout", String(DISPATCH_STALE_MS)], DISPATCH_STALE_MS + 60_000)
-        const state = agentState(prompted.stdout) ?? "unknown"
-        notify(parent, `Office task ${id} dispatched to one Herdr worker ${name} (${branch}) at ${info?.worktree?.path ?? "its worktree"}. State: ${state}.`)
-      } finally {
-        stop(pseudo)
-      }
+    // Herdr-core mode: one `hc` child does the whole task. The worktree is
+    // ours (git), and `hc run --bg` starts an OpenCode with the task as its
+    // first prompt, so there is no supervisor and no worker subagent.
+    const dispatchHc = async (id: string, task: any, title: string, parent: string) => {
+      const { path, branch } = await addWorktree(repo, id)
+      const name = `office-${taskShort(id)}`
+      const started = await run("hc", ["run", "--bg", "--name", name, "--cwd", path, "opencode", "--prompt", taskPrompt(id, task, path, branch)], 60_000)
+      if (started.code !== 0) throw new Error(`hc run failed: ${started.stderr || started.stdout}`)
+      notify(parent, `Office task ${id} dispatched to hc worker ${name} (${branch}) at ${path}.`)
     }
 
     const dispatchTask = async (id: string) => {
@@ -642,8 +616,8 @@ export default Plugin.define({
         const title = String(task?.title ?? id)
         await claimTask(call, id)
         claimed = true
-        if (dispatchMode === "herdr") {
-          await dispatchHerdr(id, task, title, parent)
+        if (dispatchMode === "hc") {
+          await dispatchHc(id, task, title, parent)
         } else {
           await dispatchInline(id, task, title, parent)
         }
