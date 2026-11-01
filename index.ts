@@ -46,6 +46,7 @@ import {
   cronLine,
   DISPATCH_STALE_MS,
   fromOthers,
+  inboxNotice,
   inboxPrompt,
   itemKey,
   MAX_DISPATCHES,
@@ -326,6 +327,11 @@ export default Plugin.define({
     }
     const dispatchDir = () => agentStateDir(legacyCredentialsFile, "dispatch", ownAgent?.slug ?? locationKey)
     const noticeDir = () => agentStateDir(legacyCredentialsFile, "notices", ownAgent?.slug ?? locationKey)
+    // New mail goes to the open session as an ids-only notice by default, like
+    // ao-claude's session inbox; "headless" keeps the child-session worker,
+    // "off" leaves mail unread for a human.
+    const configuredInbox = String(ctx.options.inbox ?? process.env.AGENT_OFFICE_INBOX ?? "session").toLowerCase()
+    const inboxMode = configuredInbox === "headless" ? "headless" : configuredInbox === "off" ? "off" : "session"
     const configuredDispatch = String(ctx.options.autoDispatch ?? process.env.AGENT_OFFICE_AUTODISPATCH ?? "on").toLowerCase()
     // ao-claude never queues a task into the user's session: every mode spawns
     // its own worker in the worktree. "session" and "herdr" are kept as aliases
@@ -704,7 +710,21 @@ export default Plugin.define({
         if (String(item?.status ?? "todo").toLowerCase() === "todo") backlog.add(taskID(item))
       }
 
-      if (freshMessages.length > 0) {
+      if (freshMessages.length > 0 && inboxMode === "off") {
+        // Left unread on purpose: the ids stay seen so one batch is not
+        // announced on every poll, and a human sees them in Office.
+        for (const item of freshMessages) seenMessages.add(itemKey(item, "message"))
+      } else if (freshMessages.length > 0 && inboxMode === "session") {
+        try {
+          await bounded(ctx.session.prompt({ sessionID, text: inboxNotice(freshMessages), delivery: "queue" }), "session.prompt")
+          lastPromptAt = Date.now()
+          lastPromptError = undefined
+          for (const item of freshMessages) seenMessages.add(itemKey(item, "message"))
+        } catch (err) {
+          lastPromptError = String(err)
+          warn("could not hand new Office messages to the session", { error: String(err) })
+        }
+      } else if (freshMessages.length > 0) {
         const ids = freshMessages.map((item) => itemKey(item, "message"))
         if (!claimNotice(noticeDir(), ids)) {
           for (const item of freshMessages) seenMessages.add(itemKey(item, "message"))
@@ -852,6 +872,7 @@ export default Plugin.define({
                 clientName,
                 plugin: ctx.app.version,
                 mode: dispatchMode,
+                inbox: inboxMode,
                 pollInterval,
                 lastPollAt: lastPollAt ? new Date(lastPollAt).toISOString() : undefined,
                 lastPollError,

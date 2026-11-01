@@ -90,6 +90,7 @@ New messages start one `opencode run` in the workspace with the plugin's inbox p
 | `AGENT_OFFICE_CALLBACK_PORT` | `41997`, the loopback port for the OAuth callback |
 | `AGENT_OFFICE_POLL_MS` | `60000`, inbox poll interval; minimum `1000` |
 | `AGENT_OFFICE_AUTODISPATCH` | `on` (dispatch through `hc`); `off` disables it. `hc`, `herdr` and `session` are accepted aliases |
+| `AGENT_OFFICE_INBOX` | `session` (default): new mail is handed to the open session as a notice with ids and counts only. `headless` runs the full inbox brief in a child session; `off` leaves mail unread |
 
 ## Development
 

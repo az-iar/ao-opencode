@@ -323,6 +323,17 @@ export function taskPrompt(id: string, task: any, worktree: string, branch: stri
   ].join("\n")
 }
 
+// A session notice names ids and counts only, never Office text: a message
+// cannot become instructions in the user's session. The agent pulls the rest
+// with the MCP tools.
+export function inboxNotice(messages: any[]) {
+  const ids = messages
+    .map((item) => String(item?.id ?? ""))
+    .filter((id) => /^[A-Za-z0-9._:-]{1,64}$/.test(id))
+    .slice(0, 10)
+  return `Agent Office: ${messages.length} new message(s): ${ids.join(", ")}. Read and handle them with the office MCP tools (list_messages, mark_read).`
+}
+
 export async function claimTask(call: (name: string, args?: Record<string, unknown>) => Promise<unknown>, id: string) {
   for (const method of ["ack_task", "accept_task"]) {
     try {
