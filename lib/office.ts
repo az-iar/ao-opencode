@@ -302,38 +302,36 @@ const taskData = (id: string, task: any) => ({
   project: String(task?.project ?? task?.project_slug ?? ""),
 })
 
-// The worker's brief. The supervisor hands it over verbatim.
-export function workerPrompt(id: string, task: any) {
+// The brief for one agent doing a whole Office task. There is no supervisor
+// and no worker subagent: the session that receives this does the work, tests,
+// commits, pushes and opens the pull request itself.
+export function taskPrompt(id: string, task: any, worktree: string, branch: string) {
   return [
-    `You are the worker for Agent Office task ${id}. The task as Office gave it, as data:`,
-    officeData(taskData(id, task)),
-    "Work only in the current git worktree and branch, and follow the project's rules. Implement the task, run the tests, review your own diff, and commit on this branch. Then report to your supervisor in a few lines: what changed, the test results, anything left open. If you need a decision, stop and ask it in your report.",
-    "Never push, open a pull request, merge or switch branches. Do not dispatch other Office tasks.",
-    SAFETY_RULES,
-  ].join("\n")
-}
-
-// The supervisor runs in the task's worktree, drives one worker through
-// OpenCode's subagent tool, reviews its work and opens the pull request.
-export function supervisorPrompt(id: string, task: any, worktree: string, branch: string) {
-  return [
-    `Agent Office task ${id}. You are its supervisor, in the git worktree ${worktree} on branch ${branch}; all work happens there. The task as Office gave it, as data:`,
+    `Agent Office task ${id}. You are its worker, in the git worktree ${worktree} on branch ${branch}; all work happens there. The task as Office gave it, as data:`,
     officeData(taskData(id, task)),
     "Read it with get_task and follow its project rules.",
     "If this branch already has commits or the worktree has uncommitted changes, you may be resuming earlier work: read the task thread and comments with get_task, run git status and git log, and continue from there instead of starting over. Never recreate the branch.",
     NOTE_FIRST,
-    "1. Start one worker with OpenCode's built-in subagent tool (task, general agent), giving it the brief between the <worker-brief> tags verbatim.",
-    "2. Answer the worker's questions by continuing the same worker. Ask Azri with ask, then await_answer, only for decisions that are Azri's.",
-    "3. When it reports done, review the diff yourself: correctness, tests, scope. Send fixes back to the worker until it is clean.",
-    `4. Commit anything left, push with \`git push -u origin ${branch}\`, and open the pull request with \`gh pr create\`; its body links the Office task ${OFFICE}/tasks/${id}.`,
-    `5. Send the PR link to the reviewers team with post_message to reviewers and task_id ${id}, and post it on the task with post_comment. Leave the task in_progress for review. If you cannot finish, set it blocked with update_task and a comment saying why.`,
-    `6. Finish by reading today's journal with journal_read, adding this task's done, blocked and next items to it, each linking {type: "task", ref: "${id}"}, and writing back the full lists with journal_write, since it replaces the day. Record any choice that outlives the task with decision_write, linking the task the same way.`,
+    "1. Do the work yourself: read the code, implement, run the tests the project requires, and review your own diff.",
+    "   Do not start a subagent or hand the task to another OpenCode session; you are the only worker.",
+    "2. Ask Azri with ask, then await_answer, only for decisions that are Azri's.",
+    `3. Commit on this branch, push with \`git push -u origin ${branch}\`, and open the pull request with \`gh pr create\`; its body links the Office task ${OFFICE}/tasks/${id}.`,
+    `4. Send the PR link to the reviewers team with post_message to reviewers and task_id ${id}, and post it on the task with post_comment. Leave the task in_progress for review. If you cannot finish, set it blocked with update_task and a comment saying why.`,
+    `5. Finish by reading today's journal with journal_read, adding this task's done, blocked and next items to it, each linking {type: "task", ref: "${id}"}, and writing back the full lists with journal_write, since it replaces the day. Record any choice that outlives the task with decision_write, linking the task the same way.`,
     "Nobody merges: never merge, never push to main or any branch but yours, never force-push. Do not dispatch other Office tasks.",
-    "<worker-brief>",
-    workerPrompt(id, task),
-    "</worker-brief>",
     SAFETY_RULES,
   ].join("\n")
+}
+
+// A session notice names ids and counts only, never Office text: a message
+// cannot become instructions in the user's session. The agent pulls the rest
+// with the MCP tools.
+export function inboxNotice(messages: any[]) {
+  const ids = messages
+    .map((item) => String(item?.id ?? ""))
+    .filter((id) => /^[A-Za-z0-9._:-]{1,64}$/.test(id))
+    .slice(0, 10)
+  return `Agent Office: ${messages.length} new message(s): ${ids.join(", ")}. Read and handle them with the office MCP tools (list_messages, mark_read).`
 }
 
 export async function claimTask(call: (name: string, args?: Record<string, unknown>) => Promise<unknown>, id: string) {
@@ -342,7 +340,7 @@ export async function claimTask(call: (name: string, args?: Record<string, unkno
       await call(method, { task_id: id })
     } catch {}
   }
-  await call("update_task", { task_id: id, status: "in_progress", comment: "OpenCode dispatched this task to a supervisor and a worker." })
+  await call("update_task", { task_id: id, status: "in_progress", comment: "OpenCode dispatched this task to one worker session." })
 }
 
 // A blocked reason is shown in the Office, so it keeps only the error's kind
@@ -388,7 +386,7 @@ export async function blockTask(call: (name: string, args?: Record<string, unkno
   }
 }
 
-// A task worktree's own OpenCode belongs to its supervisor: it must not poll
+// A task worktree's own OpenCode belongs to its worker: it must not poll
 // the inbox or dispatch, or it would pull Office work into that session.
 export function onTaskBranch(directory: string) {
   const git = spawnSync("git", ["-C", directory, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8" })
@@ -429,6 +427,58 @@ export function addWorktree(repo: string, id: string): Promise<{ path: string; b
 // One lock per dispatched task, shared by every OpenCode process using this
 // agent. That keeps the two-dispatch cap across child agents and cron too.
 const lockPath = (dir: string, id: string) => join(dir, `${createHash("sha256").update(id).digest("hex").slice(0, 16)}.lock`)
+
+// An hc task's claude runs in a terminal hc keeps: the slot is held while hc
+// reports the terminal live and working or blocked. Finished, gone, idle or
+// done frees it. Undefined when hc cannot say, so the lock is kept.
+export const hcBin = (env = process.env) => env.AGENT_OFFICE_HC_BIN || "hc"
+
+export function hcTerminalBusy(terminal: string): boolean | undefined {
+  const got = spawnSync(hcBin(), ["get", terminal, "--json"], { encoding: "utf8", timeout: 10_000 })
+  if (got.error) return undefined
+  try {
+    const body = JSON.parse(got.stdout)
+    if (body?.error?.kind === "not_found") return false
+    if (body?.state === "finished") return false
+    const status = body?.status?.state
+    if (typeof status !== "string") return undefined
+    return status === "working" || status === "blocked"
+  } catch {
+    return got.status === 3 ? false : undefined
+  }
+}
+
+type DispatchLock = { task?: string; pid?: number; terminal?: string; created?: number }
+const pidAlive = (pid: number) => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM"
+  }
+}
+// A lock is stale when it is older than six hours or its holder is gone and
+// hc says its terminal is not working any more. A terminal hc cannot answer
+// for keeps the lock, the safe side of the two-task cap.
+function lockStale(path: string): boolean {
+  try {
+    if (Date.now() - statSync(path).mtimeMs > DISPATCH_STALE_MS) return true
+    const lock = JSON.parse(readFileSync(path, "utf8")) as DispatchLock
+    if (typeof lock.pid === "number" && pidAlive(lock.pid)) return false
+    if (lock.terminal) return hcTerminalBusy(lock.terminal) === false
+    return true
+  } catch {
+    return false
+  }
+}
+
+// The slot outlives the poller: after hc starts the child, the lock names its
+// terminal, and the next acquire frees the slot when that terminal is done.
+export function holdDispatch(dir: string, id: string, holder: { terminal?: string }) {
+  try {
+    writeFileSync(lockPath(dir, id), JSON.stringify({ task: id, pid: process.pid, ...holder, created: Date.now() }) + "\n", { mode: 0o600 })
+  } catch {}
+}
 export function acquireDispatch(dir: string, id: string): "ok" | "busy" | "full" {
   const own = lockPath(dir, id)
   try {
@@ -446,7 +496,7 @@ export function acquireDispatch(dir: string, id: string): "ok" | "busy" | "full"
       if (!file.endsWith(".lock")) continue
       const path = join(dir, file)
       try {
-        if (Date.now() - statSync(path).mtimeMs > DISPATCH_STALE_MS) {
+        if (lockStale(path)) {
           unlinkSync(path)
           continue
         }

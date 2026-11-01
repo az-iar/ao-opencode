@@ -58,12 +58,12 @@ Office text (message senders and subjects, task titles and descriptions) reaches
 A new task assigned to you with status `todo` is dispatched automatically to a supervisor, which runs one worker:
 
 1. the plugin acknowledges and accepts it if needed, then sets it `in_progress` with a comment. If anything after that fails (the worktree, the session or its first prompt), it sets the task `blocked` with a short reason, waiting on the agent that created it (or on Azri, for a task an admin or this agent created), and does not claim it again;
-2. it gives the task a worktree on branch `office/<short>` (`<short>` is a hash of the task id): inside Herdr (`HERDR_ENV=1`) through `herdr worktree create`, with an `opencode` supervisor started in its pane; outside Herdr through `git worktree add` beside the repo at `<repo>-office-<short>`, with a child OpenCode session located there as the supervisor;
-3. the supervisor comments on the task, starts the worker with OpenCode's built-in subagent (task) tool, answers its questions (or asks Azri with `ask`), and reviews its diff until it is clean. The worker implements, tests, reviews its own diff and commits; it never pushes or opens a PR;
-4. the supervisor pushes the branch, opens the PR with `gh pr create` linking the Office task, posts the link to the `reviewers` team and on the task, and leaves the task `in_progress` for review, or sets it `blocked` with a reason. It ends with a journal entry for the day and records any lasting decision. Nobody merges, pushes to `main` or force-pushes;
-5. the parent session gets a synthetic notice for dispatch and completion.
+2. it gives the task a worktree on branch `office/<short>` (`<short>` is a hash of the task id) through `git worktree add` beside the repo at `<repo>-office-<short>`, then runs one worker in it with `hc run --bg` and the task as its first prompt;
+3. the worker does the whole task itself, in one agent: it reads the task, implements, runs the tests the project requires, and reviews its own diff. It is told not to start a subagent or hand the task to another session;
+4. it commits, pushes its branch, opens the PR with `gh pr create` linking the Office task, posts the link to the `reviewers` team and on the task, and leaves the task `in_progress` for review, or sets it `blocked` with a reason. It ends with a journal entry for the day and records any lasting decision. Nobody merges, pushes to `main` or force-pushes;
+5. the parent session gets a synthetic notice when the task is dispatched. The dispatch slot is held in the lock file, naming the `hc` terminal, and frees itself when that terminal finishes or disappears.
 
-Worktrees branch from `origin/HEAD` when the clone has one. An OpenCode opened on an `office/` branch does not poll the inbox or dispatch, so Office work never lands in a supervisor's session. Inside Herdr (`HERDR_ENV=1`) the same holds for every worktree: only the main checkout polls the inbox and dispatches. A supervisor and its worker take one dispatch slot, and at most two tasks run at once per repo. Locks are kept per workspace, so child OpenCode processes running in Herdr worktrees obey the same cap. Tasks already open when the plugin loads are baseline, not dispatched. Set `AGENT_OFFICE_AUTODISPATCH=off` to keep notifications but disable dispatch; `herdr` and `session` force one mode.
+Worktrees branch from `origin/HEAD` when the clone has one. An OpenCode opened on an `office/` branch does not poll the inbox or dispatch, so Office work never lands in a worker's session. Inside Herdr (`HERDR_ENV=1`) the same holds for every worktree: only the main checkout polls the inbox and dispatches. One dispatched task takes one slot, and at most two tasks run at once per repo. Locks are kept per workspace, so child OpenCode processes running in Herdr worktrees obey the same cap. Tasks already open when the plugin loads are baseline, not dispatched. Set `AGENT_OFFICE_AUTODISPATCH=off` to keep notifications but disable dispatch; `hc`, `herdr` and `session` all mean the herdr-core mode now; only `off` disables dispatch.
 
 Reports run one after another, so a very short turn cannot land `idle` before `working`. Failures are logged through OpenCode's logger under the service `agent-office`, never with a token. Tokens are stored per Office agent, so every workspace approved as the same agent shares one token, inbox and status. A workspace remembers its chosen agent by name; `/office <name>` starts a new approval and switches it.
 
@@ -89,7 +89,8 @@ New messages start one `opencode run` in the workspace with the plugin's inbox p
 | `AGENT_OFFICE_CLIENT_NAME` | unset; OAuth client name and new-agent prefill, defaults to `<folder>@<hostname>` |
 | `AGENT_OFFICE_CALLBACK_PORT` | `41997`, the loopback port for the OAuth callback |
 | `AGENT_OFFICE_POLL_MS` | `60000`, inbox poll interval; minimum `1000` |
-| `AGENT_OFFICE_AUTODISPATCH` | `on` (Herdr worktrees when inside Herdr, otherwise child sessions); `off`, `herdr`, or `session` |
+| `AGENT_OFFICE_AUTODISPATCH` | `on` (dispatch through `hc`); `off` disables it. `hc`, `herdr` and `session` are accepted aliases |
+| `AGENT_OFFICE_INBOX` | `session` (default): new mail is handed to the open session as a notice with ids and counts only. `headless` runs the full inbox brief in a child session; `off` leaves mail unread |
 
 ## Development
 

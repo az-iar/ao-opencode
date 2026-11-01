@@ -119,7 +119,7 @@ test("a notice claim held by the plugin prevents a run", async () => {
   assert.equal(ws.recorded().length, 1, "a claimed batch is seen")
 })
 
-test("a new todo task is claimed, run as a supervisor in its worktree, and its dispatch lock released", async () => {
+test("a new todo task is claimed, run as one worker in its worktree, and its dispatch lock released", async () => {
   reset()
   const ws = workspace()
   await ws.poll()
@@ -139,7 +139,7 @@ test("a new todo task is claimed, run as a supervisor in its worktree, and its d
   assert.equal(execFileSync("git", ["-C", worktree, "branch", "--show-current"], { encoding: "utf8" }).trim(), `office/${short}`)
   assert.equal(run.cwd, worktree)
   assert.deepEqual(run.argv.slice(0, 5), ["run", "--dir", worktree, "--title", "Office task task-new"])
-  assert.match(run.argv[5], /^Agent Office task task-new\. You are its supervisor/)
+  assert.match(run.argv[5], /^Agent Office task task-new\. You are its worker/)
   assert.ok(run.argv[5].includes(`git worktree ${worktree} on branch office/${short}`))
   assert.match(run.argv[5], /Before you start any work, post one short comment on the task with post_comment/)
   assert.doesNotMatch(run.argv[5], /post_message to azri/)
@@ -194,7 +194,7 @@ test("a claimed task whose worktree fails is blocked on its creating agent and n
   office.state.openTasks = [...office.state.openTasks, { id: "task-wt", title: "Fix it", status: "todo" }]
   const result = await ws.poll()
   assert.equal(result.code, 0, result.stderr)
-  assert.equal(ws.recorded().length, 1, "no supervisor run")
+  assert.equal(ws.recorded().length, 1, "no worker run")
   const [claim, block] = taskUpdates("task-wt")
   assert.equal(claim.status, "in_progress")
   assert.equal(block.status, "blocked")

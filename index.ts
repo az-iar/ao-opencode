@@ -6,9 +6,10 @@
 //   while running      `working` while any session runs, a heartbeat every
 //                      90 s, `idle` once every session is quiet; `blocked` is
 //                      never overridden. New mail runs in an inbox child of
-//                      the chat's session. New assigned tasks go to a supervisor
-//                      and its worker in a worktree, through Herdr or a child
-//                      session, up to two tasks at a time.
+//                      the chat's session. A new assigned task is claimed in a
+//                      worktree and queued in this session, or in one Herdr
+//                      agent, up to two tasks at a time. No supervisor/worker
+//                      subagent pair.
 //
 //   AGENT_OFFICE_URL                   dashboard origin, default https://office.byma.tech
 //   AGENT_OFFICE_TOKEN                 an agent API token instead of OAuth (optional)
@@ -32,6 +33,8 @@ import {
   type Credentials,
   acquireDispatch,
   addWorktree,
+  hcBin,
+  holdDispatch,
   agentCredentialsPath,
   agentStateDir,
   blockTask,
@@ -43,6 +46,7 @@ import {
   cronLine,
   DISPATCH_STALE_MS,
   fromOthers,
+  inboxNotice,
   inboxPrompt,
   itemKey,
   MAX_DISPATCHES,
@@ -57,7 +61,7 @@ import {
   saveAgentPointer,
   saveCredentials,
   summary,
-  supervisorPrompt,
+  taskPrompt,
   taskID,
   taskShort,
   tokenRequest,
@@ -147,20 +151,6 @@ function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<
 
 // The client's own check: OpenCode tags a missing session's error.
 const sessionNotFound = (err: unknown) => typeof err === "object" && err !== null && (err as { _tag?: unknown })._tag === "SessionNotFoundError"
-
-function jsonResult(output: string): any {
-  try {
-    const parsed = JSON.parse(output)
-    return parsed?.result ?? parsed
-  } catch {
-    return undefined
-  }
-}
-
-function agentState(output: string): string | undefined {
-  const result = jsonResult(output)
-  return result?.agent?.agent_status ?? result?.agent_status ?? result?.state
-}
 
 async function registerClient(callback: string, clientName: string): Promise<string> {
   const res = await fetch(`${OFFICE}/oauth/register`, {
@@ -337,8 +327,17 @@ export default Plugin.define({
     }
     const dispatchDir = () => agentStateDir(legacyCredentialsFile, "dispatch", ownAgent?.slug ?? locationKey)
     const noticeDir = () => agentStateDir(legacyCredentialsFile, "notices", ownAgent?.slug ?? locationKey)
+    // New mail goes to the open session as an ids-only notice by default, like
+    // ao-claude's session inbox; "headless" keeps the child-session worker,
+    // "off" leaves mail unread for a human.
+    const configuredInbox = String(ctx.options.inbox ?? process.env.AGENT_OFFICE_INBOX ?? "session").toLowerCase()
+    const inboxMode = configuredInbox === "headless" ? "headless" : configuredInbox === "off" ? "off" : "session"
     const configuredDispatch = String(ctx.options.autoDispatch ?? process.env.AGENT_OFFICE_AUTODISPATCH ?? "on").toLowerCase()
-    const dispatchMode = configuredDispatch === "off" || configuredDispatch === "false" ? "off" : configuredDispatch === "herdr" ? "herdr" : configuredDispatch === "session" ? "session" : process.env.HERDR_ENV === "1" ? "herdr" : "session"
+    // ao-claude never queues a task into the user's session: every mode spawns
+    // its own worker in the worktree. "session" and "herdr" are kept as aliases
+    // for hc, so an old setting still dispatches and no longer edits the main
+    // checkout.
+    const dispatchMode = configuredDispatch === "off" || configuredDispatch === "false" ? "off" : "hc"
     const bearer = auth.bearer
     const { call, checkin } = createClient(bearer)
 
@@ -417,8 +416,8 @@ export default Plugin.define({
 
     // Inbox children by id, each mapped to the root session it works for.
     const inboxSessions = new Map<string, string>()
-    // Children this plugin started count as busy work, but never as a target.
-    const officeChild = (sessionID: string) => dispatchedSessions.has(sessionID) || inboxSessions.has(sessionID)
+    // Inbox children this plugin started count as busy work, but never as a target.
+    const officeChild = (sessionID: string) => inboxSessions.has(sessionID)
     const targetSession = () => [...busy].filter((id) => !id.startsWith("herdr:") && !officeChild(id)).at(-1) ?? lastSessionID
     // One OpenCode server can stream events for several windows, so a session
     // counts only when OpenCode places it in this folder or this plugin
@@ -595,60 +594,32 @@ export default Plugin.define({
 
     const backlog = new Set<string>()
     const dispatching = new Set<string>()
-    const dispatchedSessions = new Map<string, { taskID: string; parent: string; title: string }>()
-
-    const settleChild = (sessionID: string) => {
-      const child = dispatchedSessions.get(sessionID)
-      if (!child) return
-      dispatchedSessions.delete(sessionID)
-      releaseDispatch(dispatchDir(), child.taskID)
-      dispatching.delete(child.taskID)
-      notify(child.parent, `Office task ${child.taskID} supervisor session ${sessionID} is idle. Read the session; the supervisor opens the PR and updates the task.`)
-      pumpDispatch()
-    }
 
     const repo = ctx.location.project?.canonical ?? ctx.location.directory
 
-    const dispatchSession = async (id: string, task: any, title: string, parent: string) => {
+    // Herdr-core mode: one `hc` child does the whole task. The worktree is
+    // ours (git), and `hc run --bg` starts an OpenCode with the task as its
+    // first prompt, so there is no supervisor and no worker subagent.
+    const dispatchHc = async (id: string, task: any, title: string, parent: string) => {
       const { path, branch } = await addWorktree(repo, id)
-      const child = await createChild(parent, `Office: ${title}`.slice(0, 120), { directory: path })
-      dispatchedSessions.set(child.id, { taskID: id, parent, title })
-      try {
-        await bounded(ctx.session.prompt({ sessionID: child.id, text: supervisorPrompt(id, task, path, branch) }), "session.prompt")
-      } catch (err) {
-        dispatchedSessions.delete(child.id)
-        void ctx.session.remove({ sessionID: child.id }).catch(() => {})
-        throw err
-      }
-      notify(parent, `Dispatched Office task ${id} to supervisor session ${child.id} (${branch}) at ${path}.`)
-    }
-
-    const dispatchHerdr = async (id: string, task: any, title: string, parent: string) => {
-      const pseudo = `herdr:${id}`
-      start(pseudo)
-      try {
-        const short = taskShort(id)
-        const branch = `office/${short}`
-        const created = await run("herdr", ["worktree", "create", "--cwd", repo, "--branch", branch, "--label", title.slice(0, 80), "--no-focus"], 120_000)
-        if (created.code !== 0) throw new Error(`herdr worktree create failed: ${created.stderr || created.stdout}`)
-        const info = jsonResult(created.stdout)
-        const pane = info?.root_pane?.pane_id
-        if (!pane) throw new Error("herdr worktree create returned no root pane")
-        const name = `office-${short}`
-        const started = await run("herdr", ["agent", "start", name, "--kind", "opencode", "--pane", pane, "--timeout", "120000"], 150_000)
-        if (started.code !== 0) throw new Error(`herdr agent start failed: ${started.stderr || started.stdout}`)
-        const worktree = info?.worktree?.path ?? "of this pane"
-        const prompted = await run("herdr", ["agent", "prompt", name, supervisorPrompt(id, task, worktree, branch), "--wait", "--timeout", String(DISPATCH_STALE_MS)], DISPATCH_STALE_MS + 60_000)
-        const state = agentState(prompted.stdout) ?? "unknown"
-        notify(parent, `Office task ${id} dispatched to Herdr supervisor ${name} (${branch}) at ${info?.worktree?.path ?? "its worktree"}. State: ${state}.`)
-      } finally {
-        stop(pseudo)
-      }
+      // Names must be unique among live terminals: a retry while the first
+      // child still runs would otherwise fail the launch.
+      const name = `office-${taskShort(id)}-${randomBytes(2).toString("hex")}`
+      const started = await run(
+        hcBin(),
+        ["run", "--bg", "--outlive-parent", "--no-notify", "--name", name, "--cwd", path, "opencode", "--prompt", taskPrompt(id, task, path, branch)],
+        60_000,
+      )
+      if (started.code !== 0) throw new Error(`hc run failed: ${started.stderr || started.stdout}`)
+      // The slot outlives this process: the lock names the terminal, and the
+      // next acquire frees it once hc says it is finished or gone.
+      holdDispatch(dispatchDir(), id, { terminal: name })
+      notify(parent, `Office task ${id} dispatched to hc worker ${name} (${branch}) at ${path}.`)
     }
 
     const dispatchTask = async (id: string) => {
-      let held = false
       let claimed = false
+      let held = false
       let task: any
       const parent = await targetSessionAsync()
       try {
@@ -658,12 +629,8 @@ export default Plugin.define({
         const title = String(task?.title ?? id)
         await claimTask(call, id)
         claimed = true
-        if (dispatchMode === "herdr") {
-          await dispatchHerdr(id, task, title, parent)
-        } else {
-          await dispatchSession(id, task, title, parent)
-          held = true
-        }
+        await dispatchHc(id, task, title, parent)
+        held = true
       } catch (err) {
         warn("could not dispatch Office task", { task: id, error: String(err) })
         notify(parent, `Could not dispatch Office task ${id}: ${String(err)}`)
@@ -743,7 +710,21 @@ export default Plugin.define({
         if (String(item?.status ?? "todo").toLowerCase() === "todo") backlog.add(taskID(item))
       }
 
-      if (freshMessages.length > 0) {
+      if (freshMessages.length > 0 && inboxMode === "off") {
+        // Left unread on purpose: the ids stay seen so one batch is not
+        // announced on every poll, and a human sees them in Office.
+        for (const item of freshMessages) seenMessages.add(itemKey(item, "message"))
+      } else if (freshMessages.length > 0 && inboxMode === "session") {
+        try {
+          await bounded(ctx.session.prompt({ sessionID, text: inboxNotice(freshMessages), delivery: "queue" }), "session.prompt")
+          lastPromptAt = Date.now()
+          lastPromptError = undefined
+          for (const item of freshMessages) seenMessages.add(itemKey(item, "message"))
+        } catch (err) {
+          lastPromptError = String(err)
+          warn("could not hand new Office messages to the session", { error: String(err) })
+        }
+      } else if (freshMessages.length > 0) {
         const ids = freshMessages.map((item) => itemKey(item, "message"))
         if (!claimNotice(noticeDir(), ids)) {
           for (const item of freshMessages) seenMessages.add(itemKey(item, "message"))
@@ -891,6 +872,7 @@ export default Plugin.define({
                 clientName,
                 plugin: ctx.app.version,
                 mode: dispatchMode,
+                inbox: inboxMode,
                 pollInterval,
                 lastPollAt: lastPollAt ? new Date(lastPollAt).toISOString() : undefined,
                 lastPollError,
@@ -936,7 +918,6 @@ export default Plugin.define({
               if (!child) rememberSession(event.data.sessionID)
               if (event.data.status.type === "idle") {
                 stop(event.data.sessionID)
-                settleChild(event.data.sessionID)
               } else start(event.data.sessionID)
               break
             }
@@ -944,7 +925,6 @@ export default Plugin.define({
               const child = officeChild(event.data.sessionID)
               if (!child) rememberSession(event.data.sessionID)
               stop(event.data.sessionID)
-              settleChild(event.data.sessionID)
               break
             }
             case "session.deleted": {
@@ -959,7 +939,6 @@ export default Plugin.define({
                 if (key) void ctx.storage.remove(key).catch(() => {})
               }
               stop(event.data.sessionID)
-              settleChild(event.data.sessionID)
               break
             }
           }
