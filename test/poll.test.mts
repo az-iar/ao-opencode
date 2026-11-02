@@ -36,6 +36,9 @@ function workspace() {
   const env: Record<string, string> = { ...(process.env as Record<string, string>), HOME: root, AGENT_OFFICE_URL: url, AGENT_OFFICE_OPENCODE_CREDENTIALS: credentials, AGENT_OFFICE_OPENCODE_BIN: stub }
   delete env.AGENT_OFFICE_TOKEN
   delete env.AGENT_OFFICE_AUTODISPATCH
+  // Worktrees land under this HOME's ~/.ao; no real hc is ever asked.
+  delete env.AO_HOME
+  env.AGENT_OFFICE_HC_BIN = join(root, "no-hc")
   const poll = (args: string[] = [], extra: Record<string, string> = {}) =>
     new Promise<{ code: number | null; stderr: string }>((resolve) => {
       const child = spawn(process.execPath, ["--experimental-strip-types", "--disable-warning=ExperimentalWarning", pollScript, "--dir", dir, ...args], { env: { ...env, ...extra }, stdio: ["ignore", "ignore", "pipe"] })
@@ -45,7 +48,9 @@ function workspace() {
     })
   const recorded = () => readdirSync(runs).sort().map((file) => JSON.parse(readFileSync(join(runs, file), "utf8")) as { cwd: string; argv: string[] })
   const state = (kind: string) => join(root, "store", kind, "opencode")
-  return { dir, poll, recorded, state }
+  // Where a task's worktree goes: ${AO_HOME:-~/.ao}/worktrees/<repo>/<short>-<slug>.
+  const worktreeFor = (id: string, slug: string) => join(root, ".ao", "worktrees", "repo", `${createHash("sha256").update(id).digest("hex").slice(0, 8)}-${slug}`)
+  return { dir, poll, recorded, state, worktreeFor }
 }
 
 const reset = () => {
@@ -135,7 +140,7 @@ test("a new todo task is claimed, run as one worker in its worktree, and its dis
   assert.equal(ws.recorded().length, 2)
   const run = ws.recorded()[1]
   const short = createHash("sha256").update("task-new").digest("hex").slice(0, 8)
-  const worktree = `${ws.dir}-office-${short}`
+  const worktree = ws.worktreeFor("task-new", "fix-it")
   assert.equal(execFileSync("git", ["-C", worktree, "branch", "--show-current"], { encoding: "utf8" }).trim(), `office/${short}`)
   assert.equal(run.cwd, worktree)
   assert.deepEqual(run.argv.slice(0, 5), ["run", "--dir", worktree, "--title", "Office task task-new"])
@@ -189,8 +194,9 @@ test("a claimed task whose worktree fails is blocked on its creating agent and n
   const ws = workspace()
   await ws.poll()
   office.calls.length = 0
-  execFileSync("git", ["-C", ws.dir, "branch", `office/${short("task-wt")}`])
-  office.state.taskDetails.set("task-wt", { id: "task-wt", title: "Fix it", created_by: "agent:planner" })
+  // A folder that is not the task's worktree sits at its path: never taken over.
+  mkdirSync(ws.worktreeFor("task-wt", "fix-it"), { recursive: true })
+  office.state.taskDetails.set("task-wt", { id: "task-wt", title: "Fix it", status: "todo", created_by: "agent:planner" })
   office.state.openTasks = [...office.state.openTasks, { id: "task-wt", title: "Fix it", status: "todo" }]
   const result = await ws.poll()
   assert.equal(result.code, 0, result.stderr)
@@ -199,7 +205,7 @@ test("a claimed task whose worktree fails is blocked on its creating agent and n
   assert.equal(claim.status, "in_progress")
   assert.equal(block.status, "blocked")
   assert.equal(block.waiting_on, "planner")
-  assert.match(block.reason, /^OpenCode could not start this task: Error: git worktree add failed/)
+  assert.match(block.reason, /^OpenCode could not start this task: Error: .* exists and is not the office\/[0-9a-f]{8} worktree/)
   assert.deepEqual(readdirSync(ws.state("dispatch")), [])
   await ws.poll()
   assert.equal(taskUpdates("task-wt").length, 2, "never set back to todo or claimed again")
@@ -210,7 +216,7 @@ test("a failed opencode start is blocked with a masked reason, on Azri when the 
   const ws = workspace()
   await ws.poll()
   office.calls.length = 0
-  office.state.taskDetails.set("task-ghost", { id: "task-ghost", title: "From a gone agent", created_by: "agent:ghost" })
+  office.state.taskDetails.set("task-ghost", { id: "task-ghost", title: "From a gone agent", status: "todo", created_by: "agent:ghost" })
   office.state.openTasks = [...office.state.openTasks, { id: "task-ghost", title: "From a gone agent", status: "todo" }]
   office.state.refuse = (name, args) => name === "update_task" && args?.waiting_on === "ghost"
   try {
@@ -231,8 +237,8 @@ test("an HTTP error on the blocked update is logged, not retried on Azri, and a 
   await ws.poll()
   office.calls.length = 0
   for (const id of ["task-5xx", "task-taken"]) {
-    execFileSync("git", ["-C", ws.dir, "branch", `office/${short(id)}`])
-    office.state.taskDetails.set(id, { id, title: id, created_by: "agent:planner" })
+    mkdirSync(ws.worktreeFor(id, id), { recursive: true })
+    office.state.taskDetails.set(id, { id, title: id, status: "todo", created_by: "agent:planner" })
   }
   office.state.openTasks = [...office.state.openTasks, ...["task-5xx", "task-taken"].map((id) => ({ id, title: id, status: "todo" }))]
   office.state.httpError = (name, args) => (name === "update_task" && args?.status === "blocked" ? 502 : undefined)

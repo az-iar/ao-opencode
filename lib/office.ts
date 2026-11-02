@@ -7,9 +7,9 @@
 
 import { spawn, spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { basename, dirname, join, sep } from "node:path"
+import { basename, dirname, join, resolve, sep } from "node:path"
 
 export const OFFICE = (process.env.AGENT_OFFICE_URL ?? "https://office.byma.tech").replace(/\/+$/, "")
 export const CREDENTIALS_OVERRIDE = process.env.AGENT_OFFICE_OPENCODE_CREDENTIALS
@@ -406,22 +406,110 @@ export function inHerdrWorktree(directory: string, env = process.env) {
 
 export const taskShort = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 8)
 
-// Session and cron dispatch give each task a worktree beside the repo,
-// `<repo>-office-<short>` on branch `office/<short>`; a retry reuses it.
-// It branches from the remote's default branch when the clone knows one.
-export function addWorktree(repo: string, id: string): Promise<{ path: string; branch: string }> {
+const slugify = (value: string) => value.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "")
+
+// Agent Office's home: $AO_HOME, else ~/.ao. Read at call time; empty means
+// unset. A leading `~` or `~/` (a quoted AO_HOME="~/.ao" the shell left alone)
+// is the home folder, and any other relative value resolves against the
+// current directory, so every path handed on is absolute. Same as ao-claude.
+export function aoHome(env: NodeJS.ProcessEnv = process.env) {
+  const set = env.AO_HOME?.trim()
+  if (!set) return join(homedir(), ".ao")
+  if (set === "~") return homedir()
+  if (set.startsWith("~/")) return resolve(homedir(), set.slice(2))
+  return resolve(set)
+}
+
+// Every task worktree lives at ${AO_HOME:-~/.ao}/worktrees/<repo>/<short>-<slug>
+// (the Office rule `worktree-location`), the same path ao-claude computes for
+// the same task. The slug is the title, cut to path-safe words.
+export function taskWorktreePath(repo: string, id: string, title = "", env: NodeJS.ProcessEnv = process.env) {
+  const slug = slugify(title).toLowerCase().slice(0, 40).replace(/[-.]+$/, "")
+  return join(aoHome(env), "worktrees", slugify(basename(repo)) || "repo", `${taskShort(id)}${slug ? `-${slug}` : ""}`)
+}
+
+function samePath(a: string, b: string) {
+  try {
+    return realpathSync(a) === realpathSync(b)
+  } catch {
+    return resolve(a) === resolve(b)
+  }
+}
+
+// The worktree the branch is checked out in, if any.
+function worktreeOf(repo: string, branch: string): string | undefined {
+  const got = spawnSync("git", ["-C", repo, "worktree", "list", "--porcelain"], { encoding: "utf8" })
+  if (got.status !== 0) return undefined
+  let path: string | undefined
+  for (const line of got.stdout.split("\n")) {
+    if (line.startsWith("worktree ")) path = line.slice("worktree ".length)
+    else if (line === `branch refs/heads/${branch}`) return path
+    else if (!line.trim()) path = undefined
+  }
+  return undefined
+}
+
+// Session and cron dispatch give each task a worktree under AO_HOME on branch
+// `office/<short>`; a retry reuses the worktree that branch is checked out in.
+// A folder at the path that is not that worktree is never taken over: the
+// dispatch fails, so the task is blocked with the reason instead of two
+// workers sharing a tree. It branches from the remote's default branch when
+// the clone knows one.
+export function addWorktree(repo: string, id: string, title = ""): Promise<{ path: string; branch: string }> {
   const short = taskShort(id)
   const branch = `office/${short}`
-  const path = join(dirname(repo), `${basename(repo)}-office-${short}`)
-  if (existsSync(path)) return Promise.resolve({ path, branch })
+  const kept = worktreeOf(repo, branch)
+  if (kept && samePath(kept, repo)) {
+    return Promise.reject(new Error(`${branch} is checked out in the main checkout ${repo}; move that branch before dispatching task ${id}`))
+  }
+  if (kept) return Promise.resolve({ path: kept, branch })
+  const path = taskWorktreePath(repo, id, title)
+  if (existsSync(path)) return Promise.reject(new Error(`${path} exists and is not the ${branch} worktree of ${repo}; not taking it over`))
+  const branchExists = spawnSync("git", ["-C", repo, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).status === 0
   const remote = spawnSync("git", ["-C", repo, "rev-parse", "--verify", "--quiet", "origin/HEAD"]).status === 0
+  mkdirSync(dirname(path), { recursive: true })
+  const args = branchExists ? ["worktree", "add", path, branch] : ["worktree", "add", "-b", branch, path, ...(remote ? ["origin/HEAD"] : [])]
   return new Promise((done, fail) => {
-    const git = spawn("git", ["-C", repo, "worktree", "add", "-b", branch, path, ...(remote ? ["origin/HEAD"] : [])], { stdio: ["ignore", "ignore", "pipe"] })
+    const git = spawn("git", ["-C", repo, ...args], { stdio: ["ignore", "ignore", "pipe"] })
     let stderr = ""
     git.stderr.on("data", (chunk) => (stderr += String(chunk)))
     git.on("error", fail)
     git.on("close", (code) => (code === 0 ? done({ path, branch }) : fail(new Error(`git worktree add failed: ${stderr.trim()}`))))
   })
+}
+
+// The hc label that marks the terminal working an Office task. ao-claude sets
+// and reads the same one, so neither dispatcher starts a second worker for a
+// task the other (or a hand-started worker) already runs.
+export const taskLabel = (id: string) => `ao.task=${id}`
+
+// Live hc terminals labelled for the task (`hc ls` lists only live ones).
+// Undefined when hc cannot say: missing, failing, or an answer it cannot read.
+export function hcTaskTerminals(id: string): string[] | undefined {
+  const got = spawnSync(hcBin(), ["ls", "--json", "--label", taskLabel(id)], { encoding: "utf8", timeout: 10_000 })
+  if (got.error || got.status !== 0) return undefined
+  try {
+    const body = JSON.parse(got.stdout)
+    const items = Array.isArray(body) ? body : Array.isArray(body?.terminals) ? body.terminals : undefined
+    if (!items) return undefined
+    return items.map((item: any) => (typeof item === "string" ? item : (item?.address ?? item?.id ?? item?.terminal))).filter((v: unknown): v is string => typeof v === "string" && v !== "")
+  } catch {
+    return undefined
+  }
+}
+
+// Why an assigned task must not be claimed now, or undefined to go ahead. The
+// task is read again just before the claim: checkin data can be stale, and a
+// task someone else already took is no longer todo. `hcRequired` (hc dispatch)
+// treats hc that cannot list terminals as a reason to wait; headless dispatch
+// goes ahead without hc.
+export function dispatchRefusal(id: string, task: any, hcRequired: boolean): string | undefined {
+  const status = String(task?.status ?? "").toLowerCase()
+  if (status !== "todo") return `it is ${status || "unreadable"}, not todo`
+  const live = hcTaskTerminals(id)
+  if (!live) return hcRequired ? "hc could not list its terminals" : undefined
+  if (live.length > 0) return `it already has a live worker terminal (${live.join(", ")})`
+  return undefined
 }
 
 // One lock per dispatched task, shared by every OpenCode process using this
