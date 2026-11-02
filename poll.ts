@@ -187,7 +187,7 @@ async function main(): Promise<number> {
             }
             await claimTask(call, id)
             claimed = true
-            const { path, branch } = await addWorktree(canonicalRoot(directory), id, String(task?.title ?? ""))
+            const { path, branch } = await addWorktree(canonicalRoot(directory), id, String(task?.title ?? id))
             log(`dispatching task ${id} to ${path}`)
             log(`task ${id} run exited ${await runOpencode(path, `Office task ${id}`, taskPrompt(id, detail?.task ?? detail, path, branch), DISPATCH_STALE_MS)}`)
           } catch (err) {

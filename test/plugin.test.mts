@@ -422,7 +422,7 @@ test("dispatches a new assigned todo task to one hc worker in its worktree", asy
 // the re-read says it is no longer todo or hc shows its ao.task terminal live.
 for (const [name, detail, ls] of [
   ["no longer todo when read again", { status: "in_progress" }, '{"terminals":[]}'],
-  ["already running in a live ao.task terminal", { status: "todo" }, '{"terminals":[{"address":"t9","state":"live"}]}'],
+  ["already running in a working ao.task terminal", { status: "todo" }, '{"terminals":[{"address":"t9","state":"live"}]}'],
 ] as const) {
   test(`an assigned task that is ${name} is not claimed or launched`, async () => {
     office.calls.length = 0
@@ -432,7 +432,7 @@ for (const [name, detail, ls] of [
     execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
     const bin = join(mkdtempSync(join(tmpdir(), "ao-hc-")), "hc")
     const log = `${bin}.log`
-    writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n[ "$1" = ls ] && echo '${ls}'\nexit 0\n`, { mode: 0o755 })
+    writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n[ "$1" = ls ] && echo '${ls}'\n[ "$1" = get ] && echo '{"state":"live","status":{"state":"working"},"created_ms":1}'\nexit 0\n`, { mode: 0o755 })
     process.env.AGENT_OFFICE_HC_BIN = bin
     const id = `task-skip-${detail.status}-${ls.length}`
     office.state.taskDetails.set(id, { id, title: "Taken", ...detail })
@@ -455,6 +455,34 @@ for (const [name, detail, ls] of [
     }
   })
 }
+
+test("a labelled terminal whose agent is done does not block a retry", async () => {
+  office.calls.length = 0
+  const repo = join(mkdtempSync(join(tmpdir(), "ao-done-")), "repo")
+  mkdirSync(repo)
+  execFileSync("git", ["-C", repo, "init", "-q"])
+  execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  // hc still lists the old worker as live, but its agent finished an hour ago.
+  const bin = join(mkdtempSync(join(tmpdir(), "ao-hc-")), "hc")
+  const log = `${bin}.log`
+  const created = Date.now() - 60 * 60_000
+  writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n[ "$1" = ls ] && echo '{"terminals":[{"address":"t8","state":"live"}]}'\n[ "$1" = get ] && echo '{"state":"live","status":{"state":"done"},"created_ms":${created}}'\nexit 0\n`, { mode: 0o755 })
+  process.env.AGENT_OFFICE_HC_BIN = bin
+  try {
+    const worker = makeContext(repo, { pollInterval: 1_000 })
+    const cleanup = await plugin.setup(worker.ctx)
+    await until(() => mcpCalls().length > 0, "the baseline poll")
+    worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+    await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
+    office.state.openTasks = [...office.state.openTasks, { id: "task-retry", title: "Retry", status: "todo" }]
+    await until(() => existsSync(log) && /^run --bg/m.test(readFileSync(log, "utf8")), "the hc launch")
+    assert.match(readFileSync(log, "utf8"), /--label ao\.task=task-retry/)
+    await cleanup()
+  } finally {
+    delete process.env.AGENT_OFFICE_HC_BIN
+    office.calls.length = 0
+  }
+})
 
 test("a third task dispatches after two held workers finish", async () => {
   office.calls.length = 0

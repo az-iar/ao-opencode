@@ -498,6 +498,34 @@ export function hcTaskTerminals(id: string): string[] | undefined {
   }
 }
 
+// The task's labelled terminals that still hold it: hc lists a terminal as
+// live after its agent is done, and a finished session left open must not
+// block a retry. A terminal holds the task while hc reports it working or
+// blocked, or for DISPATCH_GRACE_MS after it was created, since a booting
+// agent reads idle or done at turn 0 (the dispatch lock's rule). Undefined
+// when hc cannot say.
+export function hcTaskWorkers(id: string, now = Date.now()): string[] | undefined {
+  const live = hcTaskTerminals(id)
+  if (!live) return undefined
+  const workers: string[] = []
+  for (const terminal of live) {
+    const got = spawnSync(hcBin(), ["get", terminal, "--json"], { encoding: "utf8", timeout: 10_000 })
+    if (got.error) return undefined
+    let body: any
+    try {
+      body = JSON.parse(got.stdout)
+    } catch {
+      return undefined
+    }
+    if (body?.error?.kind === "not_found" || body?.state === "finished") continue
+    if (got.status !== 0) return undefined
+    const state = typeof body?.status === "string" ? body.status : body?.status?.state
+    const young = typeof body?.created_ms === "number" && now - body.created_ms < DISPATCH_GRACE_MS
+    if (state === "working" || state === "blocked" || young) workers.push(terminal)
+  }
+  return workers
+}
+
 // Why an assigned task must not be claimed now, or undefined to go ahead. The
 // task is read again just before the claim: checkin data can be stale, and a
 // task someone else already took is no longer todo. `hcRequired` (hc dispatch)
@@ -506,9 +534,9 @@ export function hcTaskTerminals(id: string): string[] | undefined {
 export function dispatchRefusal(id: string, task: any, hcRequired: boolean): string | undefined {
   const status = String(task?.status ?? "").toLowerCase()
   if (status !== "todo") return `it is ${status || "unreadable"}, not todo`
-  const live = hcTaskTerminals(id)
-  if (!live) return hcRequired ? "hc could not list its terminals" : undefined
-  if (live.length > 0) return `it already has a live worker terminal (${live.join(", ")})`
+  const workers = hcTaskWorkers(id)
+  if (!workers) return hcRequired ? "hc could not list its terminals" : undefined
+  if (workers.length > 0) return `it already has a live worker terminal (${workers.join(", ")})`
   return undefined
 }
 
