@@ -26,6 +26,7 @@ import {
   blockTask,
   claimNotice,
   claimTask,
+  dispatchRefusal,
   createBearer,
   createClient,
   DISPATCH_STALE_MS,
@@ -176,9 +177,17 @@ async function main(): Promise<number> {
           let detail: any
           try {
             detail = await call("get_task", { task_id: id }).catch(() => undefined)
+            const task = detail?.task ?? detail
+            // Headless needs no hc, so hc that cannot answer does not stop it;
+            // a task no longer todo, or one with a live ao.task terminal, does.
+            const refused = dispatchRefusal(id, task, false)
+            if (refused) {
+              log(`not dispatching task ${id}: ${refused}`)
+              return
+            }
             await claimTask(call, id)
             claimed = true
-            const { path, branch } = await addWorktree(canonicalRoot(directory), id)
+            const { path, branch } = await addWorktree(canonicalRoot(directory), id, String(task?.title ?? id))
             log(`dispatching task ${id} to ${path}`)
             log(`task ${id} run exited ${await runOpencode(path, `Office task ${id}`, taskPrompt(id, detail?.task ?? detail, path, branch), DISPATCH_STALE_MS)}`)
           } catch (err) {

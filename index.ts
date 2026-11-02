@@ -41,6 +41,7 @@ import {
   CREDENTIALS_OVERRIDE,
   claimNotice,
   claimTask,
+  dispatchRefusal,
   createBearer,
   createClient,
   cronLine,
@@ -63,6 +64,7 @@ import {
   summary,
   taskPrompt,
   taskID,
+  taskLabel,
   taskShort,
   tokenRequest,
   workspaceKey,
@@ -601,13 +603,13 @@ export default Plugin.define({
     // ours (git), and `hc run --bg` starts an OpenCode with the task as its
     // first prompt, so there is no supervisor and no worker subagent.
     const dispatchHc = async (id: string, task: any, title: string, parent: string) => {
-      const { path, branch } = await addWorktree(repo, id)
+      const { path, branch } = await addWorktree(repo, id, title)
       // Names must be unique among live terminals: a retry while the first
       // child still runs would otherwise fail the launch.
       const name = `office-${taskShort(id)}-${randomBytes(2).toString("hex")}`
       const started = await run(
         hcBin(),
-        ["run", "--bg", "--outlive-parent", "--no-notify", "--name", name, "--cwd", path, "opencode", "--prompt", taskPrompt(id, task, path, branch)],
+        ["run", "--bg", "--outlive-parent", "--no-notify", "--name", name, "--label", taskLabel(id), "--cwd", path, "opencode", "--prompt", taskPrompt(id, task, path, branch)],
         60_000,
       )
       if (started.code !== 0) throw new Error(`hc run failed: ${started.stderr || started.stdout}`)
@@ -627,6 +629,18 @@ export default Plugin.define({
         const detail = await call("get_task", { task_id: id }).catch(() => undefined)
         task = detail?.task ?? detail
         const title = String(task?.title ?? id)
+        // Another dispatcher (ao-claude, a hand-started hc worker) may already
+        // run this task: skip it unclaimed when it is no longer todo or a live
+        // terminal carries its ao.task label. It stays seen, so it is not
+        // retried; a task that comes back to todo is new to the next checkin.
+        // Not airtight: two dispatchers can both pass in the moment before
+        // the label is set, and the claim is the last line.
+        const refused = dispatchRefusal(id, task, true)
+        if (refused) {
+          warn("not dispatching Office task", { task: id, reason: refused })
+          notify(parent, `Not dispatching Office task ${id}: ${refused}.`)
+          return
+        }
         await claimTask(call, id)
         claimed = true
         await dispatchHc(id, task, title, parent)
