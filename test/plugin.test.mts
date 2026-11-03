@@ -257,18 +257,26 @@ test("/office: OAuth with PKCE, stored tokens, MCP server added", async () => {
   office.calls.length = 0
 })
 
-test("an approved session sends its own agent on the session-agent header", async () => {
-  // The approval above stored this folder's agent pointer, so the next Office
-  // call must carry it (GH-476). Drive it through the tool the approval test
-  // already used: a second call is now connected, so it checkins through
-  // createClient - a real /mcp call on a session the harness knows.
+test("an approved session sends its own agent on every Office call it makes", async () => {
+  // Driven by an event rather than a tool call: the connection is cached after
+  // its first checkin, so a second tool call issues no request at all and a test
+  // built on one passes only while the connection is fresh (bruno on #24). A
+  // status event always checkins, which makes the assertion deterministic.
   office.calls.length = 0
-  await harness.tools[0].execute({}, { sessionID: "s1", progress: async () => {} })
-  await until(() => office.calls.some((c) => c.path === "/mcp"), "the checkin after a connected tool call")
-  const call = office.calls.find((c) => c.path === "/mcp")!
-  assert.equal(call.headers?.["x-office-session-agent"], "opencode", `headers were ${JSON.stringify(call.headers)}`)
-  // A top-level session is not a child, so it sends no via.
-  assert.equal(call.headers?.["x-office-via"], undefined)
+  harness.push({ type: "session.status", data: { sessionID: "s1", status: { type: "busy" } } })
+  await until(() => office.calls.some((c) => c.path === "/mcp"), "the checkin an event triggers")
+  const calls = office.calls.filter((c) => c.path === "/mcp")
+  // Every one of them, not the first: a call that omitted the header would be a
+  // silent skip of the office's check, which is the whole point of GH-476.
+  assert.ok(calls.length > 0)
+  assert.ok(
+    calls.every((c) => c.headers?.["x-office-session-agent"] === "opencode"),
+    `every call names the agent: ${JSON.stringify(calls.map((c) => c.headers?.["x-office-session-agent"]))}`,
+  )
+  // A top-level session is not a child, so none of them sends a via.
+  assert.ok(calls.every((c) => c.headers?.["x-office-via"] === undefined))
+  harness.push({ type: "session.idle", data: { sessionID: "s1" } })
+  await until(() => mcpCalls().some((c) => c.includes('"idle"')), "the idle report")
   // Leave no calls behind: the tests after this one compare exact call lists.
   office.calls.length = 0
 })

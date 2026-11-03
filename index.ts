@@ -396,7 +396,11 @@ export default Plugin.define({
     // summary. Comparing the header set also makes the second-/mcp assertion in
     // the test deterministic rather than order-dependent.
     let lastIdentity = ""
+    // Callers run this after a checkin, which is also what sets `token`; the
+    // reload is a no-op without one, so the assumption is only that they got
+    // this far into the connect path.
     const syncMcpIdentity = async () => {
+      if (!token) return
       const next = JSON.stringify(officeIdentity())
       if (next === lastIdentity) return
       lastIdentity = next
@@ -405,6 +409,10 @@ export default Plugin.define({
     const connectMcp = async () => {
       token = await bearer()
       if (!token) return
+      // Record what is being registered here too: a session that already had a
+      // pointer would otherwise pay one redundant reload on its first summary,
+      // because syncMcpIdentity would see a "change" from its empty starting value.
+      lastIdentity = JSON.stringify(officeIdentity())
       await ctx.mcp.reload()
       clearTimeout(refreshTimer)
       if (auth.credentials && !process.env.AGENT_OFFICE_TOKEN) {
