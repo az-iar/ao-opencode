@@ -322,6 +322,9 @@ export function normaliseChildName(raw: string | undefined, sessionID: string | 
     .replace(/^[^a-z0-9]+/, "")
     .replace(/[^a-z0-9]+$/, "")
     .slice(0, 64)
+    // Again after the cut: 64 characters can land on a separator, and while the
+    // office accepts that, a name ending in "-" reads like a bug in a header.
+    .replace(/[^a-z0-9]+$/, "")
   return name || undefined
 }
 

@@ -42,3 +42,11 @@ test("a child names its parent and runtime, and sends nothing without a parent",
     "X-Office-Session-Agent": "opencode",
   })
 })
+
+test("a cut that lands on a separator does not leave one trailing", () => {
+  // 63 characters and then a space: the strip would otherwise cut at position 64
+  // and leave the separator that the space became.
+  const name = "a".repeat(63) + " b"
+  assert.equal(normaliseChildName(name, undefined), "a".repeat(63))
+  assert.equal(normaliseChildName("a".repeat(63) + "-b", undefined), "a".repeat(63))
+})
