@@ -432,6 +432,57 @@ test("an explicit AGENT_OFFICE_TOKEN connects an unconnected worktree and adopts
   assert.equal(resolveCredentials(wt, r).credentials, undefined)
 })
 
+test("a worktree /office that finds a token marks nothing and copies no token file", async () => {
+  const r = repo()
+  const wt = worktree(r)
+  connect(r, "agent-a", "access-a")
+  // A fresh slug, so no other test can have written its token file.
+  office.state.agent = { slug: "agent-handed-in", name: "Handed In" }
+  office.calls.length = 0
+  // The token is set and removed inside this outer try, so a failure anywhere
+  // cannot leave it set for the tests after this one.
+  try {
+    process.env.AGENT_OFFICE_TOKEN = "branch-token"
+    const harness = makeContext(wt, r, { pollInterval: 600_000 })
+    const cleanup = await plugin.setup(harness.ctx)
+    try {
+      // The bearer is already there, so `/office` asks no approval. Reaching
+      // the token's agent is not a person connecting this worktree: nothing is
+      // marked.
+      const officeConnect = harness.tools.find((tool) => tool.name === "office_connect")
+      const summary = String((await officeConnect.execute({}, { sessionID: "wt" })).content)
+      assert.match(summary, /Connected to Agent Office as @agent-handed-in/)
+      assert.equal(existsSync(agentPointerPath(wt)), false, "the token's agent is not written to the worktree")
+      assert.equal(existsSync(agentCredentialsPath("agent-handed-in")), false, "no token file copied under the token's agent")
+    } finally {
+      if (typeof cleanup === "function") await cleanup()
+    }
+    // With the token gone, the identity it carried is gone with it.
+    delete process.env.AGENT_OFFICE_TOKEN
+    assert.equal(isUnconnectedWorktree(wt), true)
+    assert.equal(resolveCredentials(wt, r).credentials, undefined)
+
+    // The same call where the worktree is connected on purpose, as A, and the
+    // token names another agent: A's OAuth must not be copied under that name.
+    connect(wt, "agent-a", "access-a", "office")
+    process.env.AGENT_OFFICE_TOKEN = "branch-token"
+    const second = makeContext(wt, r, { pollInterval: 600_000 })
+    const cleanupSecond = await plugin.setup(second.ctx)
+    try {
+      await second.tools.find((tool) => tool.name === "office_connect").execute({}, { sessionID: "wt" })
+      assert.equal(loadAgentPointer(agentPointerPath(wt)), "agent-a", "the worktree's own pointer stays its own")
+      assert.equal(agentPointerVia(agentPointerPath(wt)), "office")
+      assert.equal(existsSync(agentCredentialsPath("agent-handed-in")), false, "A's OAuth is not saved under the token's agent")
+    } finally {
+      if (typeof cleanupSecond === "function") await cleanupSecond()
+    }
+  } finally {
+    delete process.env.AGENT_OFFICE_TOKEN
+    office.state.agent = { slug: "opencode", name: "OpenCode" }
+    office.calls.length = 0
+  }
+})
+
 test("the main checkout, its subdirectories and plain directories are unchanged", async () => {
   const r = repo()
   const wt = worktree(r)
@@ -459,6 +510,11 @@ test("the main checkout, its subdirectories and plain directories are unchanged"
     assert.equal(resolveCredentials(plain).credentials?.access_token, "access-plain")
     // The worktree beside them is the only one that lost the fallback.
     assert.equal(isUnconnectedWorktree(wt), true)
+    // A marked pointer at the checkout still names its agent: nothing writes
+    // one there, but both shapes read the same outside a worktree.
+    saveAgentPointer(agentPointerPath(r), "agent-a", "office")
+    assert.equal(isUnconnectedWorktree(r), false)
+    assert.equal(resolveCredentials(r, r).credentials?.access_token, "access-a")
   } finally {
     await cleanup()
     office.calls.length = 0

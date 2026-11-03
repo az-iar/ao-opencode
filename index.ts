@@ -581,10 +581,14 @@ export default Plugin.define({
       }
     }
 
-    const connectedSummary = async () => {
+    // `via` marks a worktree pointer as written on purpose, so it is passed
+    // only where a person connected this workspace: after an approval. A
+    // `/office` that finds a bearer already (say AGENT_OFFICE_TOKEN) marks
+    // nothing, or the token's identity would outlive the token.
+    const connectedSummary = async (via?: "office" | "dispatch") => {
       await ensureConnected()
       const me = await checkin()
-      adoptAgent(me.agent?.slug, "office")
+      adoptAgent(me.agent?.slug, via)
       ownAgent = me.agent
       await observePending(me.pending, false)
       const pending = me.pending ?? {}
@@ -608,7 +612,7 @@ export default Plugin.define({
           auth.credentials = next
           saveCredentials(credentialsFile, next)
           connected = undefined
-          return connectedSummary()
+          return connectedSummary("office")
         }),
       }
       approval = current
