@@ -244,7 +244,15 @@ test("/office: OAuth with PKCE, stored tokens, MCP server added", async () => {
   const saved = JSON.parse(readFileSync(credentials, "utf8"))
   assert.equal(saved.access_token, "access-1")
   assert.equal(statSync(credentials).mode & 0o777, 0o600)
-  assert.deepEqual(harness.servers.get("office"), { type: "remote", url: saved.office + "/mcp", oauth: false, headers: { Authorization: "Bearer access-1" } })
+  // The registration carries the identity headers too: the first one is taken
+  // before the agent is known, and the reload after adoption replaces it (GH-476,
+  // bruno's MUST-FIX on #24). Exact object, because this is what the server gets.
+  assert.deepEqual(harness.servers.get("office"), {
+    type: "remote",
+    url: saved.office + "/mcp",
+    oauth: false,
+    headers: { Authorization: "Bearer access-1", "X-Office-Session-Agent": "opencode" },
+  })
   assert.deepEqual(mcpCalls(), ["Bearer access-1 checkin {}"])
   office.calls.length = 0
 })

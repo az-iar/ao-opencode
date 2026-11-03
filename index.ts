@@ -360,7 +360,12 @@ export default Plugin.define({
     // declared agent match the bearer token's.
     const officeIdentity = (): Record<string, string> => {
       const headers: Record<string, string> = {}
-      const approved = loadAgentPointer(pointerFile) ?? loadAgentPointer(repoPointerFile) ?? approvedAgent
+      // Under a credentials override the token's own agent is the only truth: the
+      // folder pointer may name a different agent, and mixing A's slug with B's
+      // bearer is a 409 (and a wrong parent for a child) the moment #508 lands.
+      // Before the first checkin that identity is unknown, so the honest header
+      // is none - the reload below fills it in as soon as checkin reports it.
+      const approved = usingCredentialsOverride ? approvedAgent : (loadAgentPointer(pointerFile) ?? loadAgentPointer(repoPointerFile) ?? approvedAgent)
       if (approved) headers["X-Office-Session-Agent"] = approved
       if (process.env.AGENT_OFFICE_CHILD === "1") {
         // Sunny's naming rule, one across all three extensions: the launcher's
@@ -385,6 +390,18 @@ export default Plugin.define({
       editor.set("office", { type: "remote", url: `${OFFICE}/mcp`, oauth: false, headers: { Authorization: `Bearer ${token}`, ...officeIdentity() } })
     })
     let refreshTimer: ReturnType<typeof setTimeout> | undefined
+    // syncMcpIdentity replays the registration only when the identity headers
+    // changed: connectedSummary is not just the connect path (a reconnect and
+    // /office use it too), so a blind reload would churn the MCP server on every
+    // summary. Comparing the header set also makes the second-/mcp assertion in
+    // the test deterministic rather than order-dependent.
+    let lastIdentity = ""
+    const syncMcpIdentity = async () => {
+      const next = JSON.stringify(officeIdentity())
+      if (next === lastIdentity) return
+      lastIdentity = next
+      await ctx.mcp.reload()
+    }
     const connectMcp = async () => {
       token = await bearer()
       if (!token) return
@@ -576,6 +593,7 @@ export default Plugin.define({
       const me = await checkin()
       adoptAgent(me.agent?.slug)
       ownAgent = me.agent
+      await syncMcpIdentity()
       await observePending(me.pending, false)
       const pending = me.pending ?? {}
       const summary = `Connected to Agent Office as @${me.agent?.slug} (${me.agent?.name}). Open tasks: ${pending.open_tasks?.length ?? 0}, unclaimed team tasks: ${pending.unclaimed_team_tasks?.length ?? 0}, unread messages: ${pending.unread_messages?.length ?? 0}. The office MCP tools are available; call checkin first.`
@@ -824,6 +842,7 @@ export default Plugin.define({
         const me = await checkin()
         adoptAgent(me.agent?.slug)
         ownAgent = me.agent
+        await syncMcpIdentity()
         lastPollAt = Date.now()
         lastPollError = undefined
         await observePending(me.pending, true)
