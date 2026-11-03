@@ -221,7 +221,14 @@ export function createBearer(credentialsFile: () => string, credentials?: Creden
 // HTTP failure or a call that never arrived.
 export class OfficeRefusal extends Error {}
 
-export function createClient(bearer: () => Promise<string | undefined>) {
+// OfficeHeaders are the identity headers every Office call carries (GH-476):
+// the agent this extension's own approval named, and, for a child session, who
+// its parent is and which runtime it is. The office compares the agent with the
+// bearer token's and refuses a mismatch with 409; the token stays the trust
+// boundary, so these are a consistency check rather than authentication.
+export type OfficeHeaders = Record<string, string>
+
+export function createClient(bearer: () => Promise<string | undefined>, identity: () => OfficeHeaders = () => ({})) {
   const call = async (name: string, args: Record<string, unknown> = {}) => {
     const token = await bearer()
     if (!token) throw new Error("not connected to Agent Office: run /office")
@@ -229,6 +236,7 @@ export function createClient(bearer: () => Promise<string | undefined>) {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
+        ...identity(),
         "Content-Type": "application/json",
         Accept: "application/json, text/event-stream",
         "MCP-Protocol-Version": MCP_PROTOCOL,

@@ -59,6 +59,7 @@ import {
   releaseDispatch,
   releaseNotice,
   resolveCredentials,
+  loadAgentPointer,
   saveAgentPointer,
   saveCredentials,
   summary,
@@ -317,6 +318,7 @@ export default Plugin.define({
 
     const resolved = resolveCredentials(ctx.location.directory, ctx.location.project?.canonical)
     const { legacyCredentialsFile, pointerFile, repoPointerFile } = resolved
+    let currentSessionID: string | undefined
     let credentialsFile = resolved.credentialsFile
     const usingCredentialsOverride = Boolean(CREDENTIALS_OVERRIDE)
     const auth = createBearer(() => credentialsFile, resolved.credentials)
@@ -341,7 +343,30 @@ export default Plugin.define({
     // checkout.
     const dispatchMode = configuredDispatch === "off" || configuredDispatch === "false" ? "off" : "hc"
     const bearer = auth.bearer
-    const { call, checkin } = createClient(bearer)
+    // officeIdentity is the header set every Office call carries (GH-476): the
+    // agent this folder's own approval named, and, for a child session, the
+    // parent it was started from plus its runtime.
+    //
+    // Folder-scoped, not session-scoped: opencode keeps one agent pointer per
+    // folder (`saveAgentPointer` on approval) and has no session pointer, so two
+    // sessions in one folder declare the same agent. That is exactly what this
+    // repo's identity is, and it is still the check the office runs - does the
+    // declared agent match the bearer token's.
+    const officeIdentity = (): Record<string, string> => {
+      const headers: Record<string, string> = {}
+      const approved = loadAgentPointer(pointerFile) ?? loadAgentPointer(repoPointerFile)
+      if (approved) headers["X-Office-Session-Agent"] = approved
+      if (process.env.AGENT_OFFICE_CHILD === "1") {
+        // Sunny's naming rule, one across all three extensions: the launcher's
+        // name, else s- plus the first 8 hex of this child's own session id.
+        // #512 answers 400 to anything outside [a-z0-9._-], so normalise here.
+        const rawName = process.env.AGENT_OFFICE_CHILD_NAME?.trim() || (currentSessionID ? `s-${currentSessionID.replace(/[^0-9a-fA-F]/g, "").slice(0, 8)}` : "")
+        const child = rawName.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+/, "").slice(0, 64)
+        if (child && approved) headers["X-Office-Via"] = `child=${child}; parent=${approved}; runtime=opencode`
+      }
+      return headers
+    }
+    const { call, checkin } = createClient(bearer, officeIdentity)
 
     // Hands OpenCode the office MCP server with the current access token, and
     // again whenever the token is refreshed. The transform captures the token
@@ -349,7 +374,9 @@ export default Plugin.define({
     let token: string | undefined
     await ctx.mcp.transform((editor) => {
       if (!token) return
-      editor.set("office", { type: "remote", url: `${OFFICE}/mcp`, oauth: false, headers: { Authorization: `Bearer ${token}` } })
+      // Same identity headers as createClient: a tool call through this server
+      // has to look like a call from this session (GH-476).
+      editor.set("office", { type: "remote", url: `${OFFICE}/mcp`, oauth: false, headers: { Authorization: `Bearer ${token}`, ...officeIdentity() } })
     })
     let refreshTimer: ReturnType<typeof setTimeout> | undefined
     const connectMcp = async () => {
@@ -402,6 +429,8 @@ export default Plugin.define({
     }
 
     const start = (sessionID: string) => {
+      // The child name falls back to this when no launcher name was given.
+      currentSessionID = sessionID
       if (busy.size === 0) {
         heartbeat = setInterval(() => checkin().catch(() => {}), HEARTBEAT_MS)
         heartbeat.unref()
