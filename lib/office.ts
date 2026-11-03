@@ -123,12 +123,25 @@ export function saveCredentials(path: string, c: Credentials) {
 // main checkout, a plain directory, a submodule or a bare repository: their
 // git dir *is* the common one. Git resolves the spelling, so a worktree
 // reached through a symlink and its subdirectories agree on the path.
+//
+// Memoised by directory, the negative included, because a checkout's git layout
+// does not move under a running process and the status bookkeeping asks this on
+// every render: without the cache a long session pays a git subprocess per
+// report. A directory that becomes a worktree later in the same process keeps
+// the answer it got first, so anything that creates one asks after, never
+// before.
+const worktreeTops = new Map<string, string | undefined>()
 export function worktreeTop(directory: string): string | undefined {
+  const key = resolve(directory)
+  if (worktreeTops.has(key)) return worktreeTops.get(key)
   const git = spawnSync("git", ["-C", directory, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", "--show-toplevel"], { encoding: "utf8" })
-  if (git.status !== 0) return undefined
-  const [gitDir, commonDir, top] = git.stdout.trim().split("\n")
-  if (!gitDir || !commonDir || !top || gitDir === commonDir) return undefined
-  return resolve(top)
+  let top: string | undefined
+  if (git.status === 0) {
+    const [gitDir, commonDir, toplevel] = git.stdout.trim().split("\n")
+    if (gitDir && commonDir && toplevel && gitDir !== commonDir) top = resolve(toplevel)
+  }
+  worktreeTops.set(key, top)
+  return top
 }
 
 export function isLinkedWorktree(directory: string): boolean {
@@ -154,20 +167,34 @@ export function adoptWorktree(directory: string, agent: string | undefined) {
 // Office identity: the repo pointer and the legacy per-repo token are that
 // checkout's agent, and a session opened only to look at a branch would post,
 // poll and report as it. A pointer written there (`/office` in the worktree,
-// or a task worktree the dispatcher adopted) connects it as its own agent;
-// AGENT_OFFICE_TOKEN and the credentials-file override hand an identity in
-// from the outside, which is how dispatched workers and children get one.
+// or a task worktree the dispatcher adopted) connects it as its own agent.
 // Only a pointer written on purpose counts there. An unmarked one was written
 // by an older version, which saved the identity it had resolved, the repo
 // pointer's agent, after every poll: honouring it would keep the worktree
 // acting as the checkout's agent. The main checkout reads both shapes.
-function unconnectedTop(top: string | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
-  if (!top || env.AGENT_OFFICE_TOKEN || CREDENTIALS_OVERRIDE) return false
-  return readAgentPointer(agentPointerPath(top))?.via === undefined
+//
+// This is the fact about the worktree, and no environment changes it: a token
+// or a credentials file handed in from outside does not connect the worktree,
+// it only lets the session act without a pointer. That is a separate question
+// with a separate answer, asked by mayActWithoutPointer.
+function unconnectedTop(top: string | undefined): boolean {
+  return top !== undefined && readAgentPointer(agentPointerPath(top))?.via === undefined
 }
 
-export function isUnconnectedWorktree(directory: string, env = process.env): boolean {
-  return unconnectedTop(worktreeTop(directory), env)
+export function isUnconnectedWorktree(directory: string): boolean {
+  return unconnectedTop(worktreeTop(directory))
+}
+
+// The decision, kept apart from the fact above because the two disagree exactly
+// where it matters: may this workspace act (poll, register the office MCP
+// server, dispatch) without a pointer of its own? Everything but a linked
+// worktree nobody connected may. There, an identity handed in from outside
+// says yes as well: AGENT_OFFICE_TOKEN and the credentials-file override, which
+// is how dispatched workers and children get one. Callers asking whether a
+// worktree has its own identity want isUnconnectedWorktree, not this.
+export function mayActWithoutPointer(directory: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!unconnectedTop(worktreeTop(directory))) return true
+  return Boolean(env.AGENT_OFFICE_TOKEN) || Boolean(CREDENTIALS_OVERRIDE)
 }
 
 // The workspace's agent pointer names the agent's token file; without one the
@@ -181,7 +208,10 @@ export function resolveCredentials(directory: string, canonical?: string) {
   const legacyCredentialsFile = worktree ? credentialsPath(worktree, worktree, CREDENTIALS_OVERRIDE, "folder") : credentialsPath(directory, canonical)
   const pointerFile = agentPointerPath(worktree ?? directory)
   const repoPointerFile = agentPointerPath(canonical ?? directory)
-  const unconnected = unconnectedTop(worktree)
+  // The decision, not the fact: an identity handed in through the environment
+  // or the override counts here, so `unconnected` is true only where the
+  // workspace must fail closed.
+  const unconnected = !mayActWithoutPointer(directory)
   const pointer = readAgentPointer(pointerFile)
   // In a linked worktree its own pointer counts only when it was written on
   // purpose; the checkout's pointer counts in any shape, as it always has.
