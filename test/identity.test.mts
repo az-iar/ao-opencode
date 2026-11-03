@@ -43,12 +43,15 @@ const {
   agentPointerPath,
   agentPointerVia,
   credentialsPath,
+  isLinkedWorktree,
   isUnconnectedWorktree,
   loadAgentPointer,
   loadCredentials,
+  mayActWithoutPointer,
   resolveCredentials,
   saveAgentPointer,
   saveCredentials,
+  worktreeTop,
 } = lib
 const { default: plugin } = await import("../index.ts")
 
@@ -208,6 +211,51 @@ test("a linked worktree nobody connected resolves no credentials of the checkout
   const main = resolveCredentials(r, r)
   assert.equal(main.unconnected, false)
   assert.equal(main.credentials?.access_token, "access-a")
+})
+
+// A checkout's git layout does not move under a running process, so worktreeTop
+// answers once per directory and the status bookkeeping stops paying a git
+// subprocess per report. GIT_TRACE makes every git process the plugin starts
+// append a line to a file, so the test counts spawns from git's side instead of
+// reaching into worktreeTop.
+test("worktreeTop answers once per directory, the negative answers included", () => {
+  const r = repo()
+  const wt = worktree(r)
+  const plain = join(mkdtempSync(join(tmpdir(), "ao-identity-plain-")), "notes")
+  mkdirSync(plain)
+  const trace = join(mkdtempSync(join(tmpdir(), "ao-identity-trace-")), "git.log")
+  const spawned = () => (existsSync(trace) ? readFileSync(trace, "utf8").split("\n").filter((line) => line.includes("rev-parse")).length : 0)
+  const cold = () => writeFileSync(trace, "")
+  process.env.GIT_TRACE = trace
+  try {
+    cold()
+    const top = worktreeTop(wt)
+    assert.ok(top, "the worktree resolves its toplevel")
+    assert.equal(spawned(), 1, "the first call asks git")
+    cold()
+    assert.equal(worktreeTop(wt), top)
+    assert.equal(spawned(), 0, "the second call spawns no git")
+
+    cold()
+    assert.equal(worktreeTop(r), undefined, "the main checkout is not a worktree")
+    assert.equal(worktreeTop(plain), undefined, "nor is a directory outside git")
+    assert.equal(spawned(), 2, "one ask each")
+    cold()
+    assert.equal(worktreeTop(r), undefined)
+    assert.equal(worktreeTop(plain), undefined)
+    assert.equal(spawned(), 0, "and both negative answers are cached too")
+
+    // What a status render asks: the identity questions and the resolution all
+    // read the same cached answer.
+    cold()
+    assert.equal(isLinkedWorktree(wt), true)
+    assert.equal(isUnconnectedWorktree(wt), true)
+    resolveCredentials(wt, r)
+    resolveCredentials(r, r)
+    assert.equal(spawned(), 0, "no git: the answers were already known")
+  } finally {
+    delete process.env.GIT_TRACE
+  }
 })
 
 test("an unconnected worktree gets no office MCP server, no polling and no status reports", async () => {
@@ -392,7 +440,7 @@ test("an explicit AGENT_OFFICE_TOKEN connects an unconnected worktree and adopts
   try {
     // The token is an identity handed in from outside: the worktree still
     // takes none of the checkout's, not its pointer and not its per-repo token.
-    assert.equal(isUnconnectedWorktree(wt), false)
+    assert.equal(mayActWithoutPointer(wt), true)
     const resolved = resolveCredentials(wt, r)
     assert.equal(resolved.credentials, undefined)
     assert.notEqual(resolved.credentialsFile, agentCredentialsPath("agent-a"))
@@ -430,6 +478,44 @@ test("an explicit AGENT_OFFICE_TOKEN connects an unconnected worktree and adopts
   // With the token gone the worktree is unconnected again: nothing is left.
   assert.equal(isUnconnectedWorktree(wt), true)
   assert.equal(resolveCredentials(wt, r).credentials, undefined)
+})
+
+// The fact and the decision are different answers, and the difference is the
+// whole point of keeping them apart: a token hands a session an identity to act
+// with, and says nothing about whether the worktree has one of its own. Asking
+// the fact where the decision belongs re-opens the bug this pair just fixed.
+test("an unconnected worktree stays unconnected with AGENT_OFFICE_TOKEN set, and the plugin connects through the token anyway", async () => {
+  const r = repo()
+  const wt = worktree(r)
+  connect(r, "agent-a", "access-a")
+  assert.equal(isUnconnectedWorktree(wt), true, "nobody connected this worktree")
+  try {
+    process.env.AGENT_OFFICE_TOKEN = "branch-token"
+    assert.equal(isUnconnectedWorktree(wt), true, "the environment does not connect it")
+    assert.equal(mayActWithoutPointer(wt), true, "the token lets the session act without a pointer")
+    // `unconnected` on the resolution is the decision, which is why the plugin
+    // is not gated by the fact.
+    assert.equal(resolveCredentials(wt, r).unconnected, false)
+
+    office.calls.length = 0
+    const harness = makeContext(wt, r, { pollInterval: 1_000 })
+    const cleanup = await plugin.setup(harness.ctx)
+    try {
+      harness.push({ type: "session.status", data: { sessionID: "wt", status: { type: "busy" } } })
+      await until(() => harness.servers.get("office") !== undefined, "the office MCP server")
+      assert.equal(harness.servers.get("office").headers.Authorization, "Bearer branch-token")
+      await until(() => mcpCalls().some((call) => call.startsWith("checkin ")), "the worktree's poll")
+      assert.equal(isUnconnectedWorktree(wt), true, "the token connected the session, not the worktree")
+      assert.equal(existsSync(agentPointerPath(wt)), false, "and left no pointer behind")
+    } finally {
+      await cleanup()
+    }
+  } finally {
+    delete process.env.AGENT_OFFICE_TOKEN
+    office.calls.length = 0
+  }
+  assert.equal(isUnconnectedWorktree(wt), true)
+  assert.equal(mayActWithoutPointer(wt), false, "and with the token gone it may not act")
 })
 
 test("a worktree /office that finds a token marks nothing and copies no token file", async () => {
