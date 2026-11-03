@@ -281,6 +281,35 @@ test("an approved session sends its own agent on every Office call it makes", as
   office.calls.length = 0
 })
 
+test("a child session sends its parent and runtime on the via header", async () => {
+  // Driven by an event, not a tool call: after its first checkin the connection
+  // is cached, so a second tool call issues no request at all and a test that
+  // expects one passes only while the connection is fresh (bruno on #24). A
+  // status event always checkins. The name rule itself is unit-tested in
+  // test/identity.test.mts - this is the wire.
+  office.calls.length = 0
+  process.env.AGENT_OFFICE_CHILD = "1"
+  process.env.AGENT_OFFICE_CHILD_NAME = "Office Inbox"
+  try {
+    harness.push({ type: "session.status", data: { sessionID: "s1", status: { type: "busy" } } })
+    await until(() => office.calls.some((c) => c.path === "/mcp"), "the checkin a child's event triggers")
+    const calls = office.calls.filter((c) => c.path === "/mcp")
+    assert.ok(calls.length > 0)
+    // Every one of them: a child that sent the agent and forgot the parent, or
+    // the reverse, is exactly the silent skip this header exists to prevent.
+    assert.ok(
+      calls.every((c) => c.headers?.["x-office-session-agent"] === "opencode" && c.headers?.["x-office-via"] === "child=office-inbox; parent=opencode; runtime=opencode"),
+      `every child call names agent and parent: ${JSON.stringify(calls.map((c) => c.headers))}`,
+    )
+  } finally {
+    delete process.env.AGENT_OFFICE_CHILD
+    delete process.env.AGENT_OFFICE_CHILD_NAME
+    harness.push({ type: "session.idle", data: { sessionID: "s1" } })
+    await until(() => mcpCalls().some((c) => c.includes('"idle"')), "the idle report")
+    office.calls.length = 0
+  }
+})
+
 test("working while any session is busy, idle when all are quiet", async () => {
   harness.push({ type: "session.status", data: { sessionID: "a", status: { type: "busy" } } })
   harness.push({ type: "session.status", data: { sessionID: "b", status: { type: "retry", attempt: 1 } } })

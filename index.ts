@@ -304,6 +304,41 @@ function approvalText(name: string, url: string) {
   ].join("\n")
 }
 
+
+// The child name the office will accept: lowercase, no leading punctuation, only
+// [a-z0-9._-], and at most 64 characters - #512 answers 400 outside that rule,
+// so normalising here is what stops a launcher's name turning a check-in into a
+// refusal. Sunny's fallback, one across the three extensions: with no name, the
+// child is `s-` plus the first eight hex of its own session id.
+export function normaliseChildName(raw: string | undefined, sessionID: string | undefined): string | undefined {
+  const hex = (sessionID ?? "").replace(/[^0-9a-fA-F]/g, "")
+  // A session id too short to give eight hex characters has no honest name.
+  const source = raw?.trim() || (hex.length >= 8 ? `s-${hex.slice(0, 8)}` : "")
+  // `s-` keeps its dash because only *leading* non-alphanumerics are stripped;
+  // a trailing separator is dropped so "Office Inbox!" does not end in a dash.
+  const name = source
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^[^a-z0-9]+/, "")
+    .replace(/[^a-z0-9]+$/, "")
+    .slice(0, 64)
+  return name || undefined
+}
+
+// identityHeaders is the header set for one Office call. Pure, so the rules can
+// be tested without a folder, a token or an approval: no parent means no via at
+// all rather than a half-header, and a child sends a via only when it also has a
+// parent to name.
+export function identityHeaders(input: { approved?: string; child?: boolean; childName?: string; sessionID?: string; runtime: string }): Record<string, string> {
+  const headers: Record<string, string> = {}
+  if (input.approved) headers["X-Office-Session-Agent"] = input.approved
+  if (input.child && input.approved) {
+    const child = normaliseChildName(input.childName, input.sessionID)
+    if (child) headers["X-Office-Via"] = `child=${child}; parent=${input.approved}; runtime=${input.runtime}`
+  }
+  return headers
+}
+
 export default Plugin.define({
   id: "agent-office",
   async setup(ctx) {
@@ -358,25 +393,19 @@ export default Plugin.define({
     // sessions in one folder declare the same agent. That is exactly what this
     // repo's identity is, and it is still the check the office runs - does the
     // declared agent match the bearer token's.
-    const officeIdentity = (): Record<string, string> => {
-      const headers: Record<string, string> = {}
+    const officeIdentity = (): Record<string, string> =>
       // Under a credentials override the token's own agent is the only truth: the
       // folder pointer may name a different agent, and mixing A's slug with B's
       // bearer is a 409 (and a wrong parent for a child) the moment #508 lands.
       // Before the first checkin that identity is unknown, so the honest header
-      // is none - the reload below fills it in as soon as checkin reports it.
-      const approved = usingCredentialsOverride ? approvedAgent : (loadAgentPointer(pointerFile) ?? loadAgentPointer(repoPointerFile) ?? approvedAgent)
-      if (approved) headers["X-Office-Session-Agent"] = approved
-      if (process.env.AGENT_OFFICE_CHILD === "1") {
-        // Sunny's naming rule, one across all three extensions: the launcher's
-        // name, else s- plus the first 8 hex of this child's own session id.
-        // #512 answers 400 to anything outside [a-z0-9._-], so normalise here.
-        const rawName = process.env.AGENT_OFFICE_CHILD_NAME?.trim() || (currentSessionID ? `s-${currentSessionID.replace(/[^0-9a-fA-F]/g, "").slice(0, 8)}` : "")
-        const child = rawName.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+/, "").slice(0, 64)
-        if (child && approved) headers["X-Office-Via"] = `child=${child}; parent=${approved}; runtime=opencode`
-      }
-      return headers
-    }
+      // is none - the reload in syncMcpIdentity fills it in as soon as it is known.
+      identityHeaders({
+        approved: usingCredentialsOverride ? approvedAgent : (loadAgentPointer(pointerFile) ?? loadAgentPointer(repoPointerFile) ?? approvedAgent),
+        childName: process.env.AGENT_OFFICE_CHILD_NAME,
+        child: process.env.AGENT_OFFICE_CHILD === "1",
+        sessionID: currentSessionID,
+        runtime: "opencode",
+      })
     const { call, checkin } = createClient(bearer, officeIdentity)
 
     // Hands OpenCode the office MCP server with the current access token, and
