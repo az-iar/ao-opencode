@@ -244,9 +244,70 @@ test("/office: OAuth with PKCE, stored tokens, MCP server added", async () => {
   const saved = JSON.parse(readFileSync(credentials, "utf8"))
   assert.equal(saved.access_token, "access-1")
   assert.equal(statSync(credentials).mode & 0o777, 0o600)
-  assert.deepEqual(harness.servers.get("office"), { type: "remote", url: saved.office + "/mcp", oauth: false, headers: { Authorization: "Bearer access-1" } })
+  // The registration carries the identity headers too: the first one is taken
+  // before the agent is known, and the reload after adoption replaces it (GH-476,
+  // bruno's MUST-FIX on #24). Exact object, because this is what the server gets.
+  assert.deepEqual(harness.servers.get("office"), {
+    type: "remote",
+    url: saved.office + "/mcp",
+    oauth: false,
+    headers: { Authorization: "Bearer access-1", "X-Office-Session-Agent": "opencode" },
+  })
   assert.deepEqual(mcpCalls(), ["Bearer access-1 checkin {}"])
   office.calls.length = 0
+})
+
+test("an approved session sends its own agent on every Office call it makes", async () => {
+  // Driven by an event rather than a tool call: the connection is cached after
+  // its first checkin, so a second tool call issues no request at all and a test
+  // built on one passes only while the connection is fresh (bruno on #24). A
+  // status event always checkins, which makes the assertion deterministic.
+  office.calls.length = 0
+  harness.push({ type: "session.status", data: { sessionID: "s1", status: { type: "busy" } } })
+  await until(() => office.calls.some((c) => c.path === "/mcp"), "the checkin an event triggers")
+  const calls = office.calls.filter((c) => c.path === "/mcp")
+  // Every one of them, not the first: a call that omitted the header would be a
+  // silent skip of the office's check, which is the whole point of GH-476.
+  assert.ok(calls.length > 0)
+  assert.ok(
+    calls.every((c) => c.headers?.["x-office-session-agent"] === "opencode"),
+    `every call names the agent: ${JSON.stringify(calls.map((c) => c.headers?.["x-office-session-agent"]))}`,
+  )
+  // A top-level session is not a child, so none of them sends a via.
+  assert.ok(calls.every((c) => c.headers?.["x-office-via"] === undefined))
+  harness.push({ type: "session.idle", data: { sessionID: "s1" } })
+  await until(() => mcpCalls().some((c) => c.includes('"idle"')), "the idle report")
+  // Leave no calls behind: the tests after this one compare exact call lists.
+  office.calls.length = 0
+})
+
+test("a child session sends its parent and runtime on the via header", async () => {
+  // Driven by an event, not a tool call: after its first checkin the connection
+  // is cached, so a second tool call issues no request at all and a test that
+  // expects one passes only while the connection is fresh (bruno on #24). A
+  // status event always checkins. The name rule itself is unit-tested in
+  // test/identity.test.mts - this is the wire.
+  office.calls.length = 0
+  process.env.AGENT_OFFICE_CHILD = "1"
+  process.env.AGENT_OFFICE_CHILD_NAME = "Office Inbox"
+  try {
+    harness.push({ type: "session.status", data: { sessionID: "s1", status: { type: "busy" } } })
+    await until(() => office.calls.some((c) => c.path === "/mcp"), "the checkin a child's event triggers")
+    const calls = office.calls.filter((c) => c.path === "/mcp")
+    assert.ok(calls.length > 0)
+    // Every one of them: a child that sent the agent and forgot the parent, or
+    // the reverse, is exactly the silent skip this header exists to prevent.
+    assert.ok(
+      calls.every((c) => c.headers?.["x-office-session-agent"] === "opencode" && c.headers?.["x-office-via"] === "child=office-inbox; parent=opencode; runtime=opencode"),
+      `every child call names agent and parent: ${JSON.stringify(calls.map((c) => c.headers))}`,
+    )
+  } finally {
+    delete process.env.AGENT_OFFICE_CHILD
+    delete process.env.AGENT_OFFICE_CHILD_NAME
+    harness.push({ type: "session.idle", data: { sessionID: "s1" } })
+    await until(() => mcpCalls().some((c) => c.includes('"idle"')), "the idle report")
+    office.calls.length = 0
+  }
 })
 
 test("working while any session is busy, idle when all are quiet", async () => {

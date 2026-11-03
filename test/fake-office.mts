@@ -2,7 +2,7 @@
 // an MCP endpoint with a `checkin` tool. Records every call for assertions.
 import { createServer, type Server } from "node:http"
 
-export type Call = { method: string; path: string; auth?: string; body: any }
+export type Call = { method: string; path: string; auth?: string; headers?: Record<string, string | undefined>; body: any }
 
 export function fakeOffice() {
   const calls: Call[] = []
@@ -37,7 +37,15 @@ export function fakeOffice() {
       res.end(JSON.stringify(body))
     }
     const body = req.headers["content-type"]?.includes("json") ? JSON.parse(raw || "{}") : Object.fromEntries(new URLSearchParams(raw))
-    calls.push({ method: req.method ?? "", path: url.pathname, auth: req.headers.authorization, body })
+    // `headers` keeps what a test needs to assert about the identity headers
+    // GH-476 added; `auth` stays as it was for the tests that read only that.
+    calls.push({
+      method: req.method ?? "",
+      path: url.pathname,
+      auth: req.headers.authorization,
+      headers: req.headers as Record<string, string | undefined>,
+      body,
+    })
 
     if (url.pathname === "/oauth/register") return json(201, { client_id: "client-1", redirect_uris: body.redirect_uris })
     if (url.pathname === "/oauth/authorize") {

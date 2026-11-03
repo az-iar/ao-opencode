@@ -306,6 +306,44 @@ function approvalText(name: string, url: string) {
   ].join("\n")
 }
 
+
+// The child name the office will accept: lowercase, no leading punctuation, only
+// [a-z0-9._-], and at most 64 characters - #512 answers 400 outside that rule,
+// so normalising here is what stops a launcher's name turning a check-in into a
+// refusal. Sunny's fallback, one across the three extensions: with no name, the
+// child is `s-` plus the first eight hex of its own session id.
+export function normaliseChildName(raw: string | undefined, sessionID: string | undefined): string | undefined {
+  const hex = (sessionID ?? "").replace(/[^0-9a-fA-F]/g, "")
+  // A session id too short to give eight hex characters has no honest name.
+  const source = raw?.trim() || (hex.length >= 8 ? `s-${hex.slice(0, 8)}` : "")
+  // `s-` keeps its dash because only *leading* non-alphanumerics are stripped;
+  // a trailing separator is dropped so "Office Inbox!" does not end in a dash.
+  const name = source
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^[^a-z0-9]+/, "")
+    .replace(/[^a-z0-9]+$/, "")
+    .slice(0, 64)
+    // Again after the cut: 64 characters can land on a separator, and while the
+    // office accepts that, a name ending in "-" reads like a bug in a header.
+    .replace(/[^a-z0-9]+$/, "")
+  return name || undefined
+}
+
+// identityHeaders is the header set for one Office call. Pure, so the rules can
+// be tested without a folder, a token or an approval: no parent means no via at
+// all rather than a half-header, and a child sends a via only when it also has a
+// parent to name.
+export function identityHeaders(input: { approved?: string; child?: boolean; childName?: string; sessionID?: string; runtime: string }): Record<string, string> {
+  const headers: Record<string, string> = {}
+  if (input.approved) headers["X-Office-Session-Agent"] = input.approved
+  if (input.child && input.approved) {
+    const child = normaliseChildName(input.childName, input.sessionID)
+    if (child) headers["X-Office-Via"] = `child=${child}; parent=${input.approved}; runtime=${input.runtime}`
+  }
+  return headers
+}
+
 export default Plugin.define({
   id: "agent-office",
   async setup(ctx) {
@@ -320,6 +358,8 @@ export default Plugin.define({
 
     const resolved = resolveCredentials(ctx.location.directory, ctx.location.project?.canonical)
     const { legacyCredentialsFile, pointerFile, repoPointerFile } = resolved
+    let currentSessionID: string | undefined
+    let approvedAgent: string | undefined
     let credentialsFile = resolved.credentialsFile
     const usingCredentialsOverride = Boolean(CREDENTIALS_OVERRIDE)
     const auth = createBearer(() => credentialsFile, resolved.credentials)
@@ -338,6 +378,11 @@ export default Plugin.define({
     // keeps its identity). With a token in the environment a worktree writes
     // none at all. The main checkout keeps the unmarked pointer it always had.
     const adoptAgent = (slug?: string, via?: "office" | "dispatch") => {
+      // The office told us which agent this token is, so keep it even when the
+      // credentials override means there is no pointer to write - the identity
+      // header needs it (GH-476). A dispatcher hands a worker its token and no
+      // agent pointer, and without this the header would simply be missing.
+      if (slug) approvedAgent = slug
       if (usingCredentialsOverride || !slug) return
       // In a linked worktree the token is an identity handed in from outside,
       // not this workspace's: a poll with it ("/office" here is different)
@@ -367,7 +412,29 @@ export default Plugin.define({
     // checkout.
     const dispatchMode = configuredDispatch === "off" || configuredDispatch === "false" ? "off" : "hc"
     const bearer = auth.bearer
-    const { call, checkin } = createClient(bearer)
+    // officeIdentity is the header set every Office call carries (GH-476): the
+    // agent this folder's own approval named, and, for a child session, the
+    // parent it was started from plus its runtime.
+    //
+    // Folder-scoped, not session-scoped: opencode keeps one agent pointer per
+    // folder (`saveAgentPointer` on approval) and has no session pointer, so two
+    // sessions in one folder declare the same agent. That is exactly what this
+    // repo's identity is, and it is still the check the office runs - does the
+    // declared agent match the bearer token's.
+    const officeIdentity = (): Record<string, string> =>
+      // Under a credentials override the token's own agent is the only truth: the
+      // folder pointer may name a different agent, and mixing A's slug with B's
+      // bearer is a 409 (and a wrong parent for a child) the moment #508 lands.
+      // Before the first checkin that identity is unknown, so the honest header
+      // is none - the reload in syncMcpIdentity fills it in as soon as it is known.
+      identityHeaders({
+        approved: usingCredentialsOverride ? approvedAgent : (loadAgentPointer(pointerFile) ?? loadAgentPointer(repoPointerFile) ?? approvedAgent),
+        childName: process.env.AGENT_OFFICE_CHILD_NAME,
+        child: process.env.AGENT_OFFICE_CHILD === "1",
+        sessionID: currentSessionID,
+        runtime: "opencode",
+      })
+    const { call, checkin } = createClient(bearer, officeIdentity)
 
     // Hands OpenCode the office MCP server with the current access token, and
     // again whenever the token is refreshed. The transform captures the token
@@ -375,15 +442,37 @@ export default Plugin.define({
     let token: string | undefined
     await ctx.mcp.transform((editor) => {
       if (!token) return
-      editor.set("office", { type: "remote", url: `${OFFICE}/mcp`, oauth: false, headers: { Authorization: `Bearer ${token}` } })
+      // Same identity headers as createClient: a tool call through this server
+      // has to look like a call from this session (GH-476).
+      editor.set("office", { type: "remote", url: `${OFFICE}/mcp`, oauth: false, headers: { Authorization: `Bearer ${token}`, ...officeIdentity() } })
     })
     let refreshTimer: ReturnType<typeof setTimeout> | undefined
+    // syncMcpIdentity replays the registration only when the identity headers
+    // changed: connectedSummary is not just the connect path (a reconnect and
+    // /office use it too), so a blind reload would churn the MCP server on every
+    // summary. Comparing the header set also makes the second-/mcp assertion in
+    // the test deterministic rather than order-dependent.
+    let lastIdentity = ""
+    // Callers run this after a checkin, which is also what sets `token`; the
+    // reload is a no-op without one, so the assumption is only that they got
+    // this far into the connect path.
+    const syncMcpIdentity = async () => {
+      if (!token) return
+      const next = JSON.stringify(officeIdentity())
+      if (next === lastIdentity) return
+      lastIdentity = next
+      await ctx.mcp.reload()
+    }
     const connectMcp = async () => {
       // Office tools act as the agent they carry, so an unconnected worktree
       // gets none of them rather than the checkout's.
       if (noIdentity()) return
       token = await bearer()
       if (!token) return
+      // Record what is being registered here too: a session that already had a
+      // pointer would otherwise pay one redundant reload on its first summary,
+      // because syncMcpIdentity would see a "change" from its empty starting value.
+      lastIdentity = JSON.stringify(officeIdentity())
       await ctx.mcp.reload()
       clearTimeout(refreshTimer)
       if (auth.credentials && !process.env.AGENT_OFFICE_TOKEN) {
@@ -432,6 +521,8 @@ export default Plugin.define({
     }
 
     const start = (sessionID: string) => {
+      // The child name falls back to this when no launcher name was given.
+      currentSessionID = sessionID
       noticeUnconnected(sessionID)
       if (busy.size === 0) {
         heartbeat = setInterval(() => {
@@ -590,6 +681,7 @@ export default Plugin.define({
       const me = await checkin()
       adoptAgent(me.agent?.slug, via)
       ownAgent = me.agent
+      await syncMcpIdentity()
       await observePending(me.pending, false)
       const pending = me.pending ?? {}
       const summary = `Connected to Agent Office as @${me.agent?.slug} (${me.agent?.name}). Open tasks: ${pending.open_tasks?.length ?? 0}, unclaimed team tasks: ${pending.unclaimed_team_tasks?.length ?? 0}, unread messages: ${pending.unread_messages?.length ?? 0}. The office MCP tools are available; call checkin first.`
@@ -845,6 +937,7 @@ export default Plugin.define({
         const me = await checkin()
         adoptAgent(me.agent?.slug)
         ownAgent = me.agent
+        await syncMcpIdentity()
         lastPollAt = Date.now()
         lastPollError = undefined
         await observePending(me.pending, true)
