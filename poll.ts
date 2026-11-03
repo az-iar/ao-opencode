@@ -22,6 +22,7 @@ import { parseArgs } from "node:util"
 import {
   acquireDispatch,
   addWorktree,
+  adoptWorktree,
   agentStateDir,
   blockTask,
   claimNotice,
@@ -124,7 +125,7 @@ async function main(): Promise<number> {
   const resolved = resolveCredentials(directory, canonicalRoot(directory))
   const { bearer } = createBearer(() => resolved.credentialsFile, resolved.credentials)
   if (!(await bearer())) {
-    log(`not connected for ${directory}: run /office in OpenCode first, or set AGENT_OFFICE_TOKEN`)
+    log(`not connected for ${directory}: ${resolved.unconnected ? "a linked worktree nobody connected; run /office in it" : "run /office in OpenCode first"}, or set AGENT_OFFICE_TOKEN`)
     return 2
   }
   const { call, checkin } = createClient(bearer)
@@ -188,6 +189,9 @@ async function main(): Promise<number> {
             await claimTask(call, id)
             claimed = true
             const { path, branch } = await addWorktree(canonicalRoot(directory), id, String(task?.title ?? id))
+            // The worker's OpenCode opens in a linked worktree, which has no
+            // Office identity unless it is given one: it gets this agent's.
+            adoptWorktree(path, me.agent?.slug)
             log(`dispatching task ${id} to ${path}`)
             log(`task ${id} run exited ${await runOpencode(path, `Office task ${id}`, taskPrompt(id, detail?.task ?? detail, path, branch), DISPATCH_STALE_MS)}`)
           } catch (err) {

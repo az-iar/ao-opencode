@@ -103,16 +103,68 @@ export function saveCredentials(path: string, c: Credentials) {
   writeFileSync(path, JSON.stringify(c, null, 2) + "\n", { mode: 0o600 })
 }
 
+// The toplevel of the linked worktree `directory` is in, or undefined for the
+// main checkout, a plain directory, a submodule or a bare repository: their
+// git dir *is* the common one. Git resolves the spelling, so a worktree
+// reached through a symlink and its subdirectories agree on the path.
+export function worktreeTop(directory: string): string | undefined {
+  const git = spawnSync("git", ["-C", directory, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", "--show-toplevel"], { encoding: "utf8" })
+  if (git.status !== 0) return undefined
+  const [gitDir, commonDir, top] = git.stdout.trim().split("\n")
+  if (!gitDir || !commonDir || !top || gitDir === commonDir) return undefined
+  return resolve(top)
+}
+
+export function isLinkedWorktree(directory: string): boolean {
+  return worktreeTop(directory) !== undefined
+}
+
+// A linked worktree's identity pointer lives at its toplevel, so `/office` at
+// the root and a session opened in a subdirectory of it agree.
+export function workspacePointerPath(directory: string): string {
+  return agentPointerPath(worktreeTop(directory) ?? directory)
+}
+
+// A dispatched task worktree acts as the agent that dispatched it, not as the
+// checkout's: the dispatcher writes the worktree's own pointer before the
+// worker starts it, since a linked worktree without one has no Office
+// identity to resolve (see isUnconnectedWorktree).
+export function adoptWorktree(directory: string, agent: string | undefined) {
+  if (agent) saveAgentPointer(workspacePointerPath(directory), agent)
+}
+
+// A linked worktree nobody connected must not take on the main checkout's
+// Office identity: the repo pointer and the legacy per-repo token are that
+// checkout's agent, and a session opened only to look at a branch would post,
+// poll and report as it. A pointer written there (`/office` in the worktree,
+// or a task worktree the dispatcher adopted) connects it as its own agent;
+// AGENT_OFFICE_TOKEN and the credentials-file override hand an identity in
+// from the outside, which is how dispatched workers and children get one.
+function unconnectedTop(top: string | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!top || env.AGENT_OFFICE_TOKEN || CREDENTIALS_OVERRIDE) return false
+  return loadAgentPointer(agentPointerPath(top)) === undefined
+}
+
+export function isUnconnectedWorktree(directory: string, env = process.env): boolean {
+  return unconnectedTop(worktreeTop(directory), env)
+}
+
 // The workspace's agent pointer names the agent's token file; without one the
-// legacy per-repo file is used. The override file replaces both.
+// legacy per-repo file is used. The override file replaces both. A linked
+// worktree resolves its own identity only, token or not: the pointer at its
+// toplevel, its own folder-scoped file, or an explicit token/override. It
+// never borrows the checkout's pointer or per-repo token, and a `/office` run
+// there writes its own file, so neither acts nor writes as that agent.
 export function resolveCredentials(directory: string, canonical?: string) {
-  const legacyCredentialsFile = credentialsPath(directory, canonical)
-  const pointerFile = agentPointerPath(directory)
+  const worktree = worktreeTop(directory)
+  const legacyCredentialsFile = worktree ? credentialsPath(worktree, worktree, CREDENTIALS_OVERRIDE, "folder") : credentialsPath(directory, canonical)
+  const pointerFile = agentPointerPath(worktree ?? directory)
   const repoPointerFile = agentPointerPath(canonical ?? directory)
+  const unconnected = unconnectedTop(worktree)
   const pointedAgent =
     CREDENTIALS_OVERRIDE
       ? undefined
-      : loadAgentPointer(pointerFile) ?? (repoPointerFile !== pointerFile ? loadAgentPointer(repoPointerFile) : undefined)
+      : loadAgentPointer(pointerFile) ?? (worktree || repoPointerFile === pointerFile ? undefined : loadAgentPointer(repoPointerFile))
   let credentialsFile = pointedAgent ? agentCredentialsPath(pointedAgent) : legacyCredentialsFile
   let credentials = loadCredentials(credentialsFile)
   if (!credentials && !pointedAgent) {
@@ -122,7 +174,7 @@ export function resolveCredentials(directory: string, canonical?: string) {
       credentialsFile = legacyCredentialsFile
     }
   }
-  return { legacyCredentialsFile, pointerFile, repoPointerFile, credentialsFile, credentials }
+  return { legacyCredentialsFile, pointerFile, repoPointerFile, credentialsFile, credentials, unconnected }
 }
 
 // Claims, dispatch locks and poller state live beside the credentials, one
@@ -397,11 +449,7 @@ export function onTaskBranch(directory: string) {
 // a linked git worktree, and its OpenCode would otherwise poll and dispatch
 // beside the main one.
 export function inHerdrWorktree(directory: string, env = process.env) {
-  if (env.HERDR_ENV !== "1") return false
-  const git = spawnSync("git", ["-C", directory, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], { encoding: "utf8" })
-  if (git.status !== 0) return false
-  const [gitDir, commonDir] = git.stdout.trim().split("\n")
-  return Boolean(gitDir && commonDir) && gitDir !== commonDir
+  return env.HERDR_ENV === "1" && isLinkedWorktree(directory)
 }
 
 export const taskShort = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 8)

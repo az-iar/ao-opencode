@@ -8,6 +8,8 @@ export function fakeOffice() {
   const calls: Call[] = []
   const state = {
     workStatus: "working",
+    // Who this Office says the caller is; a test sets another agent.
+    agent: { slug: "opencode", name: "OpenCode" },
     tokens: 0,
     openTasks: [{ id: "task-open-1", title: "Open task" }],
     unclaimedTasks: [] as any[],
@@ -72,7 +74,7 @@ export function fakeOffice() {
         }
         if (body.params.arguments?.status) state.workStatus = body.params.arguments.status
         const data = {
-          agent: { slug: "opencode", name: "OpenCode", work_status: state.workStatus },
+          agent: { ...state.agent, work_status: state.workStatus },
           pending: { open_tasks: state.openTasks, unclaimed_team_tasks: state.unclaimedTasks, unread_messages: state.unreadMessages },
           rules: { etag: "etag-1", effective: [], always: [], projects: [], layers: [] },
         }

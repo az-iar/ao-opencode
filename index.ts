@@ -33,6 +33,7 @@ import {
   type Credentials,
   acquireDispatch,
   addWorktree,
+  adoptWorktree,
   hcBin,
   holdDispatch,
   agentCredentialsPath,
@@ -320,12 +321,22 @@ export default Plugin.define({
     let credentialsFile = resolved.credentialsFile
     const usingCredentialsOverride = Boolean(CREDENTIALS_OVERRIDE)
     const auth = createBearer(() => credentialsFile, resolved.credentials)
+    // A linked worktree nobody connected has no Office identity at all, and
+    // must not borrow the checkout's: no polling, no status reports, no
+    // dispatch and no office MCP server (whose tools would act as that agent).
+    // A `/office` run here (adoptAgent) or a token in the environment is an
+    // explicit identity; a task worktree's worker is handed one by its
+    // dispatcher (adoptWorktree). Assigned once polling is set up, below, so a
+    // worktree connected by /office starts polling without a restart.
+    const noIdentity = () => resolved.unconnected && !auth.credentials && !process.env.AGENT_OFFICE_TOKEN
+    let startPolling: () => void = () => {}
     const adoptAgent = (slug?: string) => {
       if (usingCredentialsOverride || !slug) return
       const target = agentCredentialsPath(slug)
       if (auth.credentials) saveCredentials(target, auth.credentials)
       credentialsFile = target
       saveAgentPointer(pointerFile, slug)
+      startPolling()
     }
     const dispatchDir = () => agentStateDir(legacyCredentialsFile, "dispatch", ownAgent?.slug ?? locationKey)
     const noticeDir = () => agentStateDir(legacyCredentialsFile, "notices", ownAgent?.slug ?? locationKey)
@@ -353,6 +364,9 @@ export default Plugin.define({
     })
     let refreshTimer: ReturnType<typeof setTimeout> | undefined
     const connectMcp = async () => {
+      // Office tools act as the agent they carry, so an unconnected worktree
+      // gets none of them rather than the checkout's.
+      if (noIdentity()) return
       token = await bearer()
       if (!token) return
       await ctx.mcp.reload()
@@ -391,6 +405,7 @@ export default Plugin.define({
     const report = (status: "working" | "idle") => {
       queue = queue.then(async () => {
         try {
+          if (noIdentity()) return
           if (!(await bearer())) return
           if (status === "idle" && (await checkin()).agent?.work_status === "blocked") return
           await checkin({ status, note })
@@ -403,7 +418,9 @@ export default Plugin.define({
 
     const start = (sessionID: string) => {
       if (busy.size === 0) {
-        heartbeat = setInterval(() => checkin().catch(() => {}), HEARTBEAT_MS)
+        heartbeat = setInterval(() => {
+          if (!noIdentity()) checkin().catch(() => {})
+        }, HEARTBEAT_MS)
         heartbeat.unref()
         void report("working")
       }
@@ -604,6 +621,9 @@ export default Plugin.define({
     // first prompt, so there is no supervisor and no worker subagent.
     const dispatchHc = async (id: string, task: any, title: string, parent: string) => {
       const { path, branch } = await addWorktree(repo, id, title)
+      // The worker's OpenCode opens in a linked worktree, which has no Office
+      // identity unless it is given one: it gets this agent's.
+      adoptWorktree(path, usingCredentialsOverride ? undefined : ownAgent?.slug)
       // Names must be unique among live terminals: a retry while the first
       // child still runs would otherwise fail the launch.
       const name = `office-${taskShort(id)}-${randomBytes(2).toString("hex")}`
@@ -663,7 +683,7 @@ export default Plugin.define({
     // One pump at a time, including while it looks up the remembered session.
     let pumping = false
     const pumpDispatch = () => {
-      if (life.signal.aborted || dispatchMode === "off" || pumping) return
+      if (life.signal.aborted || dispatchMode === "off" || noIdentity() || pumping) return
       pumping = true
       if (!targetSession()) {
         void targetSessionAsync()
@@ -785,6 +805,7 @@ export default Plugin.define({
       if (polling) return
       polling = true
       try {
+        if (noIdentity()) return
         if (!(await bearer())) return
         const me = await checkin()
         adoptAgent(me.agent?.slug)
@@ -802,11 +823,15 @@ export default Plugin.define({
 
     const configuredPoll = Number(ctx.options.pollInterval ?? process.env.AGENT_OFFICE_POLL_MS ?? DEFAULT_POLL_MS)
     const pollInterval = Number.isFinite(configuredPoll) ? Math.max(configuredPoll, 1_000) : DEFAULT_POLL_MS
-    if (!onTaskBranch(ctx.location.directory) && !inHerdrWorktree(ctx.location.directory)) {
+    // Only the main checkout reads the inbox: not a session on an office/
+    // branch, not a Herdr worktree, and not a worktree nobody connected.
+    startPolling = () => {
+      if (pollTimer || noIdentity() || onTaskBranch(ctx.location.directory) || inHerdrWorktree(ctx.location.directory)) return
       pollTimer = setInterval(() => void poll(), pollInterval)
       pollTimer.unref()
       void poll()
     }
+    startPolling()
 
     await ctx.command.transform((editor) => {
       editor.add({
@@ -881,6 +906,7 @@ export default Plugin.define({
                 canonical: ctx.location.project?.canonical,
                 credentialsFile,
                 tokenStorage: usingCredentialsOverride ? "override" : "agent",
+                officeIdentity: noIdentity() ? "none (unconnected worktree: run /office here)" : "connected",
                 agentPointer: pointerFile,
                 repoAgentPointer: repoPointerFile,
                 clientName,
