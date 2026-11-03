@@ -33,10 +33,13 @@ import {
   type Credentials,
   acquireDispatch,
   addWorktree,
+  adoptWorktree,
   hcBin,
   holdDispatch,
   agentCredentialsPath,
+  agentPointerVia,
   agentStateDir,
+  loadAgentPointer,
   blockTask,
   CREDENTIALS_OVERRIDE,
   claimNotice,
@@ -320,12 +323,35 @@ export default Plugin.define({
     let credentialsFile = resolved.credentialsFile
     const usingCredentialsOverride = Boolean(CREDENTIALS_OVERRIDE)
     const auth = createBearer(() => credentialsFile, resolved.credentials)
-    const adoptAgent = (slug?: string) => {
+    // A linked worktree nobody connected has no Office identity at all, and
+    // must not borrow the checkout's: no polling, no status reports, no
+    // dispatch and no office MCP server (whose tools would act as that agent).
+    // A `/office` run here (adoptAgent) or a token in the environment is an
+    // explicit identity; a task worktree's worker is handed one by its
+    // dispatcher (adoptWorktree). Assigned once polling is set up, below, so a
+    // worktree connected by /office starts polling without a restart.
+    const noIdentity = () => resolved.unconnected && !auth.credentials && !process.env.AGENT_OFFICE_TOKEN
+    let startPolling: () => void = () => {}
+    // `via` is the mark a linked worktree's pointer needs to count: "office"
+    // for a `/office` here. A plain poll passes none and, in a worktree, writes
+    // no pointer unless one there is already marked (a dispatcher's worker
+    // keeps its identity). With a token in the environment a worktree writes
+    // none at all. The main checkout keeps the unmarked pointer it always had.
+    const adoptAgent = (slug?: string, via?: "office" | "dispatch") => {
       if (usingCredentialsOverride || !slug) return
+      // In a linked worktree the token is an identity handed in from outside,
+      // not this workspace's: a poll with it ("/office" here is different)
+      // must not leave a pointer or another agent's token behind.
+      if (resolved.worktree && process.env.AGENT_OFFICE_TOKEN && !via) return startPolling()
       const target = agentCredentialsPath(slug)
       if (auth.credentials) saveCredentials(target, auth.credentials)
       credentialsFile = target
-      saveAgentPointer(pointerFile, slug)
+      if (!resolved.worktree) saveAgentPointer(pointerFile, slug)
+      else {
+        const mark = via ?? agentPointerVia(pointerFile)
+        if (mark) saveAgentPointer(pointerFile, slug, mark)
+      }
+      startPolling()
     }
     const dispatchDir = () => agentStateDir(legacyCredentialsFile, "dispatch", ownAgent?.slug ?? locationKey)
     const noticeDir = () => agentStateDir(legacyCredentialsFile, "notices", ownAgent?.slug ?? locationKey)
@@ -353,6 +379,9 @@ export default Plugin.define({
     })
     let refreshTimer: ReturnType<typeof setTimeout> | undefined
     const connectMcp = async () => {
+      // Office tools act as the agent they carry, so an unconnected worktree
+      // gets none of them rather than the checkout's.
+      if (noIdentity()) return
       token = await bearer()
       if (!token) return
       await ctx.mcp.reload()
@@ -391,6 +420,7 @@ export default Plugin.define({
     const report = (status: "working" | "idle") => {
       queue = queue.then(async () => {
         try {
+          if (noIdentity()) return
           if (!(await bearer())) return
           if (status === "idle" && (await checkin()).agent?.work_status === "blocked") return
           await checkin({ status, note })
@@ -402,8 +432,11 @@ export default Plugin.define({
     }
 
     const start = (sessionID: string) => {
+      noticeUnconnected(sessionID)
       if (busy.size === 0) {
-        heartbeat = setInterval(() => checkin().catch(() => {}), HEARTBEAT_MS)
+        heartbeat = setInterval(() => {
+          if (!noIdentity()) checkin().catch(() => {})
+        }, HEARTBEAT_MS)
         heartbeat.unref()
         void report("working")
       }
@@ -459,6 +492,18 @@ export default Plugin.define({
     const notify = (sessionID: string | undefined, text: string) => {
       if (!sessionID) return
       void ctx.session.synthetic({ sessionID, text, description: "Agent Office" }).catch((err) => warn("could not notify the session", { error: String(err) }))
+    }
+
+    // An unconnected worktree just has no office tools; say why once in the
+    // session, and only when the checkout it belongs to really is connected,
+    // so this is not noise in a project that never used Agent Office.
+    const unconnectedNoticed = new Set<string>()
+    const noticeUnconnected = (sessionID: string) => {
+      if (!noIdentity() || unconnectedNoticed.has(sessionID)) return
+      const checkoutAgent = loadAgentPointer(repoPointerFile)
+      if (!checkoutAgent) return
+      unconnectedNoticed.add(sessionID)
+      notify(sessionID, `This worktree is not connected to Agent Office (the main checkout is, as @${checkoutAgent}), so it has no office tools, polling or notices. Run /office here to connect it.`)
     }
 
     // Office children run on their root session's model, not on OpenCode's
@@ -536,10 +581,14 @@ export default Plugin.define({
       }
     }
 
-    const connectedSummary = async () => {
+    // `via` marks a worktree pointer as written on purpose, so it is passed
+    // only where a person connected this workspace: after an approval. A
+    // `/office` that finds a bearer already (say AGENT_OFFICE_TOKEN) marks
+    // nothing, or the token's identity would outlive the token.
+    const connectedSummary = async (via?: "office" | "dispatch") => {
       await ensureConnected()
       const me = await checkin()
-      adoptAgent(me.agent?.slug)
+      adoptAgent(me.agent?.slug, via)
       ownAgent = me.agent
       await observePending(me.pending, false)
       const pending = me.pending ?? {}
@@ -563,7 +612,7 @@ export default Plugin.define({
           auth.credentials = next
           saveCredentials(credentialsFile, next)
           connected = undefined
-          return connectedSummary()
+          return connectedSummary("office")
         }),
       }
       approval = current
@@ -604,6 +653,12 @@ export default Plugin.define({
     // first prompt, so there is no supervisor and no worker subagent.
     const dispatchHc = async (id: string, task: any, title: string, parent: string) => {
       const { path, branch } = await addWorktree(repo, id, title)
+      // The worker's OpenCode opens in a linked worktree, which has no Office
+      // identity unless it is given one: it gets this agent's, marked as a
+      // dispatch so the worktree keeps it. Under the credentials override
+      // nothing is adopted: an hc worker cannot inherit that variable, so a
+      // pointer here would name an identity the worker cannot use.
+      adoptWorktree(path, usingCredentialsOverride ? undefined : ownAgent?.slug)
       // Names must be unique among live terminals: a retry while the first
       // child still runs would otherwise fail the launch.
       const name = `office-${taskShort(id)}-${randomBytes(2).toString("hex")}`
@@ -663,7 +718,7 @@ export default Plugin.define({
     // One pump at a time, including while it looks up the remembered session.
     let pumping = false
     const pumpDispatch = () => {
-      if (life.signal.aborted || dispatchMode === "off" || pumping) return
+      if (life.signal.aborted || dispatchMode === "off" || noIdentity() || pumping) return
       pumping = true
       if (!targetSession()) {
         void targetSessionAsync()
@@ -785,6 +840,7 @@ export default Plugin.define({
       if (polling) return
       polling = true
       try {
+        if (noIdentity()) return
         if (!(await bearer())) return
         const me = await checkin()
         adoptAgent(me.agent?.slug)
@@ -802,11 +858,15 @@ export default Plugin.define({
 
     const configuredPoll = Number(ctx.options.pollInterval ?? process.env.AGENT_OFFICE_POLL_MS ?? DEFAULT_POLL_MS)
     const pollInterval = Number.isFinite(configuredPoll) ? Math.max(configuredPoll, 1_000) : DEFAULT_POLL_MS
-    if (!onTaskBranch(ctx.location.directory) && !inHerdrWorktree(ctx.location.directory)) {
+    // Only the main checkout reads the inbox: not a session on an office/
+    // branch, not a Herdr worktree, and not a worktree nobody connected.
+    startPolling = () => {
+      if (pollTimer || noIdentity() || onTaskBranch(ctx.location.directory) || inHerdrWorktree(ctx.location.directory)) return
       pollTimer = setInterval(() => void poll(), pollInterval)
       pollTimer.unref()
       void poll()
     }
+    startPolling()
 
     await ctx.command.transform((editor) => {
       editor.add({
@@ -881,6 +941,7 @@ export default Plugin.define({
                 canonical: ctx.location.project?.canonical,
                 credentialsFile,
                 tokenStorage: usingCredentialsOverride ? "override" : "agent",
+                officeIdentity: noIdentity() ? "none (unconnected worktree: run /office here)" : "connected",
                 agentPointer: pointerFile,
                 repoAgentPointer: repoPointerFile,
                 clientName,
