@@ -319,10 +319,16 @@ export default Plugin.define({
     const resolved = resolveCredentials(ctx.location.directory, ctx.location.project?.canonical)
     const { legacyCredentialsFile, pointerFile, repoPointerFile } = resolved
     let currentSessionID: string | undefined
+    let approvedAgent: string | undefined
     let credentialsFile = resolved.credentialsFile
     const usingCredentialsOverride = Boolean(CREDENTIALS_OVERRIDE)
     const auth = createBearer(() => credentialsFile, resolved.credentials)
     const adoptAgent = (slug?: string) => {
+      // The office told us which agent this token is, so keep it even when the
+      // credentials override means there is no pointer to write - the identity
+      // header needs it (GH-476). A dispatcher hands a worker its token and no
+      // agent pointer, and without this the header would simply be missing.
+      if (slug) approvedAgent = slug
       if (usingCredentialsOverride || !slug) return
       const target = agentCredentialsPath(slug)
       if (auth.credentials) saveCredentials(target, auth.credentials)
@@ -354,7 +360,7 @@ export default Plugin.define({
     // declared agent match the bearer token's.
     const officeIdentity = (): Record<string, string> => {
       const headers: Record<string, string> = {}
-      const approved = loadAgentPointer(pointerFile) ?? loadAgentPointer(repoPointerFile)
+      const approved = loadAgentPointer(pointerFile) ?? loadAgentPointer(repoPointerFile) ?? approvedAgent
       if (approved) headers["X-Office-Session-Agent"] = approved
       if (process.env.AGENT_OFFICE_CHILD === "1") {
         // Sunny's naming rule, one across all three extensions: the launcher's

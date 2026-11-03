@@ -249,6 +249,22 @@ test("/office: OAuth with PKCE, stored tokens, MCP server added", async () => {
   office.calls.length = 0
 })
 
+test("an approved session sends its own agent on the session-agent header", async () => {
+  // The approval above stored this folder's agent pointer, so the next Office
+  // call must carry it (GH-476). Drive it through the tool the approval test
+  // already used: a second call is now connected, so it checkins through
+  // createClient - a real /mcp call on a session the harness knows.
+  office.calls.length = 0
+  await harness.tools[0].execute({}, { sessionID: "s1", progress: async () => {} })
+  await until(() => office.calls.some((c) => c.path === "/mcp"), "the checkin after a connected tool call")
+  const call = office.calls.find((c) => c.path === "/mcp")!
+  assert.equal(call.headers?.["x-office-session-agent"], "opencode", `headers were ${JSON.stringify(call.headers)}`)
+  // A top-level session is not a child, so it sends no via.
+  assert.equal(call.headers?.["x-office-via"], undefined)
+  // Leave no calls behind: the tests after this one compare exact call lists.
+  office.calls.length = 0
+})
+
 test("working while any session is busy, idle when all are quiet", async () => {
   harness.push({ type: "session.status", data: { sessionID: "a", status: { type: "busy" } } })
   harness.push({ type: "session.status", data: { sessionID: "b", status: { type: "retry", attempt: 1 } } })
