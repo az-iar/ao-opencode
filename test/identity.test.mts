@@ -41,6 +41,7 @@ const {
   adoptWorktree,
   agentCredentialsPath,
   agentPointerPath,
+  agentPointerVia,
   credentialsPath,
   isUnconnectedWorktree,
   loadAgentPointer,
@@ -77,10 +78,12 @@ const credentials = (agent: string, access: string, refresh = `refresh-${agent}`
 })
 
 // What `/office` leaves behind in a workspace: the agent's token under its
-// name, and the workspace's pointer to that agent.
-function connect(directory: string, agent: string, access: string) {
+// name, and the workspace's pointer to that agent. `via` is the mark a linked
+// worktree's pointer needs; the checkout's is written unmarked, as it always
+// was.
+function connect(directory: string, agent: string, access: string, via?: "office" | "dispatch") {
   saveCredentials(agentCredentialsPath(agent), credentials(agent, access))
-  saveAgentPointer(agentPointerPath(directory), agent)
+  saveAgentPointer(agentPointerPath(directory), agent, via)
 }
 
 const agentToken = (agent: string) => JSON.parse(readFileSync(agentCredentialsPath(agent), "utf8")).access_token
@@ -256,6 +259,7 @@ test("/office in the worktree connects it as its own agent; the checkout keeps i
     await until(() => harness.servers.get("office") !== undefined, "the office MCP server")
     await until(() => existsSync(agentPointerPath(wt)), "the worktree's own agent pointer")
     assert.equal(loadAgentPointer(agentPointerPath(wt)), "opencode")
+    assert.equal(agentPointerVia(agentPointerPath(wt)), "office", "marked: written on purpose by /office here")
     assert.equal(harness.servers.get("office").headers.Authorization, `Bearer ${agentToken("opencode")}`)
     // Connecting the worktree did not rewrite the token the checkout uses.
     assert.equal(agentToken("agent-a"), "access-a")
@@ -273,11 +277,55 @@ test("/office in the worktree connects it as its own agent; the checkout keeps i
   }
 })
 
-test("a worktree with its own pointer resolves that agent, and only that one", () => {
+test("a pointer the old plugin left in a worktree grants no identity there", async () => {
   const r = repo()
   const wt = worktree(r)
   connect(r, "agent-a", "access-a")
-  connect(wt, "agent-b", "access-b")
+  // What the old plugin wrote after every poll in a worktree: the identity it
+  // had resolved, the checkout's agent, as an unmarked pointer of the
+  // worktree's own. It is the shape a real machine still carries.
+  saveAgentPointer(agentPointerPath(wt), "agent-a")
+  assert.equal(loadAgentPointer(agentPointerPath(wt)), "agent-a", "the file stays; it is ignored, not deleted")
+
+  // Read from the checkout, that pointer is the checkout's agent, as before.
+  assert.equal(isUnconnectedWorktree(r), false)
+  assert.equal(resolveCredentials(r, r).credentials?.access_token, "access-a")
+  // Read from the worktree it counts for nothing.
+  assert.equal(isUnconnectedWorktree(wt), true)
+  const resolved = resolveCredentials(wt, r)
+  assert.equal(resolved.unconnected, true)
+  assert.equal(resolved.credentials, undefined)
+  assert.equal(loadCredentials(resolved.credentialsFile), undefined)
+
+  office.calls.length = 0
+  const harness = makeContext(wt, r, { pollInterval: 1_000 })
+  const cleanup = await plugin.setup(harness.ctx)
+  try {
+    harness.push({ type: "session.status", data: { sessionID: "stale", status: { type: "busy" } } })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(harness.servers.size, 0, "no office MCP server")
+    assert.deepEqual(mcpCalls(), [], "no checkin, no status report, no dispatch")
+    // N1: the session is told once why it has no office tools, naming the
+    // checkout's agent, which it does not act as.
+    assert.match(JSON.stringify(harness.synthetics), /not connected to Agent Office \(the main checkout is, as @agent-a\)/)
+    assert.equal(harness.synthetics.length, 1, "said once, not on every event")
+
+    // A pointer written on purpose (what `/office` there writes) is accepted
+    // without any cleanup of the old one.
+    saveAgentPointer(agentPointerPath(wt), "agent-a", "office")
+    assert.equal(isUnconnectedWorktree(wt), false)
+    assert.equal(resolveCredentials(wt, r).credentials?.access_token, "access-a")
+  } finally {
+    if (typeof cleanup === "function") await cleanup()
+    office.calls.length = 0
+  }
+})
+
+test("a worktree with a pointer written on purpose resolves that agent, and only that one", () => {
+  const r = repo()
+  const wt = worktree(r)
+  connect(r, "agent-a", "access-a")
+  connect(wt, "agent-b", "access-b", "office")
   assert.equal(isUnconnectedWorktree(wt), false)
   assert.equal(resolveCredentials(wt, r).credentials?.access_token, "access-b")
   assert.equal(resolveCredentials(r, r).credentials?.access_token, "access-a")
@@ -291,7 +339,7 @@ test("a subdirectory of a worktree resolves as the worktree does", () => {
   // Unconnected, the subdirectory is unconnected too, not the checkout's agent.
   assert.equal(resolveCredentials(join(wt, "src"), r).credentials, undefined)
   // Connected at the worktree's root, its subdirectories find that pointer.
-  connect(wt, "agent-b", "access-b")
+  connect(wt, "agent-b", "access-b", "office")
   assert.equal(resolveCredentials(join(wt, "src"), r).credentials?.access_token, "access-b")
   assert.equal(resolveCredentials(r, r).credentials?.access_token, "access-a")
 })
@@ -319,6 +367,7 @@ test("a dispatched task worktree resolves as the agent that dispatched it", asyn
     // The dispatcher wrote the worktree's own pointer, so its worker resolves
     // the dispatching agent instead of falling back to the checkout's.
     assert.equal(loadAgentPointer(agentPointerPath(taskWorktree)), "agent-a")
+    assert.equal(agentPointerVia(agentPointerPath(taskWorktree)), "dispatch", "marked: given on purpose")
     assert.equal(isUnconnectedWorktree(taskWorktree), false)
     assert.equal(resolveCredentials(taskWorktree, r).credentials?.access_token, "access-a")
   } finally {
@@ -366,6 +415,9 @@ test("an explicit AGENT_OFFICE_TOKEN connects an unconnected worktree and adopts
       const taskWorktree = readFileSync(log, "utf8").match(/--cwd (\S+)/)![1]
       assert.equal(loadAgentPointer(agentPointerPath(taskWorktree)), "agent-token")
       assert.equal(resolveCredentials(taskWorktree, r).credentials, undefined, "and no token file of the checkout's either")
+      // The token is an identity handed in, not one this worktree keeps: a
+      // poll with it must not leave a pointer that outlives it.
+      assert.equal(existsSync(agentPointerPath(wt)), false, "the token left no pointer behind in the worktree")
     } finally {
       await cleanup()
     }
@@ -375,6 +427,9 @@ test("an explicit AGENT_OFFICE_TOKEN connects an unconnected worktree and adopts
     office.state.openTasks = [{ id: "task-open-1", title: "Open task" }]
     office.calls.length = 0
   }
+  // With the token gone the worktree is unconnected again: nothing is left.
+  assert.equal(isUnconnectedWorktree(wt), true)
+  assert.equal(resolveCredentials(wt, r).credentials, undefined)
 })
 
 test("the main checkout, its subdirectories and plain directories are unchanged", async () => {

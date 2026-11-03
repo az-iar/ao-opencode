@@ -37,7 +37,9 @@ import {
   hcBin,
   holdDispatch,
   agentCredentialsPath,
+  agentPointerVia,
   agentStateDir,
+  loadAgentPointer,
   blockTask,
   CREDENTIALS_OVERRIDE,
   claimNotice,
@@ -330,12 +332,25 @@ export default Plugin.define({
     // worktree connected by /office starts polling without a restart.
     const noIdentity = () => resolved.unconnected && !auth.credentials && !process.env.AGENT_OFFICE_TOKEN
     let startPolling: () => void = () => {}
-    const adoptAgent = (slug?: string) => {
+    // `via` is the mark a linked worktree's pointer needs to count: "office"
+    // for a `/office` here. A plain poll passes none and, in a worktree, writes
+    // no pointer unless one there is already marked (a dispatcher's worker
+    // keeps its identity). With a token in the environment a worktree writes
+    // none at all. The main checkout keeps the unmarked pointer it always had.
+    const adoptAgent = (slug?: string, via?: "office" | "dispatch") => {
       if (usingCredentialsOverride || !slug) return
+      // In a linked worktree the token is an identity handed in from outside,
+      // not this workspace's: a poll with it ("/office" here is different)
+      // must not leave a pointer or another agent's token behind.
+      if (resolved.worktree && process.env.AGENT_OFFICE_TOKEN && !via) return startPolling()
       const target = agentCredentialsPath(slug)
       if (auth.credentials) saveCredentials(target, auth.credentials)
       credentialsFile = target
-      saveAgentPointer(pointerFile, slug)
+      if (!resolved.worktree) saveAgentPointer(pointerFile, slug)
+      else {
+        const mark = via ?? agentPointerVia(pointerFile)
+        if (mark) saveAgentPointer(pointerFile, slug, mark)
+      }
       startPolling()
     }
     const dispatchDir = () => agentStateDir(legacyCredentialsFile, "dispatch", ownAgent?.slug ?? locationKey)
@@ -417,6 +432,7 @@ export default Plugin.define({
     }
 
     const start = (sessionID: string) => {
+      noticeUnconnected(sessionID)
       if (busy.size === 0) {
         heartbeat = setInterval(() => {
           if (!noIdentity()) checkin().catch(() => {})
@@ -476,6 +492,18 @@ export default Plugin.define({
     const notify = (sessionID: string | undefined, text: string) => {
       if (!sessionID) return
       void ctx.session.synthetic({ sessionID, text, description: "Agent Office" }).catch((err) => warn("could not notify the session", { error: String(err) }))
+    }
+
+    // An unconnected worktree just has no office tools; say why once in the
+    // session, and only when the checkout it belongs to really is connected,
+    // so this is not noise in a project that never used Agent Office.
+    const unconnectedNoticed = new Set<string>()
+    const noticeUnconnected = (sessionID: string) => {
+      if (!noIdentity() || unconnectedNoticed.has(sessionID)) return
+      const checkoutAgent = loadAgentPointer(repoPointerFile)
+      if (!checkoutAgent) return
+      unconnectedNoticed.add(sessionID)
+      notify(sessionID, `This worktree is not connected to Agent Office (the main checkout is, as @${checkoutAgent}), so it has no office tools, polling or notices. Run /office here to connect it.`)
     }
 
     // Office children run on their root session's model, not on OpenCode's
@@ -556,7 +584,7 @@ export default Plugin.define({
     const connectedSummary = async () => {
       await ensureConnected()
       const me = await checkin()
-      adoptAgent(me.agent?.slug)
+      adoptAgent(me.agent?.slug, "office")
       ownAgent = me.agent
       await observePending(me.pending, false)
       const pending = me.pending ?? {}
@@ -622,7 +650,10 @@ export default Plugin.define({
     const dispatchHc = async (id: string, task: any, title: string, parent: string) => {
       const { path, branch } = await addWorktree(repo, id, title)
       // The worker's OpenCode opens in a linked worktree, which has no Office
-      // identity unless it is given one: it gets this agent's.
+      // identity unless it is given one: it gets this agent's, marked as a
+      // dispatch so the worktree keeps it. Under the credentials override
+      // nothing is adopted: an hc worker cannot inherit that variable, so a
+      // pointer here would name an identity the worker cannot use.
       adoptWorktree(path, usingCredentialsOverride ? undefined : ownAgent?.slug)
       // Names must be unique among live terminals: a retry while the first
       // child still runs would otherwise fail the launch.

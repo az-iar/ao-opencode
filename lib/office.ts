@@ -55,8 +55,9 @@ export function taskID(item: any): string {
   return String(item?.id ?? item?.task_id ?? item?.slug ?? itemKey(item, "task"))
 }
 
-// One token per repo by default. Worktrees share the canonical project root;
-// `AGENT_OFFICE_TOKEN_SCOPE=folder` keys by the loaded directory instead.
+// One token per repo by default. `AGENT_OFFICE_TOKEN_SCOPE=folder` keys by the
+// loaded directory instead, which is what a linked worktree always does (see
+// resolveCredentials): its file is its own, not the checkout's.
 export function credentialsPath(directory: string, canonical?: string, override = CREDENTIALS_OVERRIDE, scope = process.env.AGENT_OFFICE_TOKEN_SCOPE ?? "repo"): string {
   if (override) return override
   if (scope === "global") return join(homedir(), ".config", "agent-office", "opencode.json")
@@ -84,18 +85,33 @@ export function agentPointerPath(directory: string): string {
   return join(POINTERS_DIR, `${workspaceKey(directory)}.json`)
 }
 
-export function loadAgentPointer(path: string): string | undefined {
+// A pointer written on purpose: `/office` in that workspace, or a dispatcher
+// adopting a task worktree. A pointer an older version wrote from the repo
+// fallback carries no mark, and names the main checkout's agent.
+export type AgentPointerVia = "office" | "dispatch"
+
+export function readAgentPointer(path: string): { agent: string; via?: AgentPointerVia } | undefined {
   try {
-    const value = JSON.parse(readFileSync(path, "utf8")) as { agent?: string }
-    return typeof value.agent === "string" ? value.agent : undefined
+    const value = JSON.parse(readFileSync(path, "utf8")) as { agent?: string; via?: string }
+    if (typeof value.agent !== "string") return undefined
+    const via = value.via === "office" || value.via === "dispatch" ? value.via : undefined
+    return { agent: value.agent, via }
   } catch {
     return undefined
   }
 }
 
-export function saveAgentPointer(path: string, slug: string) {
+export function loadAgentPointer(path: string): string | undefined {
+  return readAgentPointer(path)?.agent
+}
+
+export function agentPointerVia(path: string): AgentPointerVia | undefined {
+  return readAgentPointer(path)?.via
+}
+
+export function saveAgentPointer(path: string, slug: string, via?: AgentPointerVia) {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
-  writeFileSync(path, JSON.stringify({ agent: slug }, null, 2) + "\n", { mode: 0o600 })
+  writeFileSync(path, JSON.stringify(via ? { agent: slug, via } : { agent: slug }, null, 2) + "\n", { mode: 0o600 })
 }
 
 export function saveCredentials(path: string, c: Credentials) {
@@ -128,9 +144,10 @@ export function workspacePointerPath(directory: string): string {
 // A dispatched task worktree acts as the agent that dispatched it, not as the
 // checkout's: the dispatcher writes the worktree's own pointer before the
 // worker starts it, since a linked worktree without one has no Office
-// identity to resolve (see isUnconnectedWorktree).
+// identity to resolve (see isUnconnectedWorktree). The mark says the identity
+// was given on purpose, so the worktree keeps it while a plain one would not.
 export function adoptWorktree(directory: string, agent: string | undefined) {
-  if (agent) saveAgentPointer(workspacePointerPath(directory), agent)
+  if (agent) saveAgentPointer(workspacePointerPath(directory), agent, "dispatch")
 }
 
 // A linked worktree nobody connected must not take on the main checkout's
@@ -140,9 +157,13 @@ export function adoptWorktree(directory: string, agent: string | undefined) {
 // or a task worktree the dispatcher adopted) connects it as its own agent;
 // AGENT_OFFICE_TOKEN and the credentials-file override hand an identity in
 // from the outside, which is how dispatched workers and children get one.
+// Only a pointer written on purpose counts there. An unmarked one was written
+// by an older version, which saved the identity it had resolved, the repo
+// pointer's agent, after every poll: honouring it would keep the worktree
+// acting as the checkout's agent. The main checkout reads both shapes.
 function unconnectedTop(top: string | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
   if (!top || env.AGENT_OFFICE_TOKEN || CREDENTIALS_OVERRIDE) return false
-  return loadAgentPointer(agentPointerPath(top)) === undefined
+  return readAgentPointer(agentPointerPath(top))?.via === undefined
 }
 
 export function isUnconnectedWorktree(directory: string, env = process.env): boolean {
@@ -161,10 +182,14 @@ export function resolveCredentials(directory: string, canonical?: string) {
   const pointerFile = agentPointerPath(worktree ?? directory)
   const repoPointerFile = agentPointerPath(canonical ?? directory)
   const unconnected = unconnectedTop(worktree)
+  const pointer = readAgentPointer(pointerFile)
+  // In a linked worktree its own pointer counts only when it was written on
+  // purpose; the checkout's pointer counts in any shape, as it always has.
+  const ownAgent = pointer && (worktree ? pointer.via : true) ? pointer.agent : undefined
   const pointedAgent =
     CREDENTIALS_OVERRIDE
       ? undefined
-      : loadAgentPointer(pointerFile) ?? (worktree || repoPointerFile === pointerFile ? undefined : loadAgentPointer(repoPointerFile))
+      : ownAgent ?? (worktree || repoPointerFile === pointerFile ? undefined : loadAgentPointer(repoPointerFile))
   let credentialsFile = pointedAgent ? agentCredentialsPath(pointedAgent) : legacyCredentialsFile
   let credentials = loadCredentials(credentialsFile)
   if (!credentials && !pointedAgent) {
@@ -174,7 +199,8 @@ export function resolveCredentials(directory: string, canonical?: string) {
       credentialsFile = legacyCredentialsFile
     }
   }
-  return { legacyCredentialsFile, pointerFile, repoPointerFile, credentialsFile, credentials, unconnected }
+  // `worktree` is the linked worktree's toplevel, undefined in the checkout.
+  return { legacyCredentialsFile, pointerFile, repoPointerFile, credentialsFile, credentials, unconnected, worktree }
 }
 
 // Claims, dispatch locks and poller state live beside the credentials, one
