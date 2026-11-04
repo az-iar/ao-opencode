@@ -27,6 +27,10 @@ function workspace() {
   mkdirSync(runs)
   execFileSync("git", ["-C", dir, "init", "-q"])
   execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  // A named repo is resolved by origin, and a checkout with none keeps #32's
+  // fallback (it runs the task), so the poller's own checkout needs one for the
+  // refusal cases to be refusals (agent-office#558).
+  execFileSync("git", ["-C", dir, "remote", "add", "origin", "git@github.com:az-iar/ao-opencode.git"])
   const credentials = join(root, "store", "opencode.json")
   mkdirSync(join(root, "store"))
   writeFileSync(credentials, JSON.stringify({ office: url, client_id: "client-1", access_token: "access-poll", refresh_token: "refresh-poll", expires_at: Date.now() + 3_600_000 }))
