@@ -154,13 +154,20 @@ const refusedSessionPairs = new Set<string>()
 //
 // A record with no `session` field is honoured: that is the shape of every record
 // written before this change, and refusing them would revoke every session on
-// upgrade. Only a record that names a different session is refused.
-function sessionRecordNames(record: { session?: string }, requested: string): boolean {
-  if (record.session === undefined || record.session === requested) return true
-  const pair = `${requested}\u0000${record.session}`
+// upgrade. Only a record that does not name this session is refused - another id,
+// or a value of the wrong type: a null or a number is a present field, not a
+// missing one, and honouring it would hand this session an agent its record
+// never named, whatever the field was meant to say. The value is logged through
+// JSON.stringify, so a planted string cannot end the line and forge one.
+function sessionRecordNames(record: { session?: unknown }, requested: string): boolean {
+  if (!("session" in record)) return true
+  const named = record.session
+  if (typeof named === "string" && named === requested) return true
+  const shown = JSON.stringify(named) ?? String(named)
+  const pair = `${requested}\u0000${shown}`
   if (!refusedSessionPairs.has(pair)) {
     refusedSessionPairs.add(pair)
-    console.warn('[agent-office] session record for ' + requested + ' names ' + record.session + ': ignoring it')
+    console.warn('[agent-office] session record for ' + requested + ' names ' + shown + ': ignoring it')
   }
   return false
 }
@@ -182,6 +189,11 @@ export function sessionAgentOf(sessionID: string | undefined): string | undefine
   if (!record?.agent) return undefined
   if (!sessionRecordNames(record, sessionID)) return undefined
   const legacy = record.agent
+  // What this promotion costs an auditor: the copy is byte-identical to an
+  // approval, `at` is the copy's time and nothing marks it inherited, so after
+  // it you cannot tell from the file whether a person approved this session or
+  // it inherited an approval made before #39. The legacy file is retired below,
+  // so even the second file does not survive to say so.
   try {
     saveSessionAgent(sessionID, legacy)
   } catch (err) {
@@ -209,14 +221,18 @@ export function sessionAgentOf(sessionID: string | undefined): string | undefine
 // fallback carries no mark, and names the main checkout's agent.
 export type AgentPointerVia = "office" | "dispatch"
 
-export function readAgentPointer(path: string): { agent: string; via?: AgentPointerVia; session?: string } | undefined {
+// `session` is the record's session field as it was written, not a validated
+// string: readAgentPointer cannot decide whether a value is acceptable, and
+// dropping a wrong-typed one here is what made a null read as "no field" and
+// get honoured for every session (ao-opencode#41). Session reads compare it in
+// sessionRecordNames; a pointer record simply has no such field.
+export function readAgentPointer(path: string): { agent: string; via?: AgentPointerVia; session?: unknown } | undefined {
   try {
-    const value = JSON.parse(readFileSync(path, "utf8")) as { agent?: string; via?: string; session?: string }
+    const value = JSON.parse(readFileSync(path, "utf8")) as { agent?: string; via?: string; session?: unknown }
     if (typeof value.agent !== "string") return undefined
     const via = value.via === "office" || value.via === "dispatch" ? value.via : undefined
-    // Only a session record carries this; a folder pointer leaves it undefined.
-    const session = typeof value.session === "string" ? value.session : undefined
-    return { agent: value.agent, via, session }
+    // Only a session record carries this; a folder pointer leaves it absent.
+    return "session" in value ? { agent: value.agent, via, session: value.session } : { agent: value.agent, via }
   } catch {
     return undefined
   }

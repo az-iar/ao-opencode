@@ -47,6 +47,7 @@ import {
   agentPointerVia,
   agentStateDir,
   loadAgentPointer,
+  readAgentPointer,
   saveSessionAgent,
   sessionAgentOf,
   loadCredentials,
@@ -435,7 +436,14 @@ export default Plugin.define({
       // against a session (ao-pi's adoptAgent returns before its pointer too).
       if (usingCredentialsOverride || tokenGranted()) return
       const id = approvedSessionID ?? ownedSessionID
-      if (!id || loadAgentPointer(sessionPointerPath(id)) === slug) return
+      if (!id) return
+      // Skip only a record that already names this agent AND this session. The
+      // session half is the one that matters: a record refused for this id (it
+      // names another session, or no session) is not this session's approval,
+      // and leaving it in place makes /office work in this process while the
+      // next start refuses the session again - for as long as the file lives.
+      const record = readAgentPointer(sessionPointerPath(id))
+      if (record?.agent === slug && record.session === id) return
       saveSessionAgent(id, slug)
     }
     // `via` is the mark a linked worktree's pointer needs to count: "office"

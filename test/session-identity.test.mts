@@ -633,3 +633,74 @@ test("a mismatched legacy record is not copied forward", () => {
     `the refusal was not reported: ${seen.join(" | ")}`,
   )
 })
+
+// ao-opencode#41 (bruno): rememberSessionApproval skipped the write when the
+// stored *agent* already matched, never looking at the session. A record refused
+// for this session (it names another session) therefore survived a re-approval
+// as the same agent: /office worked in the process, the next start refused the
+// session again, and only deleting the file ended the loop. Both directions are
+// covered - the same agent (the one the skip swallowed) and a different one.
+test("a re-approval after a refusal replaces the refused record instead of skipping the write", async () => {
+  for (const [approveAs, staleAgent] of [["host", "host"], ["other", "host"]] as const) {
+    const dir = repo()
+    const folder = testToken(`reapprove-folder-${approveAs}`)
+    const approved = testToken(`reapprove-${approveAs}`)
+    connect(dir, "host", folder)
+    office.state.issuedToken = approved
+    office.state.agent = { slug: approveAs, name: approveAs }
+    office.calls.length = 0
+    const session = `reapprove-session-${approveAs}`
+    const owner = `reapprove-owner-${approveAs}`
+    // A record written for another session: this session's read refuses it.
+    lib.saveSessionAgent(owner, staleAgent)
+    copyFileSync(lib.sessionPointerPath(owner), lib.sessionPointerPath(session))
+    assert.equal(lib.sessionAgentOf(session), undefined, `fixture (${approveAs}): the mismatched record was honoured`)
+    const harness = makeContext(dir)
+    const cleanup = await plugin.setup(harness.ctx)
+    try {
+      // The approval a person runs: /office <name>, in this session.
+      const officeConnect = harness.tools.find((tool) => tool.name === "office_connect")
+      const started = await officeConnect.execute({ agent_name: approveAs }, { sessionID: session })
+      const authorizeUrl = String(started.content).match(/^(http\S+\/oauth\/authorize\?\S+)$/m)?.[1]
+      assert.ok(authorizeUrl, String(started.content))
+      await fetch(authorizeUrl, { redirect: "follow" })
+      // The approval's own adoption writes the record; the reload after it is
+      // the observable that the write has happened.
+      await until(() => harness.servers.get("office")?.headers["X-Office-Session-Agent"] === approveAs, `the ${approveAs} approval's registration`)
+      // The stored record, not the in-process flag: this is what the next start
+      // reads, and the skip left the refused one there.
+      const stored = JSON.parse(readFileSync(lib.sessionPointerPath(session), "utf8"))
+      assert.deepEqual({ agent: stored.agent, session: stored.session }, { agent: approveAs, session }, `a re-approval as ${approveAs} left the refused record in place`)
+      assert.equal(loadAgentPointer(lib.sessionPointerPath(session)), approveAs, `the stored record does not name ${approveAs}`)
+      const next = refused(() => lib.sessionAgentOf(session))
+      assert.equal(next.result, approveAs, `a load after the re-approval does not return ${approveAs}`)
+    } finally {
+      office.state.agent = { slug: "opencode", name: "OpenCode" }
+      await cleanup()
+      await drained()
+    }
+  }
+})
+
+// ao-opencode#41 (bruno): a `session` field that is present but not a string was
+// read as "no field" and honoured for every session, so "fail closed" was false.
+// The refusal is a mismatch like any other, and the value it logs is quoted: a
+// planted string with a newline in it must not be able to forge a log line.
+test("a session field of the wrong type is refused, and the warning is JSON-quoted", () => {
+  const values: unknown[] = [null, 123, [], {}, true, "other\nforged line"]
+  values.forEach((value, index) => {
+    const id = `session-wrong-type-${index}`
+    mkdirSync(dirname(lib.sessionPointerPath(id)), { recursive: true })
+    writeFileSync(lib.sessionPointerPath(id), JSON.stringify({ agent: "host", session: value }, null, 2) + "\n", { mode: 0o600 })
+    const { result, warnings: seen } = refused(() => lib.sessionAgentOf(id))
+    assert.equal(result, undefined, `a session field of ${JSON.stringify(value)} honoured the record`)
+    const mismatch = seen.filter((warning) => warning.includes("ignoring it"))
+    assert.equal(mismatch.length, 1, `the refusal of ${JSON.stringify(value)} was not reported once: ${seen.join(" | ")}`)
+    assert.ok(mismatch[0].includes(JSON.stringify(value)), `the warning does not quote the value it refused: ${mismatch[0]}`)
+    assert.ok(!/[\r\n]/.test(mismatch[0]), `a planted value forged a line in the warning: ${JSON.stringify(mismatch[0])}`)
+    // Once per pair, and the repeat read is still refused.
+    const again = refused(() => lib.sessionAgentOf(id))
+    assert.equal(again.result, undefined, `a repeat read honoured ${JSON.stringify(value)}`)
+    assert.deepEqual(again.warnings, [], `the same pair warned again: ${again.warnings.join(" | ")}`)
+  })
+})
