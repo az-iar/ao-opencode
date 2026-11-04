@@ -869,3 +869,10 @@ export function sameRepo(directory: string, wanted: string): boolean {
   if (mine === "") return true
   return mine === wanted.trim().toLowerCase().replace(/\.git$/, "")
 }
+
+// needsCheckin answers whether dispatch must check in before writing a pointer:
+// this process has no agent of its own and is not running on a credentials
+// override, whose token is the identity and needs no pointer (agent-office#557).
+export function needsCheckin(override: boolean, agent: string | undefined): boolean {
+  return !override && !agent
+}

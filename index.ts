@@ -81,6 +81,7 @@ import {
   tokenRequest,
   workspaceKey,
   dispatchTarget,
+  needsCheckin,
   repoTitle,
   sameRepo,
   scratchTaskDir,
@@ -829,7 +830,7 @@ export default Plugin.define({
     // instead of refusing: blocking the dispatch is worse than a slow one, and the
     // identity is what the pointer is written from (agent-office#557).
     const ensureIdentity = async () => {
-      if (usingCredentialsOverride || ownAgent?.slug) return
+      if (!needsCheckin(usingCredentialsOverride, ownAgent?.slug)) return
       if (!(await ownedBearer())) return
       const me = await checkin()
       adoptAgent(me.agent?.slug)
