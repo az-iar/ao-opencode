@@ -530,11 +530,14 @@ function checkout(root: string, name: string, remote: string) {
   return path
 }
 
-// A fake hc that records the argv it is given and reports no live terminals.
+// A fake hc that records the argv it is given, reports no live terminals, and
+// says any terminal a lock asks about is finished: a dispatch test that leaves its
+// lock behind would otherwise fill the two-task cap for every later test in this
+// file. The lock is freed by the next acquire, not by this test.
 function recordingHc() {
   const bin = join(mkdtempSync(join(tmpdir(), "ao-hc-")), "hc")
   const log = `${bin}.log`
-  writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n[ "$1" = ls ] && echo '{"terminals":[]}'\nexit 0\n`, { mode: 0o755 })
+  writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n[ "$1" = ls ] && echo '{"terminals":[]}'\n[ "$1" = get ] && echo '{"state":"finished"}'\nexit 0\n`, { mode: 0o755 })
   return { bin, log }
 }
 
@@ -547,9 +550,12 @@ test("a task naming another local checkout is dispatched in that checkout's work
   const other = checkout(root, "agent-office", "https://github.com/az-iar/agent-office.git")
   const hc = recordingHc()
   process.env.AGENT_OFFICE_HC_BIN = hc.bin
+  // cleanup runs in finally: a poller left alive by a failed assertion keeps its
+  // dispatch lock, and this file shares one agent state.
+  let cleanup: (() => Promise<void>) | undefined
   try {
     const worker = makeContext(session, { pollInterval: 1_000 })
-    const cleanup = await plugin.setup(worker.ctx)
+    cleanup = await plugin.setup(worker.ctx)
     await until(() => mcpCalls().length > 0, "the baseline poll")
     worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
     await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
@@ -568,8 +574,9 @@ test("a task naming another local checkout is dispatched in that checkout's work
       join(other, ".git"),
     )
     assert.equal(execFileSync("git", ["-C", worktree, "branch", "--show-current"], { encoding: "utf8" }).trim(), `office/${short}`)
-    await cleanup()
   } finally {
+    await cleanup?.()
+    office.state.openTasks = office.state.openTasks.filter((task) => task.id !== "task-other")
     delete process.env.AGENT_OFFICE_HC_BIN
     office.calls.length = 0
   }
@@ -581,9 +588,12 @@ test("a task naming a repo with no local checkout is refused, naming the repo", 
   const session = checkout(root, "ao-opencode", "git@github.com:az-iar/ao-opencode.git")
   const hc = recordingHc()
   process.env.AGENT_OFFICE_HC_BIN = hc.bin
+  // cleanup runs in finally: a poller left alive by a failed assertion keeps its
+  // dispatch lock, and this file shares one agent state.
+  let cleanup: (() => Promise<void>) | undefined
   try {
     const worker = makeContext(session, { pollInterval: 1_000 })
-    const cleanup = await plugin.setup(worker.ctx)
+    cleanup = await plugin.setup(worker.ctx)
     await until(() => mcpCalls().length > 0, "the baseline poll")
     worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
     await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
@@ -594,8 +604,9 @@ test("a task naming a repo with no local checkout is refused, naming the repo", 
     // Not silently dispatched in the session's checkout either.
     const launched = existsSync(hc.log) ? readFileSync(hc.log, "utf8") : ""
     assert.doesNotMatch(launched, /^run /m, launched)
-    await cleanup()
   } finally {
+    await cleanup?.()
+    office.state.openTasks = office.state.openTasks.filter((task) => task.id !== "task-none")
     delete process.env.AGENT_OFFICE_HC_BIN
     office.calls.length = 0
   }
@@ -609,22 +620,26 @@ test("a task naming a repo with two local checkouts is refused, naming both", as
   checkout(root, "agent-office-b", "https://github.com/az-iar/agent-office.git")
   const hc = recordingHc()
   process.env.AGENT_OFFICE_HC_BIN = hc.bin
+  // cleanup runs in finally: a poller left alive by a failed assertion keeps its
+  // dispatch lock, and this file shares one agent state.
+  let cleanup: (() => Promise<void>) | undefined
   try {
     const worker = makeContext(session, { pollInterval: 1_000 })
-    const cleanup = await plugin.setup(worker.ctx)
+    cleanup = await plugin.setup(worker.ctx)
     await until(() => mcpCalls().length > 0, "the baseline poll")
     worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
     await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
-    office.state.openTasks = [...office.state.openTasks, { id: "task-two", title: "Fix it", status: "todo", repo: "az-iar/agent-office" }]
-    await until(() => taskUpdates("task-two").some((args) => args.status === "blocked"), "the refusal")
-    const reason = String(taskUpdates("task-two").find((args) => args.status === "blocked")?.reason ?? "")
+    office.state.openTasks = [...office.state.openTasks, { id: "task-two-checkouts", title: "Fix it", status: "todo", repo: "az-iar/agent-office" }]
+    await until(() => taskUpdates("task-two-checkouts").some((args) => args.status === "blocked"), "the refusal")
+    const reason = String(taskUpdates("task-two-checkouts").find((args) => args.status === "blocked")?.reason ?? "")
     assert.match(reason, /2 checkouts of az-iar\/agent-office/)
     assert.match(reason, /agent-office-a/)
     assert.match(reason, /agent-office-b/)
     const launched = existsSync(hc.log) ? readFileSync(hc.log, "utf8") : ""
     assert.doesNotMatch(launched, /^run /m, launched)
-    await cleanup()
   } finally {
+    await cleanup?.()
+    office.state.openTasks = office.state.openTasks.filter((task) => task.id !== "task-two-checkouts")
     delete process.env.AGENT_OFFICE_HC_BIN
     office.calls.length = 0
   }
