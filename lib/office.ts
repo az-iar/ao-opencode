@@ -7,7 +7,7 @@
 
 import { spawn, spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { renameSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { basename, dirname, join, resolve, sep } from "node:path"
 
@@ -90,7 +90,44 @@ export function agentPointerPath(directory: string): string {
 // pointer only pre-fills an approval. A child session has its own id and no
 // file here, so it cannot speak as the agent its host was approved as.
 export function sessionPointerPath(sessionID: string): string {
+  // One directory per HOST, not per runtime (agent-office#560): a session id is
+  // globally unique and the identity travels with the session, so the three
+  // plugins agree on who a session is.
+  return join(dirname(CREDENTIALS_DIR), "sessions", `${workspaceKey(sessionID)}.json`)
+}
+
+// saveSessionAgent writes an approval into the host-wide directory atomically (temp
+// plus rename): three plugins can write it concurrently, and a half-written record
+// would read as "no identity" for a session that has one (agent-office#560).
+export function saveSessionAgent(sessionID: string, slug: string) {
+  const path = sessionPointerPath(sessionID)
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+  const tmp = `${path}.${process.pid}.tmp`
+  writeFileSync(tmp, JSON.stringify({ agent: slug, runtime: "opencode", at: Date.now() }, null, 2) + "\n", { mode: 0o600 })
+  renameSync(tmp, path)
+}
+
+// Where the previous version kept it, read once so a live session keeps its
+// identity across the move, and copied forward by the writer below.
+export function legacySessionPointerPath(sessionID: string): string {
   return join(CREDENTIALS_DIR, "sessions", `${workspaceKey(sessionID)}.json`)
+}
+
+// sessionAgentOf reads a session's agent: the host-wide record, else the legacy one
+// copied forward. The pointer is never consulted here - only an approval is.
+export function sessionAgentOf(sessionID: string | undefined): string | undefined {
+  if (!sessionID) return undefined
+  const current = readAgentPointer(sessionPointerPath(sessionID))?.agent
+  if (current) return current
+  const legacy = readAgentPointer(legacySessionPointerPath(sessionID))?.agent
+  if (legacy) {
+    try {
+      saveSessionAgent(sessionID, legacy)
+    } catch {
+      // Read-only state is fine: the identity is still returned.
+    }
+  }
+  return legacy
 }
 
 // A pointer written on purpose: `/office` in that workspace, or a dispatcher

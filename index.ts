@@ -47,6 +47,8 @@ import {
   agentPointerVia,
   agentStateDir,
   loadAgentPointer,
+  saveSessionAgent,
+  sessionAgentOf,
   loadCredentials,
   blockTask,
   CREDENTIALS_OVERRIDE,
@@ -420,7 +422,7 @@ export default Plugin.define({
     // wrote there for this worker). A `/office` mark is not a grant: that
     // approval is recorded against the session that ran it.
     let owns = false
-    const sessionAgent = (id: string | undefined) => (id ? loadAgentPointer(sessionPointerPath(id)) : undefined)
+    const sessionAgent = (id: string | undefined) => sessionAgentOf(id)
     const tokenGranted = () => Boolean(process.env.AGENT_OFFICE_TOKEN) && process.env.AGENT_OFFICE_CHILD !== "1"
     const dispatchGranted = () => Boolean(resolved.worktree && agentPointerVia(pointerFile) === "dispatch")
     const granted = () => tokenGranted() || usingCredentialsOverride || dispatchGranted()
@@ -434,7 +436,7 @@ export default Plugin.define({
       if (usingCredentialsOverride || tokenGranted()) return
       const id = approvedSessionID ?? ownedSessionID
       if (!id || loadAgentPointer(sessionPointerPath(id)) === slug) return
-      saveAgentPointer(sessionPointerPath(id), slug)
+      saveSessionAgent(id, slug)
     }
     // `via` is the mark a linked worktree's pointer needs to count: "office"
     // for a `/office` here. A plain poll passes none and, in a worktree, writes
@@ -1133,7 +1135,7 @@ export default Plugin.define({
       let agent = sessionAgent(sessionID)
       if (!agent && legacyAgent && sessionID === legacySessionID) {
         // The grandfather, recorded once and against this id alone.
-        saveAgentPointer(sessionPointerPath(sessionID), legacyAgent)
+        saveSessionAgent(sessionID, legacyAgent)
         agent = legacyAgent
       }
       if (!agent) return
