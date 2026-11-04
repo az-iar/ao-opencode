@@ -821,15 +821,20 @@ export default Plugin.define({
     // first prompt, so there is no supervisor and no worker subagent.
     // dispatchScratch runs a repo-less task in a directory that is not a git
     // checkout: no branch, no worktree, and a prompt that says so (agent-office#556).
+    // requireIdentity refuses to launch a worker that could not post: ownAgent is
+    // only set by a checkin, so a dispatch before one would write no pointer and
+    // hand the worker a prompt telling it to post_comment with no agent to do it
+    // as. Under a credentials override there is no pointer to write, so the
+    // worktree and scratch paths both proceed (neo, ao-opencode#32).
+    const requireIdentity = (id: string, dir: string) => {
+      if (usingCredentialsOverride || ownAgent?.slug) return
+      throw new Error(`cannot dispatch task ${id} into ${dir}: this session has no Office agent yet, so the worker would have no identity to post with`)
+    }
+
     const dispatchScratch = async (id: string, task: any, dir: string, parent: string) => {
       // The scratch dir needs the same Office identity the worktree path gives its
       // worker: the prompt tells the worker to post_comment and set the task
       // blocked, and without a pointer there is no agent to do it as (neo, #32).
-      // A missing identity is loud rather than a silent no-op: launching a worker
-      // that cannot post is worse than not launching it.
-      if (!usingCredentialsOverride && !ownAgent?.slug) {
-        throw new Error(`cannot dispatch task ${id} into ${dir}: this session has no Office agent yet, so the worker would have no identity to post with`)
-      }
       adoptWorktree(dir, usingCredentialsOverride ? undefined : ownAgent?.slug)
       const name = `office-${taskShort(id)}-${randomBytes(2).toString("hex")}`
       const started = await run(
