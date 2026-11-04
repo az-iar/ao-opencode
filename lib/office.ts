@@ -124,17 +124,22 @@ export function sessionAgentOf(sessionID: string | undefined): string | undefine
   if (!legacy) return undefined
   try {
     saveSessionAgent(sessionID, legacy)
+  } catch (err) {
+    const code = (err as { code?: string }).code
+    if (code !== "EROFS" && code !== "EACCES") {
+      console.warn(`[agent-office] could not copy session ${sessionID}'s legacy approval forward: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    return legacy
+  }
+  try {
     // One-way: deleting the new record is the only revoke, so the old file must
     // not survive the copy or the next load resurrects the agent (bruno's must-fix
     // on ao-claude#14, the same pattern here).
     unlinkSync(legacyPath)
   } catch (err) {
-    const code = (err as { code?: string }).code
-    if (code !== "EROFS" && code !== "EACCES") {
-      // Read-only state is expected; any other failure means the migration will
-      // never complete, which is worth a line.
-      console.warn(`[agent-office] could not retire session ${sessionID}'s legacy approval: ${err instanceof Error ? err.message : String(err)}`)
-    }
+    // A copy that worked and a retire that did not leaves the zombie identity
+    // behind, so this is never benign - warn whatever the reason (neo on #35).
+    console.warn(`[agent-office] could not retire session ${sessionID}'s legacy approval: ${err instanceof Error ? err.message : String(err)}`)
   }
   return legacy
 }
