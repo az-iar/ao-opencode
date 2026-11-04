@@ -81,6 +81,7 @@ import {
   tokenRequest,
   workspaceKey,
   dispatchTarget,
+  needsCheckin,
   repoTitle,
   sameRepo,
   scratchTaskDir,
@@ -823,10 +824,36 @@ export default Plugin.define({
     // first prompt, so there is no supervisor and no worker subagent.
     // dispatchScratch runs a repo-less task in a directory that is not a git
     // checkout: no branch, no worktree, and a prompt that says so (agent-office#556).
+    // Dispatch can run before any checkin (the poll and a wake both reach here
+    // first), and ownAgent is only set by a checkin - so a worker would launch with
+    // no pointer, unable to post_comment or block its task. Check in on demand
+    // instead of refusing: blocking the dispatch is worse than a slow one, and the
+    // identity is what the pointer is written from (agent-office#557).
+    const ensureIdentity = async () => {
+      if (!needsCheckin(usingCredentialsOverride, ownAgent?.slug)) return
+      if (!(await ownedBearer())) {
+        // No bearer means no identity to fetch: as audible as a failed checkin, and
+        // it does not fail the dispatch either (neo on #33).
+        warn("dispatching with no Office bearer: the worker will have no identity")
+        return
+      }
+      // A failed checkin must not kill the dispatch: the pointer is missing either
+      // way, and blocking the launch is worse than a worker with no identity -
+      // which is the whole point of not refusing here (neo on #33).
+      try {
+        const me = await checkin()
+        adoptAgent(me.agent?.slug)
+        ownAgent = me.agent
+      } catch (err) {
+        warn("could not check in before dispatching", { error: String(err) })
+      }
+    }
+
     const dispatchScratch = async (id: string, task: any, dir: string, parent: string) => {
       // The scratch dir needs the same Office identity the worktree path gives its
       // worker: the prompt tells the worker to post_comment and set the task
       // blocked, and without a pointer there is no agent to do it as (neo, #32).
+      await ensureIdentity()
       adoptWorktree(dir, usingCredentialsOverride ? undefined : ownAgent?.slug)
       const name = `office-${taskShort(id)}-${randomBytes(2).toString("hex")}`
       const started = await run(
@@ -865,6 +892,7 @@ export default Plugin.define({
       // dispatch so the worktree keeps it. Under the credentials override
       // nothing is adopted: an hc worker cannot inherit that variable, so a
       // pointer here would name an identity the worker cannot use.
+      await ensureIdentity()
       adoptWorktree(path, usingCredentialsOverride ? undefined : ownAgent?.slug)
       // Names must be unique among live terminals: a retry while the first
       // child still runs would otherwise fail the launch.
