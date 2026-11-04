@@ -7,7 +7,7 @@
 
 import { spawn, spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { renameSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { chmodSync, renameSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { basename, dirname, join, resolve, sep } from "node:path"
 
@@ -96,14 +96,40 @@ export function sessionPointerPath(sessionID: string): string {
   return join(dirname(CREDENTIALS_DIR), "sessions", `${workspaceKey(sessionID)}.json`)
 }
 
+// ensurePrivateDir makes the record's directory private whether it is new or older:
+// mkdirSync's mode applies only to a directory it creates, so a sessions/ that
+// already exists under a permissive umask stays readable by anyone who can read its
+// parent (bruno on ao-pi#39, ao-pi#40). A failure to tighten is reported, not
+// thrown: the save that follows is the operation that matters.
+//
+// The test is for group and other access, not for anything but 0700: a directory
+// someone made deliberately private (0500, say) keeps its bits, and only one that
+// leaks stays changed. Forcing 0700 on inequality would also create a directory
+// that is readable and writable where it was not, and sessionAgentOf's EACCES
+// fallback - a read-only approvals directory still answering from the legacy
+// record - would start succeeding instead (the regression ao-pi#42 fixed).
+function ensurePrivateDir(dir: string) {
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  try {
+    if ((statSync(dir).mode & 0o077) !== 0) chmodSync(dir, 0o700)
+  } catch (err) {
+    console.warn(`[agent-office] could not tighten ${dir} to 0700: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
 // saveSessionAgent writes an approval into the host-wide directory atomically (temp
 // plus rename): three plugins can write it concurrently, and a half-written record
 // would read as "no identity" for a session that has one (agent-office#560).
+// `runtime` is the one that last wrote the record, not the one that approved the
+// session: a re-approval by another plugin overwrites it (ao-pi#40).
+// `session` is the id itself: the file is named sha256(id)[:16], so the name cannot
+// be read back and a record that did not name its own session could not be checked
+// against the session it approves (ao-pi#40).
 export function saveSessionAgent(sessionID: string, slug: string) {
   const path = sessionPointerPath(sessionID)
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+  ensurePrivateDir(dirname(path))
   const tmp = `${path}.${process.pid}.tmp`
-  writeFileSync(tmp, JSON.stringify({ agent: slug, runtime: "opencode", at: Date.now() }, null, 2) + "\n", { mode: 0o600 })
+  writeFileSync(tmp, JSON.stringify({ agent: slug, session: sessionID, runtime: "opencode", at: Date.now() }, null, 2) + "\n", { mode: 0o600 })
   renameSync(tmp, path)
 }
 
