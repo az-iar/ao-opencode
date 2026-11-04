@@ -832,9 +832,16 @@ export default Plugin.define({
     const ensureIdentity = async () => {
       if (!needsCheckin(usingCredentialsOverride, ownAgent?.slug)) return
       if (!(await ownedBearer())) return
-      const me = await checkin()
-      adoptAgent(me.agent?.slug)
-      ownAgent = me.agent
+      // A failed checkin must not kill the dispatch: the pointer is missing either
+      // way, and blocking the launch is worse than a worker with no identity -
+      // which is the whole point of not refusing here (neo on #33).
+      try {
+        const me = await checkin()
+        adoptAgent(me.agent?.slug)
+        ownAgent = me.agent
+      } catch (err) {
+        warn("could not check in before dispatching", { error: String(err) })
+      }
     }
 
     const dispatchScratch = async (id: string, task: any, dir: string, parent: string) => {

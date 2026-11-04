@@ -168,7 +168,6 @@ let plugin: any
 let credentialsPath: (directory: string, canonical?: string, override?: string, scope?: string) => string
 let agentCredentialsPath: (slug: string) => string
 let agentPointerPath: (directory: string) => string
-let workspacePointerPath: (directory: string) => string
 let harness: ReturnType<typeof makeContext>
 let cleanupFirst: (() => Promise<void>) | undefined
 const warnings: string[] = []
@@ -182,7 +181,6 @@ before(async () => {
   credentialsPath = deriveCredentials
   agentCredentialsPath = deriveAgentCredentials
   agentPointerPath = deriveAgentPointer
-  workspacePointerPath = (await import("../lib/office.ts")).workspacePointerPath
   harness = makeContext()
   cleanupFirst = await plugin.setup(harness.ctx)
 })
