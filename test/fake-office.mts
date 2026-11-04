@@ -6,7 +6,17 @@ export type Call = { method: string; path: string; auth?: string; headers?: Reco
 
 export function fakeOffice() {
   const calls: Call[] = []
+  // Requests the Office is still answering. `idle()` resolves when none is, which
+  // is the fact a test's finally can wait on: a request a plugin left in flight
+  // after its cleanup() is answered before the log is cleared, so it cannot be
+  // counted by the test that runs next. A count, never a quiet period.
+  let inFlight = 0
+  let answered: (() => void)[] = []
   const state = {
+    // The access token the token endpoint issues. A test pins its own, so the
+    // calls the approving plugin makes are attributable to that test and no
+    // other test's are.
+    issuedToken: undefined as string | undefined,
     workStatus: "working",
     // Who this Office says the caller is; a test sets another agent.
     agent: { slug: "opencode", name: "OpenCode" },
@@ -28,6 +38,13 @@ export function fakeOffice() {
     ],
   }
   const server: Server = createServer(async (req, res) => {
+    inFlight++
+    // 'close' fires when the response is finished or the client goes away, so
+    // this is "this request is done", not "the handler returned".
+    res.on("close", () => {
+      if (--inFlight > 0) return
+      for (const done of answered.splice(0)) done()
+    })
     const chunks: Buffer[] = []
     for await (const chunk of req) chunks.push(chunk as Buffer)
     const raw = Buffer.concat(chunks).toString()
@@ -39,6 +56,9 @@ export function fakeOffice() {
     const body = req.headers["content-type"]?.includes("json") ? JSON.parse(raw || "{}") : Object.fromEntries(new URLSearchParams(raw))
     // `headers` keeps what a test needs to assert about the identity headers
     // GH-476 added; `auth` stays as it was for the tests that read only that.
+    // `auth` is recorded on every call, including the ones that carried no
+    // Authorization header at all (undefined), so a test can tell a call made
+    // without a token from one made with another test's.
     calls.push({
       method: req.method ?? "",
       path: url.pathname,
@@ -58,7 +78,7 @@ export function fakeOffice() {
     }
     if (url.pathname === "/oauth/token") {
       state.tokens++
-      return json(200, { access_token: `access-${state.tokens}`, refresh_token: `refresh-${state.tokens}`, expires_in: 3600, token_type: "Bearer", scope: "office:read office:write office:events" })
+      return json(200, { access_token: state.issuedToken ?? `access-${state.tokens}`, refresh_token: `refresh-${state.tokens}`, expires_in: 3600, token_type: "Bearer", scope: "office:read office:write office:events" })
     }
     if (url.pathname === "/mcp") {
       if (!req.headers.authorization?.startsWith("Bearer ")) return json(401, { error: "unauthorized" })
@@ -94,8 +114,16 @@ export function fakeOffice() {
   })
   return {
     calls,
+    // The calls that arrived with `token`'s bearer, in arrival order: the
+    // attribution a test asserts on. A straggler from an earlier test stays in
+    // `calls` under that test's token instead of being dropped.
+    byToken: (token: string) => calls.filter((c) => c.auth === `Bearer ${token}`),
     state,
     listen: () => new Promise<string>((r) => server.listen(0, "127.0.0.1", () => r(`http://127.0.0.1:${(server.address() as { port: number }).port}`))),
+    // Resolves when this Office is answering nothing. Resolves at once when
+    // there is nothing in flight, so a caller that has none is not delayed.
+    idle: () => (inFlight === 0 ? Promise.resolve() : new Promise<void>((done) => answered.push(done))),
+    inFlight: () => inFlight,
     close: () => new Promise<void>((r) => (server.closeAllConnections(), server.close(() => r()))),
   }
 }
