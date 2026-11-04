@@ -782,7 +782,10 @@ test("a refused current-session record does not fall through to the legacy recor
     const id = `session-48-refused-${label}`
     const legacy = lib.legacySessionPointerPath(id)
     mkdirSync(dirname(legacy), { recursive: true })
-    writeFileSync(legacy, JSON.stringify({ agent: "legacy-agent" }, null, 2) + "\n", { mode: 0o600 })
+    // The legacy record names this session: a fall-through gated on the legacy
+    // record naming the requested session would never fire against a session-less
+    // fixture, and the gap would stay invisible.
+    writeFileSync(legacy, JSON.stringify({ agent: "legacy-agent", session: id }, null, 2) + "\n", { mode: 0o600 })
     const legacyBefore = readFileSync(legacy, "utf8")
     // This session's own record, refused because it does not name this session.
     const record = lib.sessionPointerPath(id)
@@ -790,7 +793,8 @@ test("a refused current-session record does not fall through to the legacy recor
     const recordBytes = JSON.stringify({ agent: "planted-agent", session: stored, runtime: "opencode", at: 1 }, null, 2) + "\n"
     writeFileSync(record, recordBytes, { mode: 0o600 })
 
-    assert.equal(lib.sessionAgentOf(id), undefined, `(${label}) a refused record fell through to the legacy record's agent`)
+    const { result } = refused(() => lib.sessionAgentOf(id))
+    assert.equal(result, undefined, `(${label}) a refused record fell through to the legacy record's agent`)
     // Not consulted means not promoted and not retired: the legacy file is still
     // there, byte for byte, and the shared directory holds only what was planted.
     assert.equal(existsSync(legacy), true, `(${label}) the legacy record was retired for a session whose record was refused`)
