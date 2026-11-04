@@ -11,7 +11,7 @@
 // failing there (the child instance checks in from the folder pointer).
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { after, test } from "node:test"
@@ -559,4 +559,208 @@ test("a read-only sessions directory still answers from the legacy record and wr
   } finally {
     chmodSync(dir, 0o700)
   }
+})
+
+// ao-opencode#40: the record carries the id it approves, and the reader compares
+// it. Without the comparison a record copied to another session's filename is
+// indistinguishable from a real approval - the file is sha256(id)[:16], so the
+// name cannot be read back - and the reader learns the agent of a session that
+// never approved anything.
+const refused = (run: () => unknown) => {
+  const original = console.warn
+  const seen: string[] = []
+  console.warn = (...args: unknown[]) => void seen.push(args.map(String).join(" "))
+  try {
+    return { result: run(), warnings: seen }
+  } finally {
+    console.warn = original
+  }
+}
+
+test("a record naming another session is refused, not honoured", () => {
+  const owner = "session-owner-copy"
+  const copier = "session-copier-copy"
+  lib.saveSessionAgent(owner, "host")
+  copyFileSync(lib.sessionPointerPath(owner), lib.sessionPointerPath(copier))
+  const { result, warnings: seen } = refused(() => lib.sessionAgentOf(copier))
+  assert.equal(result, undefined, "a record naming another session handed that session its agent")
+  const mismatch = seen.filter((warning) => warning.includes("ignoring it"))
+  assert.equal(mismatch.length, 1, `the refusal was not reported once: ${seen.join(" | ")}`)
+  assert.ok(mismatch[0].includes(copier), `the warning does not name the session it was fetched by: ${mismatch[0]}`)
+  assert.ok(mismatch[0].includes(owner), `the warning does not name the session the record belongs to: ${mismatch[0]}`)
+  // The poll repeats this read on a timer, so the pair is reported once and the
+  // second read is silent but still refused.
+  const again = refused(() => [lib.sessionAgentOf(copier), lib.sessionAgentOf(copier)])
+  assert.deepEqual(again.result, [undefined, undefined], "a repeat read honoured the mismatched record")
+  assert.deepEqual(again.warnings, [], `the same pair warned again on a repeat read: ${again.warnings.join(" | ")}`)
+})
+
+test("a record with no session field is still honoured, and no mismatch is warned about", () => {
+  const id = "session-no-field"
+  // The shape of every record written before the field was read: refusing it
+  // would revoke every session on upgrade.
+  mkdirSync(dirname(lib.sessionPointerPath(id)), { recursive: true })
+  writeFileSync(lib.sessionPointerPath(id), JSON.stringify({ agent: "host" }, null, 2) + "\n", { mode: 0o600 })
+  const { result, warnings: seen } = refused(() => lib.sessionAgentOf(id))
+  assert.equal(result, "host", "a record written before this change was refused on upgrade")
+  assert.deepEqual(seen, [], `a record with no session field was warned about: ${seen.join(" | ")}`)
+})
+
+test("the record written for its own session still resolves", () => {
+  const id = "session-own-record"
+  lib.saveSessionAgent(id, "host")
+  assert.equal(JSON.parse(readFileSync(lib.sessionPointerPath(id), "utf8")).session, id, "fixture: the record does not name its own session")
+  const { result, warnings: seen } = refused(() => lib.sessionAgentOf(id))
+  assert.equal(result, "host", "the record written for its own session was refused")
+  assert.deepEqual(seen, [], `the record's own session was warned about: ${seen.join(" | ")}`)
+})
+
+test("a mismatched legacy record is not copied forward", () => {
+  const owner = "session-owner-legacy"
+  const copier = "session-copier-legacy"
+  lib.saveSessionAgent(owner, "host")
+  const legacy = lib.legacySessionPointerPath(copier)
+  mkdirSync(dirname(legacy), { recursive: true })
+  copyFileSync(lib.sessionPointerPath(owner), legacy)
+  const before = readFileSync(legacy, "utf8")
+  const { result, warnings: seen } = refused(() => lib.sessionAgentOf(copier))
+  assert.equal(result, undefined, "a legacy record naming another session granted it that agent")
+  // Promoting it would make the stale file the record every later read sees.
+  assert.equal(existsSync(lib.sessionPointerPath(copier)), false, "a mismatched legacy record was copied forward into the shared directory")
+  assert.equal(readFileSync(legacy, "utf8"), before, "the refused legacy record was rewritten")
+  assert.ok(
+    seen.some((warning) => warning.includes("ignoring it") && warning.includes(copier) && warning.includes(owner)),
+    `the refusal was not reported: ${seen.join(" | ")}`,
+  )
+})
+
+// ao-opencode#41 (bruno): rememberSessionApproval skipped the write when the
+// stored *agent* already matched, never looking at the session. A record refused
+// for this session (it names another session) therefore survived a re-approval
+// as the same agent: /office worked in the process, the next start refused the
+// session again, and only deleting the file ended the loop. Both directions are
+// covered - the same agent (the one the skip swallowed) and a different one.
+test("a re-approval after a refusal replaces the refused record instead of skipping the write", async () => {
+  for (const [approveAs, staleAgent] of [["host", "host"], ["other", "host"]] as const) {
+    const dir = repo()
+    const folder = testToken(`reapprove-folder-${approveAs}`)
+    const approved = testToken(`reapprove-${approveAs}`)
+    connect(dir, "host", folder)
+    office.state.issuedToken = approved
+    office.state.agent = { slug: approveAs, name: approveAs }
+    office.calls.length = 0
+    const session = `reapprove-session-${approveAs}`
+    const owner = `reapprove-owner-${approveAs}`
+    // A record written for another session: this session's read refuses it.
+    lib.saveSessionAgent(owner, staleAgent)
+    copyFileSync(lib.sessionPointerPath(owner), lib.sessionPointerPath(session))
+    assert.equal(lib.sessionAgentOf(session), undefined, `fixture (${approveAs}): the mismatched record was honoured`)
+    const harness = makeContext(dir)
+    const cleanup = await plugin.setup(harness.ctx)
+    try {
+      // The approval a person runs: /office <name>, in this session.
+      const officeConnect = harness.tools.find((tool) => tool.name === "office_connect")
+      const started = await officeConnect.execute({ agent_name: approveAs }, { sessionID: session })
+      const authorizeUrl = String(started.content).match(/^(http\S+\/oauth\/authorize\?\S+)$/m)?.[1]
+      assert.ok(authorizeUrl, String(started.content))
+      await fetch(authorizeUrl, { redirect: "follow" })
+      // The approval's own adoption writes the record; the reload after it is
+      // the observable that the write has happened.
+      await until(() => harness.servers.get("office")?.headers["X-Office-Session-Agent"] === approveAs, `the ${approveAs} approval's registration`)
+      // The stored record, not the in-process flag: this is what the next start
+      // reads, and the skip left the refused one there.
+      const stored = JSON.parse(readFileSync(lib.sessionPointerPath(session), "utf8"))
+      assert.deepEqual({ agent: stored.agent, session: stored.session }, { agent: approveAs, session }, `a re-approval as ${approveAs} left the refused record in place`)
+      assert.equal(loadAgentPointer(lib.sessionPointerPath(session)), approveAs, `the stored record does not name ${approveAs}`)
+      const next = refused(() => lib.sessionAgentOf(session))
+      assert.equal(next.result, approveAs, `a load after the re-approval does not return ${approveAs}`)
+    } finally {
+      office.state.agent = { slug: "opencode", name: "OpenCode" }
+      await cleanup()
+      await drained()
+    }
+  }
+})
+
+// ao-opencode#41 (bruno): a `session` field that is present but not a string was
+// read as "no field" and honoured for every session, so "fail closed" was false.
+// The refusal is a mismatch like any other, and the value it logs is quoted: a
+// planted string with a newline in it must not be able to forge a log line.
+test("a session field of the wrong type is refused, and the warning is JSON-quoted", () => {
+  const values: unknown[] = [null, 123, [], {}, true, "other\nforged line"]
+  values.forEach((value, index) => {
+    const id = `session-wrong-type-${index}`
+    mkdirSync(dirname(lib.sessionPointerPath(id)), { recursive: true })
+    writeFileSync(lib.sessionPointerPath(id), JSON.stringify({ agent: "host", session: value }, null, 2) + "\n", { mode: 0o600 })
+    const { result, warnings: seen } = refused(() => lib.sessionAgentOf(id))
+    assert.equal(result, undefined, `a session field of ${JSON.stringify(value)} honoured the record`)
+    const mismatch = seen.filter((warning) => warning.includes("ignoring it"))
+    assert.equal(mismatch.length, 1, `the refusal of ${JSON.stringify(value)} was not reported once: ${seen.join(" | ")}`)
+    assert.ok(mismatch[0].includes(JSON.stringify(value)), `the warning does not quote the value it refused: ${mismatch[0]}`)
+    assert.ok(!/[\r\n]/.test(mismatch[0]), `a planted value forged a line in the warning: ${JSON.stringify(mismatch[0])}`)
+    // Once per pair, and the repeat read is still refused.
+    const again = refused(() => lib.sessionAgentOf(id))
+    assert.equal(again.result, undefined, `a repeat read honoured ${JSON.stringify(value)}`)
+    assert.deepEqual(again.warnings, [], `the same pair warned again: ${again.warnings.join(" | ")}`)
+  })
+})
+
+// ao-opencode#41: the set of pairs already warned about was unbounded, and a
+// record whose `session` keeps changing is a new pair on every read, so a
+// long-lived poller held one string per pair it ever saw. 150 distinct pairs is
+// more than the cap, so a set that grew to 150 fails here; the count is the whole
+// of the surface the bound needs, because nothing else about the cap is visible
+// from outside. A test that repeated one pair would pass with no cap at all.
+const warnOnce = (what: string, value: string) => {
+  mkdirSync(dirname(lib.sessionPointerPath(what)), { recursive: true })
+  writeFileSync(lib.sessionPointerPath(what), JSON.stringify({ agent: "host", session: value }, null, 2) + "\n", { mode: 0o600 })
+}
+const mismatches = (seen: string[]) => seen.filter((warning) => warning.includes("ignoring it"))
+
+test("the warned pairs are bounded", () => {
+  const cap = 100
+  const sizes: number[] = []
+  let warned = 0
+  for (let i = 0; i < 150; i++) {
+    // A distinct (requested, stored) pair per read, through the path the poll
+    // takes: a record on disk that names another session.
+    const id = `bounded-session-${i}`
+    warnOnce(id, `bounded-owner-${i}`)
+    const { result, warnings: seen } = refused(() => lib.sessionAgentOf(id))
+    assert.equal(result, undefined, `pair ${i} honoured a record naming another session`)
+    warned += mismatches(seen).length
+    sizes.push(lib.refusedSessionPairCount())
+  }
+  // Every distinct pair is reported when it is first read, capped or not.
+  assert.equal(warned, 150, `the 150 distinct pairs did not each warn once: ${warned}`)
+  const largest = Math.max(...sizes)
+  assert.ok(largest <= cap, `the warned pairs set held ${largest} pairs, past the cap of ${cap}`)
+})
+
+// The consequence of clearing rather than evicting: a pair lost to the clear is
+// refused and warned about again, once, and then stays quiet - a fresh process
+// reading the same bad record. 101 distinct pairs overflow any starting state,
+// because a clear is what an add at the cap does.
+test("a pair that was cleared warns again once", () => {
+  const id = "cleared-session"
+  warnOnce(id, "cleared-owner")
+  const first = refused(() => lib.sessionAgentOf(id))
+  assert.equal(first.result, undefined, "fixture: a record naming another session was honoured")
+  assert.equal(mismatches(first.warnings).length, 1, `fixture: the pair was not warned about: ${first.warnings.join(" | ")}`)
+  const quiet = refused(() => lib.sessionAgentOf(id))
+  assert.deepEqual(quiet.warnings, [], `fixture: the same pair warned twice with no clear between: ${quiet.warnings.join(" | ")}`)
+
+  for (let i = 0; i < 101; i++) {
+    const other = `cleared-overflow-${i}`
+    warnOnce(other, `cleared-overflow-owner-${i}`)
+    refused(() => lib.sessionAgentOf(other))
+  }
+
+  // The cleared pair is still refused, so the clear costs a repeat of the
+  // warning and nothing else.
+  const again = refused(() => [lib.sessionAgentOf(id), lib.sessionAgentOf(id)])
+  assert.deepEqual(again.result, [undefined, undefined], "a cleared pair's record was honoured after the clear")
+  assert.equal(mismatches(again.warnings).length, 1, `a cleared pair did not warn exactly once after the clear: ${again.warnings.join(" | ")}`)
+  const silent = refused(() => lib.sessionAgentOf(id))
+  assert.deepEqual(silent.warnings, [], `the re-warned pair warned again on a repeat read: ${silent.warnings.join(" | ")}`)
 })

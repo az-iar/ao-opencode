@@ -120,11 +120,13 @@ function ensurePrivateDir(dir: string) {
 // saveSessionAgent writes an approval into the host-wide directory atomically (temp
 // plus rename): three plugins can write it concurrently, and a half-written record
 // would read as "no identity" for a session that has one (agent-office#560).
-// `runtime` is the one that last wrote the record, not the one that approved the
-// session: a re-approval by another plugin overwrites it (ao-pi#40).
-// `session` is the id itself, stored for audit only: the file is named sha256(id)[:16]
-// so the name cannot be read back, and this field is what tells a human reading the
-// record which session it belongs to. Nothing compares it on read (ao-opencode#39).
+// `runtime` is the writer, not the approver: it is the plugin that last wrote the
+// record, so a re-approval by another plugin overwrites it (ao-pi#40).
+// `session` is the id itself, and it is read: the file is named sha256(id)[:16], so
+// the name cannot be read back to the id it approves, and without this field a
+// record copied to another session's filename would hand its agent to a session
+// that never approved anything. sessionAgentOf compares it and ignores a record
+// that names a different session - #39 only wrote it, #40 reads it.
 export function saveSessionAgent(sessionID: string, slug: string) {
   const path = sessionPointerPath(sessionID)
   ensurePrivateDir(dirname(path))
@@ -139,15 +141,75 @@ export function legacySessionPointerPath(sessionID: string): string {
   return join(CREDENTIALS_DIR, "sessions", `${workspaceKey(sessionID)}.json`)
 }
 
+// The pairs already refused, so each one is reported once: the poll repeats the
+// same read on a timer, and a warning per tick is noise nobody reads. A record
+// whose `session` keeps changing is a new pair on every read, so the set is
+// capped: unbounded, a long-lived poller held one string per pair it ever saw
+// for the life of the process (ao-opencode#41).
+const REFUSED_SESSION_PAIRS_MAX = 100
+const refusedSessionPairs = new Set<string>()
+
+// How many pairs are held, so the cap above can be asserted from outside: the
+// set itself stays private, and this is the whole of the surface the bound needs.
+export function refusedSessionPairCount(): number {
+  return refusedSessionPairs.size
+}
+
+// sessionRecordNames enforces that a record names the session it was fetched by.
+// The id has to be stored because the filename is sha256(id)[:16]: a record copied
+// to another session's name is indistinguishable from the real one otherwise, and
+// honouring it teaches the reader the agent of a session that never approved
+// anything (ao-opencode#40). Refusal is fail-closed, and the warning is given once
+// per pair rather than per read.
+//
+// A record with no `session` field is honoured: that is the shape of every record
+// written before this change, and refusing them would revoke every session on
+// upgrade. Only a record that does not name this session is refused - another id,
+// or a value of the wrong type: a null or a number is a present field, not a
+// missing one, and honouring it would hand this session an agent its record
+// never named, whatever the field was meant to say. The value is logged through
+// JSON.stringify, so a planted string cannot end the line and forge one.
+function sessionRecordNames(record: { session?: unknown }, requested: string): boolean {
+  if (!("session" in record)) return true
+  const named = record.session
+  if (typeof named === "string" && named === requested) return true
+  const shown = JSON.stringify(named) ?? String(named)
+  const pair = `${requested}\u0000${shown}`
+  if (!refusedSessionPairs.has(pair)) {
+    // Cleared, not evicted: this set exists only to stop a warning on every poll
+    // tick, so after a clear a pair that is still bad warns once per cycle, which
+    // is what a fresh process does. Eviction order buys nothing here - the pair
+    // evicted is no more or less stale than the one that stays, and whichever
+    // order is chosen, a still-bad pair is back to one warning a cycle anyway.
+    if (refusedSessionPairs.size >= REFUSED_SESSION_PAIRS_MAX) refusedSessionPairs.clear()
+    refusedSessionPairs.add(pair)
+    console.warn('[agent-office] session record for ' + requested + ' names ' + shown + ': ignoring it')
+  }
+  return false
+}
+
 // sessionAgentOf reads a session's agent: the host-wide record, else the legacy one
-// copied forward. The pointer is never consulted here - only an approval is.
+// copied forward. The pointer is never consulted here - only an approval is. A
+// record that names another session is refused where it is read, and is not
+// copied forward from the legacy path either: promoting a stale file into the
+// shared directory would make it the record every later read sees (ao-opencode#40).
 export function sessionAgentOf(sessionID: string | undefined): string | undefined {
   if (!sessionID) return undefined
-  const current = readAgentPointer(sessionPointerPath(sessionID))?.agent
-  if (current) return current
+  const current = readAgentPointer(sessionPointerPath(sessionID))
+  if (current?.agent) {
+    if (!sessionRecordNames(current, sessionID)) return undefined
+    return current.agent
+  }
   const legacyPath = legacySessionPointerPath(sessionID)
-  const legacy = readAgentPointer(legacyPath)?.agent
-  if (!legacy) return undefined
+  const record = readAgentPointer(legacyPath)
+  if (!record?.agent) return undefined
+  if (!sessionRecordNames(record, sessionID)) return undefined
+  const legacy = record.agent
+  // What this promotion costs an auditor: the copy is byte-identical to an
+  // approval, `at` is the copy's time and nothing marks it inherited, so after
+  // it you cannot tell from the file whether a person approved this session or
+  // it inherited an approval made before #39. The legacy file is retired below,
+  // so even the second file does not survive to say so.
   try {
     saveSessionAgent(sessionID, legacy)
   } catch (err) {
@@ -175,12 +237,18 @@ export function sessionAgentOf(sessionID: string | undefined): string | undefine
 // fallback carries no mark, and names the main checkout's agent.
 export type AgentPointerVia = "office" | "dispatch"
 
-export function readAgentPointer(path: string): { agent: string; via?: AgentPointerVia } | undefined {
+// `session` is the record's session field as it was written, not a validated
+// string: readAgentPointer cannot decide whether a value is acceptable, and
+// dropping a wrong-typed one here is what made a null read as "no field" and
+// get honoured for every session (ao-opencode#41). Session reads compare it in
+// sessionRecordNames; a pointer record simply has no such field.
+export function readAgentPointer(path: string): { agent: string; via?: AgentPointerVia; session?: unknown } | undefined {
   try {
-    const value = JSON.parse(readFileSync(path, "utf8")) as { agent?: string; via?: string }
+    const value = JSON.parse(readFileSync(path, "utf8")) as { agent?: string; via?: string; session?: unknown }
     if (typeof value.agent !== "string") return undefined
     const via = value.via === "office" || value.via === "dispatch" ? value.via : undefined
-    return { agent: value.agent, via }
+    // Only a session record carries this; a folder pointer leaves it absent.
+    return "session" in value ? { agent: value.agent, via, session: value.session } : { agent: value.agent, via }
   } catch {
     return undefined
   }
