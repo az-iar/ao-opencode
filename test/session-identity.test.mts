@@ -11,7 +11,7 @@
 // failing there (the child instance checks in from the folder pointer).
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { after, test } from "node:test"
@@ -559,4 +559,77 @@ test("a read-only sessions directory still answers from the legacy record and wr
   } finally {
     chmodSync(dir, 0o700)
   }
+})
+
+// ao-opencode#40: the record carries the id it approves, and the reader compares
+// it. Without the comparison a record copied to another session's filename is
+// indistinguishable from a real approval - the file is sha256(id)[:16], so the
+// name cannot be read back - and the reader learns the agent of a session that
+// never approved anything.
+const refused = (run: () => unknown) => {
+  const original = console.warn
+  const seen: string[] = []
+  console.warn = (...args: unknown[]) => void seen.push(args.map(String).join(" "))
+  try {
+    return { result: run(), warnings: seen }
+  } finally {
+    console.warn = original
+  }
+}
+
+test("a record naming another session is refused, not honoured", () => {
+  const owner = "session-owner-copy"
+  const copier = "session-copier-copy"
+  lib.saveSessionAgent(owner, "host")
+  copyFileSync(lib.sessionPointerPath(owner), lib.sessionPointerPath(copier))
+  const { result, warnings: seen } = refused(() => lib.sessionAgentOf(copier))
+  assert.equal(result, undefined, "a record naming another session handed that session its agent")
+  const mismatch = seen.filter((warning) => warning.includes("ignoring it"))
+  assert.equal(mismatch.length, 1, `the refusal was not reported once: ${seen.join(" | ")}`)
+  assert.ok(mismatch[0].includes(copier), `the warning does not name the session it was fetched by: ${mismatch[0]}`)
+  assert.ok(mismatch[0].includes(owner), `the warning does not name the session the record belongs to: ${mismatch[0]}`)
+  // The poll repeats this read on a timer, so the pair is reported once and the
+  // second read is silent but still refused.
+  const again = refused(() => [lib.sessionAgentOf(copier), lib.sessionAgentOf(copier)])
+  assert.deepEqual(again.result, [undefined, undefined], "a repeat read honoured the mismatched record")
+  assert.deepEqual(again.warnings, [], `the same pair warned again on a repeat read: ${again.warnings.join(" | ")}`)
+})
+
+test("a record with no session field is still honoured, and no mismatch is warned about", () => {
+  const id = "session-no-field"
+  // The shape of every record written before the field was read: refusing it
+  // would revoke every session on upgrade.
+  mkdirSync(dirname(lib.sessionPointerPath(id)), { recursive: true })
+  writeFileSync(lib.sessionPointerPath(id), JSON.stringify({ agent: "host" }, null, 2) + "\n", { mode: 0o600 })
+  const { result, warnings: seen } = refused(() => lib.sessionAgentOf(id))
+  assert.equal(result, "host", "a record written before this change was refused on upgrade")
+  assert.deepEqual(seen, [], `a record with no session field was warned about: ${seen.join(" | ")}`)
+})
+
+test("the record written for its own session still resolves", () => {
+  const id = "session-own-record"
+  lib.saveSessionAgent(id, "host")
+  assert.equal(JSON.parse(readFileSync(lib.sessionPointerPath(id), "utf8")).session, id, "fixture: the record does not name its own session")
+  const { result, warnings: seen } = refused(() => lib.sessionAgentOf(id))
+  assert.equal(result, "host", "the record written for its own session was refused")
+  assert.deepEqual(seen, [], `the record's own session was warned about: ${seen.join(" | ")}`)
+})
+
+test("a mismatched legacy record is not copied forward", () => {
+  const owner = "session-owner-legacy"
+  const copier = "session-copier-legacy"
+  lib.saveSessionAgent(owner, "host")
+  const legacy = lib.legacySessionPointerPath(copier)
+  mkdirSync(dirname(legacy), { recursive: true })
+  copyFileSync(lib.sessionPointerPath(owner), legacy)
+  const before = readFileSync(legacy, "utf8")
+  const { result, warnings: seen } = refused(() => lib.sessionAgentOf(copier))
+  assert.equal(result, undefined, "a legacy record naming another session granted it that agent")
+  // Promoting it would make the stale file the record every later read sees.
+  assert.equal(existsSync(lib.sessionPointerPath(copier)), false, "a mismatched legacy record was copied forward into the shared directory")
+  assert.equal(readFileSync(legacy, "utf8"), before, "the refused legacy record was rewritten")
+  assert.ok(
+    seen.some((warning) => warning.includes("ignoring it") && warning.includes(copier) && warning.includes(owner)),
+    `the refusal was not reported: ${seen.join(" | ")}`,
+  )
 })
