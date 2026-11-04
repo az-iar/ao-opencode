@@ -12,7 +12,26 @@ const office = fakeOffice()
 const dir = mkdtempSync(join(tmpdir(), "ao-opencode-"))
 const credentials = join(dir, "opencode.json")
 process.env.AGENT_OFFICE_OPENCODE_CREDENTIALS = credentials
-process.env.AGENT_OFFICE_CALLBACK_PORT = "45123"
+// The plugin reads its preferred callback port once, at import, so the base has
+// to be chosen before that import: take an ephemeral loopback port and hold it
+// here. The fallback test below then owns the blocked port instead of guessing
+// one, which is what made it flake on a fixed 45124 when the host (or an
+// earlier run) had it busy (bruno on #28).
+const holdCallbackPort = async (): Promise<{ server: ReturnType<typeof createServer>; port: number }> => {
+  const server = createServer((_req, res) => res.writeHead(204).end())
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+  return { server, port: (server.address() as { port: number }).port }
+}
+let held = await holdCallbackPort()
+// A base with no room left in the 16-bit range would make the walk itself the
+// failure: bind again until CALLBACK_TRIES ports fit above it.
+while (held.port > 65535 - 20) {
+  await new Promise<void>((resolve) => held.server.close(() => resolve()))
+  held = await holdCallbackPort()
+}
+const blockedCallback = held.server
+const blockedPort = held.port
+process.env.AGENT_OFFICE_CALLBACK_PORT = String(blockedPort)
 // Never open a real browser from a test: the opener is the one boundary that
 // reaches outside this process, and the browser's own request for the approval
 // URL lands in another test's Office call log (az-iar/ao-pi#10, #13).
@@ -169,6 +188,7 @@ after(async () => {
   await cleanupFirst?.()
   console.warn = originalWarn
   office.close()
+  await new Promise<void>((resolve) => blockedCallback.close(() => resolve()))
 })
 
 test("defines the agent-office plugin", () => {
@@ -218,9 +238,10 @@ test("not connected: events report nothing and no MCP server is added", async ()
 })
 
 test("/office: OAuth with PKCE, stored tokens, MCP server added", async () => {
-  // Another plugin instance already holds the preferred callback port.
-  const blocker = createServer((_req, res) => res.writeHead(204).end())
-  await new Promise<void>((resolve) => blocker.listen(45123, "127.0.0.1", resolve))
+  // Another plugin instance already holds the preferred callback port: the
+  // blocker bound at import holds blockedPort for this whole file, so the
+  // approval has to fall back.
+  assert.ok(blockedCallback.listening)
   // The tool answers at once with the link, so a remote machine is not left waiting.
   const started = await harness.tools[0].execute({}, { sessionID: "s1", progress: async () => {} })
   const authorizeUrl = started.content.match(/^(http\S+\/oauth\/authorize\?\S+)$/m)?.[1]
@@ -232,12 +253,25 @@ test("/office: OAuth with PKCE, stored tokens, MCP server added", async () => {
   const landing = await fetch(back.headers.get("location")!)
   assert.match(await landing.text(), /connected/)
   await until(() => harness.synthetics.some((m) => m.sessionID === "s1" && /^Connected to Agent Office/.test(m.text)), "the connected notice")
-  await new Promise<void>((resolve) => blocker.close(() => resolve()))
   assert.match(harness.synthetics.find((m) => /^Connected to Agent Office/.test(m.text)).text, /^Connected to Agent Office as @opencode \(OpenCode\)\. Open tasks: 1, unclaimed team tasks: 0, unread messages: 2\./)
 
   const register = office.calls.find((c) => c.path === "/oauth/register")!
   const token = office.calls.find((c) => c.path === "/oauth/token")!
-  assert.deepEqual(register.body.redirect_uris, ["http://127.0.0.1:45124/callback"])
+  // What matters is that the fallback happened: one redirect URI, a loopback
+  // callback, on a port above the blocked base and still inside the plugin's
+  // CALLBACK_TRIES window (index.ts walks CALLBACK_TRIES = 20 ports from the
+  // base). Not an exact number, because the port above the base is not one this
+  // test holds.
+  assert.equal(register.body.redirect_uris.length, 1)
+  const redirect = new URL(register.body.redirect_uris[0])
+  assert.equal(redirect.protocol, "http:")
+  assert.equal(redirect.hostname, "127.0.0.1")
+  assert.equal(redirect.pathname, "/callback")
+  assert.notEqual(Number(redirect.port), blockedPort)
+  assert.ok(
+    Number(redirect.port) > blockedPort && Number(redirect.port) < blockedPort + 20,
+    `the callback fell back from ${blockedPort} to ${redirect.port}, inside ${blockedPort}-${blockedPort + 19}: ${register.body.redirect_uris[0]}`,
+  )
   assert.match(register.body.client_name, /^agent-office@[^@]+$/)
   assert.equal(token.body.grant_type, "authorization_code")
   assert.equal(token.body.code, "code-1")
