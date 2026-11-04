@@ -825,6 +825,11 @@ export default Plugin.define({
       // The scratch dir needs the same Office identity the worktree path gives its
       // worker: the prompt tells the worker to post_comment and set the task
       // blocked, and without a pointer there is no agent to do it as (neo, #32).
+      // A missing identity is loud rather than a silent no-op: launching a worker
+      // that cannot post is worse than not launching it.
+      if (!usingCredentialsOverride && !ownAgent?.slug) {
+        throw new Error(`cannot dispatch task ${id} into ${dir}: this session has no Office agent yet, so the worker would have no identity to post with`)
+      }
       adoptWorktree(dir, usingCredentialsOverride ? undefined : ownAgent?.slug)
       const name = `office-${taskShort(id)}-${randomBytes(2).toString("hex")}`
       const started = await run(
