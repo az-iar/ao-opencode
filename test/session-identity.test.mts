@@ -19,11 +19,6 @@ import { fakeOffice } from "./fake-office.mts"
 
 const office = fakeOffice()
 const tick = () => new Promise((r) => setTimeout(r, 20))
-// A boot poll, a status report and a registration all settle well inside this.
-// Only the two checks that nothing is sent at boot use it; every test that
-// asserts a refusal waits on the notice instead, because that is a fact and a
-// duration is a hope.
-const settle = (ms = 300) => new Promise((r) => setTimeout(r, ms))
 const until = async (check: () => boolean, what: string) => {
   for (let i = 0; i < 300; i++) {
     if (check()) return
@@ -268,8 +263,11 @@ test("a session that approves here owns an identity: it registers and posts, and
   const cleanup = await plugin.setup(harness.ctx)
   try {
     // Nothing is sent before a session owns an identity, even with a folder
-    // pointer and its token present.
-    await settle()
+    // pointer and its token present. The fact to wait on is that the plugin had
+    // a session in hand and declined to speak for it: the notice it gives a
+    // session with no approval of its own.
+    harness.push({ type: "session.status", data: { sessionID: "unapproved-session", status: { type: "busy" } } })
+    await until(() => noticed(harness, /Run \/office/), "the unapproved session's notice")
     assert.equal(harness.servers.size, 0, "the Office MCP server was registered before any session approved")
     assert.deepEqual(strays([folder, approved]), [], `an Office request was made before any session approved: ${windowReport([folder, approved])}`)
 
@@ -466,8 +464,12 @@ test("an approval made before this change keeps working when OpenCode still reme
   const harness = makeContext(dir, {}, { [`last-session:host:${workspaceKey(dir)}`]: "host-session" })
   const cleanup = await plugin.setup(harness.ctx)
   try {
-    // Still nothing until that session shows up - the record names one id.
-    await settle()
+    // Still nothing until that session shows up - the record names one id. The
+    // fact to wait on is that the plugin had a session in hand and declined to
+    // speak for it: a stranger in this folder is refused by name, and the
+    // recorded session has not been handed anything yet.
+    harness.push({ type: "session.status", data: { sessionID: "stranger-session", status: { type: "busy" } } })
+    await until(() => noticed(harness, /stranger-session has no Office identity/), "the stranger's refusal notice")
     assert.equal(harness.servers.size, 0)
     assert.deepEqual(strays([host]), [], `an Office request was made before the recorded session spoke: ${windowReport([host])}`)
     harness.push({ type: "session.status", data: { sessionID: "host-session", status: { type: "busy" } } })
