@@ -13,6 +13,10 @@ const dir = mkdtempSync(join(tmpdir(), "ao-opencode-"))
 const credentials = join(dir, "opencode.json")
 process.env.AGENT_OFFICE_OPENCODE_CREDENTIALS = credentials
 process.env.AGENT_OFFICE_CALLBACK_PORT = "45123"
+// Never open a real browser from a test: the opener is the one boundary that
+// reaches outside this process, and the browser's own request for the approval
+// URL lands in another test's Office call log (az-iar/ao-pi#10, #13).
+process.env.AGENT_OFFICE_OPEN_BROWSER = "off"
 // Task worktrees go under a temp AO_HOME, never the real ~/.ao.
 process.env.AO_HOME = join(dir, "ao-home")
 delete process.env.AGENT_OFFICE_TOKEN

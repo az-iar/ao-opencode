@@ -85,6 +85,14 @@ export function agentPointerPath(directory: string): string {
   return join(POINTERS_DIR, `${workspaceKey(directory)}.json`)
 }
 
+// An approval recorded against one session id, the same shape ao-pi keeps
+// (GH-491). A session is approved when this file names its agent; the folder
+// pointer only pre-fills an approval. A child session has its own id and no
+// file here, so it cannot speak as the agent its host was approved as.
+export function sessionPointerPath(sessionID: string): string {
+  return join(CREDENTIALS_DIR, "sessions", `${workspaceKey(sessionID)}.json`)
+}
+
 // A pointer written on purpose: `/office` in that workspace, or a dispatcher
 // adopting a task worktree. A pointer an older version wrote from the repo
 // fallback carries no mark, and names the main checkout's agent.
