@@ -416,7 +416,7 @@ test("a dispatched task worktree resolves as the agent that dispatched it", asyn
     harness.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
     await until(() => mcpCalls().length > 0, "the parent's first checkin")
     await until(() => office.calls.some((c) => c.body?.params?.name === "checkin"), "the working report")
-    office.state.openTasks = [...office.state.openTasks, { id: "task-identity", title: "Fix it", status: "todo" }]
+    office.state.openTasks = [...office.state.openTasks, { id: "task-identity", title: "Fix it", status: "todo", repo: "az-iar/ao-opencode" }]
     await until(() => existsSync(log) && readFileSync(log, "utf8").includes("run --bg"), "the hc launch")
 
     const taskWorktree = readFileSync(log, "utf8").match(/--cwd (\S+)/)![1]
@@ -466,7 +466,7 @@ test("an explicit AGENT_OFFICE_TOKEN connects an unconnected worktree and adopts
 
       // A task dispatched from here is adopted for the agent this session is
       // (the token's), never for the agent the checkout's pointer names.
-      office.state.openTasks = [...office.state.openTasks, { id: "task-token", title: "From a branch", status: "todo" }]
+      office.state.openTasks = [...office.state.openTasks, { id: "task-token", title: "From a branch", status: "todo", repo: "az-iar/ao-opencode" }]
       await until(() => existsSync(log) && readFileSync(log, "utf8").includes("run --bg"), "the hc launch")
       const taskWorktree = readFileSync(log, "utf8").match(/--cwd (\S+)/)![1]
       assert.equal(loadAgentPointer(agentPointerPath(taskWorktree)), "agent-token")
