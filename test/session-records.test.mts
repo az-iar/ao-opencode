@@ -2,7 +2,7 @@
 // runtime recorded, so two agents' sessions on one machine resolve their own
 // identity and three plugins agree on who a session is.
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -39,4 +39,29 @@ test("two sessions on one host read their own agent, not each other's", () => {
   assert.equal(sessionAgentOf("session-one"), "opencode");
   assert.equal(sessionAgentOf("session-two"), "other-agent");
   assert.equal(sessionAgentOf("session-three"), undefined, "a session that never approved has no identity");
+});
+
+test("revoking the session record is not undone by the legacy file", () => {
+  const id = "session-revoke";
+  mkdirSync(dirname(legacySessionPointerPath(id)), { recursive: true });
+  writeFileSync(legacySessionPointerPath(id), JSON.stringify({ agent: "opencode" }), { mode: 0o600 });
+  assert.equal(sessionAgentOf(id), "opencode");
+  assert.equal(existsSync(legacySessionPointerPath(id)), false, "the legacy file is retired once copied");
+  unlinkSync(sessionPointerPath(id));
+  assert.equal(sessionAgentOf(id), undefined, "a deleted approval stays deleted");
+});
+
+test("a read-only sessions directory still returns the agent, with nothing copied", () => {
+  const id = "session-readonly";
+  mkdirSync(dirname(legacySessionPointerPath(id)), { recursive: true });
+  writeFileSync(legacySessionPointerPath(id), JSON.stringify({ agent: "opencode" }), { mode: 0o600 });
+  const sessions = dirname(sessionPointerPath(id));
+  mkdirSync(sessions, { recursive: true });
+  chmodSync(sessions, 0o500);
+  try {
+    assert.equal(sessionAgentOf(id), "opencode", "the identity survives a read-only directory");
+    assert.equal(existsSync(sessionPointerPath(id)), false, "and nothing is copied into it");
+  } finally {
+    chmodSync(sessions, 0o700);
+  }
 });
