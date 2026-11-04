@@ -11,7 +11,7 @@
 // failing there (the child instance checks in from the folder pointer).
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { after, test } from "node:test"
@@ -507,5 +507,56 @@ test("a folder approval with no session record is pre-fill only: the session is 
     office.state.agent = { slug: "opencode", name: "OpenCode" }
     await cleanup()
     await drained()
+  }
+})
+
+// ao-pi#40: mkdirSync's mode applies only to a directory it creates, so an
+// existing sessions/ with looser bits stayed loose and the records were readable
+// by anyone who could read the parent.
+test("an existing sessions directory is tightened to 0700", () => {
+  const id = "session-loose-dir"
+  const dir = dirname(lib.sessionPointerPath(id))
+  mkdirSync(dir, { recursive: true })
+  chmodSync(dir, 0o755)
+  assert.equal(statSync(dir).mode & 0o777, 0o755, "fixture: the directory starts loose")
+  lib.saveSessionAgent(id, "opencode")
+  assert.equal(statSync(dir).mode & 0o777, 0o700, "the record's directory is private after a save")
+})
+
+// The other half of the tighten (ao-pi#42's fix, 65aabc1): only group and other
+// bits are the leak, so a directory someone made deliberately private keeps its
+// bits. Forcing 0700 on any inequality would hand back the write access it was
+// denied on purpose, and the EACCES fallback below would start succeeding - that
+// exact regression broke ao-pi.
+//
+// ao-pi#40: a read-only approvals directory is a supported state - sessionAgentOf
+// still answers from the legacy record, writes nothing into the directory, and
+// leaves the legacy file in place instead of retiring a record it never copied.
+// Root ignores the bits, so there is nothing to test there.
+test("a read-only sessions directory still answers from the legacy record and writes nothing", (t) => {
+  if (process.getuid?.() === 0) {
+    t.skip("running as root: root ignores directory bits, so 0500 does not refuse the write and this case cannot be exercised")
+    return
+  }
+  const id = "session-readonly-dir"
+  const dir = dirname(lib.sessionPointerPath(id))
+  const legacy = lib.legacySessionPointerPath(id)
+  mkdirSync(dirname(legacy), { recursive: true })
+  writeFileSync(legacy, JSON.stringify({ agent: "host" }, null, 2) + "\n", { mode: 0o600 })
+  mkdirSync(dir, { recursive: true })
+  chmodSync(dir, 0o500)
+  try {
+    const before = readFileSync(legacy, "utf8")
+    assert.equal(lib.sessionAgentOf(id), "host", "a read-only approvals directory lost the agent")
+    assert.deepEqual(
+      readdirSync(dir).filter((name) => name.startsWith(workspaceKey(id))),
+      [],
+      "a record or a temp file was written into a read-only directory",
+    )
+    assert.equal(existsSync(legacy), true, "a copy that never happened retired the legacy record")
+    assert.equal(readFileSync(legacy, "utf8"), before, "the legacy record was rewritten")
+    assert.equal(statSync(dir).mode & 0o777, 0o500, "the read-only directory was widened to 0700")
+  } finally {
+    chmodSync(dir, 0o700)
   }
 })

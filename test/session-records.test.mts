@@ -18,10 +18,15 @@ test("the session record is host-wide and names the runtime", () => {
   assert.ok(!path.includes("/opencode/sessions/"), `not buried inside a runtime: ${path}`);
 });
 
+// ao-pi#40: the record names its own session. The file is sha256(id)[:16], so the
+// name cannot be read back to the id it approves.
 test("an approval is written atomically and carries the runtime", () => {
   saveSessionAgent("session-ada", "opencode");
   const record = JSON.parse(readFileSync(sessionPointerPath("session-ada"), "utf8"));
-  assert.deepEqual({ agent: record.agent, runtime: record.runtime }, { agent: "opencode", runtime: "opencode" });
+  assert.deepEqual(
+    { agent: record.agent, session: record.session, runtime: record.runtime },
+    { agent: "opencode", session: "session-ada", runtime: "opencode" },
+  );
   assert.equal(typeof record.at, "number");
 });
 
