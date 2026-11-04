@@ -821,11 +821,18 @@ export function cronLine(directory: string, pollScript: string, path = process.e
 // same rule ao-pi carries in dispatchTarget (agent-office#556). Defaulting such a
 // task to the session's repository is what put a worker in a checkout nobody
 // chose.
-export type DispatchTarget = { kind: "worktree"; repo: string } | { kind: "scratch" }
+//
+// A task that NAMES a repo is resolved to a local checkout first, never assumed
+// to be the session's (agent-office#558): `resolved` is that lookup's answer, so
+// this stays the only place where scratch, worktree and refusal are decided. A
+// resolution that carries a note is one dispatch has to say out loud.
+export type DispatchTarget = { kind: "worktree"; repo: string; note?: string } | { kind: "scratch" } | { kind: "refused"; reason: string }
 
-export function dispatchTarget(sessionRepo: string, taskRepo: string): DispatchTarget {
+export function dispatchTarget(taskRepo: string, resolved?: RepoChoice): DispatchTarget {
   if (!taskRepo.trim()) return { kind: "scratch" }
-  return { kind: "worktree", repo: sessionRepo }
+  if (!resolved) return { kind: "refused", reason: `no checkout was looked up for ${taskRepo.trim()}` }
+  if ("error" in resolved) return { kind: "refused", reason: resolved.error }
+  return { kind: "worktree", repo: resolved.path, ...(resolved.note ? { note: resolved.note } : {}) }
 }
 
 // scratchTaskDir is where a repo-less task's worker runs: the agent's own state,
@@ -850,24 +857,121 @@ export function scratchPrompt(id: string, task: any, dir: string): string {
   ].join("\n")
 }
 
-// repoTitle is a checkout's owner/name from its origin, lowercased, for comparing
-// a task's repo field with the checkout a session is in. It deliberately does not
-// resolve other checkouts: a task naming a different repository is refused rather
-// than chased (agent-office#556, vinn's review of ao-opencode#32).
-export function repoTitle(directory: string): string {
-  const r = spawnSync("git", ["-C", directory, "remote", "get-url", "origin"], { encoding: "utf8" })
-  const raw = r.status === 0 ? r.stdout.trim().toLowerCase().replace(/\.git$/, "") : ""
-  const m = raw.match(/([a-z0-9_.-]+)\/([a-z0-9_.-]+)$/)
-  return m ? `${m[1]}/${m[2]}` : ""
+// A dispatch runs in the TASK's repository, not the session's (agent-office#558,
+// the half #556 and ao-opencode#32 left): a named repo is matched against local
+// checkouts by what they push to, and refused rather than guessed when it matches
+// none or more than one. This is ao-pi's resolver (agent-office#540, ao-pi#17-#19)
+// with the same search: the session's own checkout, then its siblings.
+//
+// repoFromRemote reads a remote URL and returns its `owner/name`, so a checkout is
+// found by where it pushes rather than by what its directory is called.
+export function repoFromRemote(remote: string): string | undefined {
+  // Normalise before comparing: `git@github.com:owner/name.git`,
+  // `https://github.com/owner/name` and a case difference all mean the same
+  // checkout, and a matcher that treats them as different refuses real repos.
+  const cleaned = remote.trim().toLowerCase().replace(/\/+$/, "").replace(/\.git$/, "")
+  // A host is required: a bare path like /srv/git/agent-office names no owner, and
+  // matching it would let any directory whose last two segments look right pass as
+  // the task's repo.
+  const match = cleaned.match(/^(?:[a-z+]+:\/\/[^/]+\/|[\w.-]+@[\w.-]+:)([a-z0-9_.-]+)\/([a-z0-9_.-]+)$/i)
+  return match ? `${match[1]}/${match[2]}` : undefined
 }
 
-export function sameRepo(directory: string, wanted: string): boolean {
-  const mine = repoTitle(directory)
-  // A checkout with no origin cannot disagree with the task: there is nothing to
-  // compare, and refusing every dispatch in a remote-less repo would be worse than
-  // the mismatch this guards.
-  if (mine === "") return true
-  return mine === wanted.trim().toLowerCase().replace(/\.git$/, "")
+// RepoChoice is a checkout, optionally with a note the notice has to carry, or the
+// reason there is none.
+export type RepoChoice = { path: string; note?: string } | { error: string }
+
+// matchingCheckouts is every candidate whose origin is the task's repo: the match
+// key for dispatch, so a directory name never stands in for a remote.
+function matchingCheckouts(wanted: string, candidates: { path: string; remote?: string }[]) {
+  // Accept `owner/name` or a remote URL, compared the way repoFromRemote reads it.
+  const normalised = repoFromRemote(wanted) ?? wanted.trim().toLowerCase()
+  const matches = candidates.filter((candidate) => candidate.remote && repoFromRemote(candidate.remote) === normalised)
+  return { normalised, matches }
+}
+
+// chooseRepo picks the checkout for a task's repo from the candidates it was
+// given. It refuses rather than guesses: no match, or more than one, is an error
+// naming the repo and what was found.
+export function chooseRepo(wanted: string, candidates: { path: string; remote?: string }[]): RepoChoice {
+  const { normalised, matches } = matchingCheckouts(wanted, candidates)
+  if (matches.length === 1) return { path: matches[0].path }
+  if (matches.length === 0) {
+    return { error: `no local checkout of ${normalised} beside the session's checkout; clone it there or clear the task's repo` }
+  }
+  // Directory names, not paths: a block reason passes through failureReason, which
+  // replaces every absolute path with <path>, and then the reason could not say
+  // which checkouts it is choosing between (agent-office#558).
+  const names = matches.map((match) => basename(match.path)).join(", ")
+  return { error: `${matches.length} checkouts of ${normalised} beside the session's checkout (${names}); refusing to guess which one` }
+}
+
+// dedupeCandidates keeps one checkout per repository: a linked worktree shares its
+// origin and its git common dir with the main checkout, so a sibling scan sees one
+// repository several times and "two checkouts" would refuse every dispatch once a
+// task worktree exists (neo, ao-pi#17).
+export function dedupeCandidates<T extends { path: string; commonDir?: string }>(candidates: T[]): T[] {
+  const seen = new Map<string, T>()
+  for (const candidate of candidates) {
+    const key = candidate.commonDir ?? candidate.path
+    const held = seen.get(key)
+    // Prefer the main checkout: a worktree's path sits under the repository's
+    // directory but is not where a new worktree should be rooted.
+    if (!held || held.path.length > candidate.path.length) seen.set(key, candidate)
+  }
+  return [...seen.values()]
+}
+
+// resolveDispatchRepo answers which checkout a dispatch for this task should use:
+// a named repo is matched by remote, and never silently falls back to the
+// session's - the one exception is a session checkout with no origin at all, which
+// vinn's rule in ao-opencode#32 keeps: it cannot disagree with the task, and
+// refusing every dispatch in a remote-less workspace would be worse than the
+// mismatch. That fallback carries a note, so the dispatch says what it did.
+export function resolveDispatchRepo(
+  sessionRepo: string,
+  taskRepo: string,
+  list: (dir: string) => { path: string; remote?: string; commonDir?: string }[] = siblingCheckouts,
+): RepoChoice {
+  const wanted = taskRepo.trim().toLowerCase()
+  if (!wanted) return { path: sessionRepo }
+  // The session's own entry is read before the dedupe, which keeps the main checkout
+  // of a repository and would otherwise drop the session when it is a linked
+  // worktree of it.
+  const listed = list(sessionRepo)
+  const session = listed.find((candidate) => candidate.path === sessionRepo)
+  const candidates = dedupeCandidates(listed)
+  const { normalised, matches } = matchingCheckouts(wanted, candidates)
+  // Zero matches and a remote-less session checkout: it is the only checkout that
+  // could not disagree with the task, so it runs the task and the notice says why.
+  if (matches.length === 0 && session && !session.remote) {
+    return { path: sessionRepo, note: `No checkout matched ${normalised} and this checkout has no origin to match against, so the task runs here.` }
+  }
+  return chooseRepo(wanted, candidates)
+}
+
+// siblingCheckouts lists the checkouts beside a repository: the repository itself
+// and every directory next to it, each with its origin and its git common dir. The
+// common dir is what tells a linked worktree from a separate clone, so one
+// repository is counted once.
+export function siblingCheckouts(root: string): { path: string; remote?: string; commonDir?: string }[] {
+  const gitOut = (path: string, args: string[]) => {
+    const r = spawnSync("git", ["-C", path, ...args], { encoding: "utf8" })
+    return r.status === 0 ? r.stdout.trim() : undefined
+  }
+  // --path-format=absolute matters: a main checkout answers `.git` (relative) while
+  // its worktree answers an absolute path, so the two never compare equal and the
+  // dedupe above would silently do nothing (neo, ao-pi#19).
+  const common = (path: string) => gitOut(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+  const candidates = [{ path: root, remote: gitOut(root, ["remote", "get-url", "origin"]), commonDir: common(root) }]
+  try {
+    for (const name of readdirSync(dirname(root))) {
+      const path = join(dirname(root), name)
+      if (path === root) continue
+      candidates.push({ path, remote: gitOut(path, ["remote", "get-url", "origin"]), commonDir: common(path) })
+    }
+  } catch {}
+  return candidates
 }
 
 // needsCheckin answers whether dispatch must check in before writing a pointer:

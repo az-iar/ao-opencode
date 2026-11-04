@@ -3,7 +3,7 @@ import { execFileSync, spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, dirname } from "node:path"
 import { after, before, test } from "node:test"
 import { fileURLToPath } from "node:url"
 import { fakeOffice } from "./fake-office.mts"
@@ -27,6 +27,10 @@ function workspace() {
   mkdirSync(runs)
   execFileSync("git", ["-C", dir, "init", "-q"])
   execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  // A named repo is resolved by origin, and a checkout with none keeps #32's
+  // fallback (it runs the task), so the poller's own checkout needs one for the
+  // refusal cases to be refusals (agent-office#558).
+  execFileSync("git", ["-C", dir, "remote", "add", "origin", "git@github.com:az-iar/ao-opencode.git"])
   const credentials = join(root, "store", "opencode.json")
   mkdirSync(join(root, "store"))
   writeFileSync(credentials, JSON.stringify({ office: url, client_id: "client-1", access_token: "access-poll", refresh_token: "refresh-poll", expires_at: Date.now() + 3_600_000 }))
@@ -152,6 +156,61 @@ test("a new todo task is claimed, run as one worker in its worktree, and its dis
   assert.equal(update?.body.params.arguments.task_id, "task-new")
   assert.equal(update?.body.params.arguments.status, "in_progress")
   assert.deepEqual(readdirSync(ws.state("dispatch")), [])
+})
+
+// agent-office#558: the cron path dispatched every task in the poller's checkout,
+// named repo or not, so a task in another checkout landed in the wrong one. Both
+// tests here are red on main: there the worktree is of `repo` either way.
+test("a task naming another local checkout runs in a worktree of THAT checkout", async () => {
+  reset()
+  const ws = workspace()
+  // A checkout beside the poller's, named by the task.
+  const other = join(dirname(ws.dir), "agent-office")
+  mkdirSync(other)
+  execFileSync("git", ["-C", other, "init", "-q"])
+  execFileSync("git", ["-C", other, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  execFileSync("git", ["-C", other, "remote", "add", "origin", "https://github.com/az-iar/agent-office.git"])
+  await ws.poll()
+  office.calls.length = 0
+  const id = "task-other-repo"
+  const task = { id, title: "Fix it", status: "todo", repo: "az-iar/agent-office" }
+  office.state.taskDetails.set(id, task)
+  office.state.openTasks = [...office.state.openTasks, task]
+  try {
+    const result = await ws.poll()
+    assert.equal(result.code, 0, result.stderr)
+    const short = createHash("sha256").update(id).digest("hex").slice(0, 8)
+    const run = ws.recorded().at(-1)!
+    assert.equal(run.cwd, join(dirname(ws.dir), ".ao", "worktrees", "agent-office", `${short}-fix-it`))
+    assert.equal(
+      execFileSync("git", ["-C", run.cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"], { encoding: "utf8" }).trim(),
+      join(other, ".git"),
+      "the worktree belongs to the checkout the task names",
+    )
+  } finally {
+    office.state.taskDetails.delete(id)
+  }
+})
+
+test("a task naming a repo with no local checkout is refused, not dispatched here", async () => {
+  reset()
+  const ws = workspace()
+  await ws.poll()
+  office.calls.length = 0
+  const id = "task-nowhere-repo"
+  const task = { id, title: "Fix it", status: "todo", repo: "az-iar/elsewhere" }
+  office.state.taskDetails.set(id, task)
+  office.state.openTasks = [...office.state.openTasks, task]
+  try {
+    const before = ws.recorded().length
+    const result = await ws.poll()
+    assert.equal(result.code, 0, result.stderr)
+    assert.equal(ws.recorded().length, before, "no worker is started in the poller's checkout instead")
+    const blocked = office.calls.find((c) => c.body?.params?.name === "update_task" && c.body.params.arguments?.task_id === id && c.body.params.arguments?.status === "blocked")
+    assert.match(String(blocked?.body.params.arguments?.reason ?? ""), /no local checkout of az-iar\/elsewhere/)
+  } finally {
+    office.state.taskDetails.delete(id)
+  }
 })
 
 test("--dry-run reports ids only, writes nothing and starts nothing", async () => {

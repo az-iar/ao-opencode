@@ -67,6 +67,9 @@ function repo() {
   mkdirSync(path)
   execFileSync("git", ["init", "-q", path])
   execFileSync("git", ["-C", path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  // A task's named repo resolves by origin (agent-office#558), so the checkout a
+  // dispatch starts from needs one here too.
+  execFileSync("git", ["-C", path, "remote", "add", "origin", "git@github.com:az-iar/ao-opencode.git"])
   return path
 }
 

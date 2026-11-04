@@ -1,24 +1,30 @@
 // Azri's decision on card 53828e66, same rule as ao-pi: a task with repo "" gets
 // no worktree, so it cannot land in the session's checkout (agent-office#556).
 import assert from "node:assert/strict";
-import { spawnSync as spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { dispatchTarget, repoTitle, sameRepo, scratchTaskDir } from "../lib/office.ts";
+import { dispatchTarget, scratchTaskDir } from "../lib/office.ts";
 
 test("a repo-less task gets a scratch directory, never the session's repo", () => {
-  assert.deepEqual(dispatchTarget("/home/azri/projects/personal/ao-opencode", ""), { kind: "scratch" });
+  assert.deepEqual(dispatchTarget(""), { kind: "scratch" });
 });
 
 test("whitespace is not a repo either", () => {
-  assert.deepEqual(dispatchTarget("/repo", "   "), { kind: "scratch" });
+  assert.deepEqual(dispatchTarget("   "), { kind: "scratch" });
 });
 
-test("a named repo keeps the worktree path", () => {
-  assert.deepEqual(dispatchTarget("/repo", "az-iar/ao-pi"), { kind: "worktree", repo: "/repo" });
+test("a named repo takes the worktree of the checkout it resolved to", () => {
+  // Not the session's checkout: dispatchTarget is handed the resolution, and the
+  // resolver is the only thing that decides which checkout that is (#558).
+  assert.deepEqual(dispatchTarget("az-iar/ao-pi", { path: "/work/ao-pi" }), { kind: "worktree", repo: "/work/ao-pi" });
+});
+
+test("a named repo that resolved to nothing is refused with the resolver's reason", () => {
+  assert.deepEqual(dispatchTarget("az-iar/elsewhere", { error: "no local checkout of az-iar/elsewhere beside the session's checkout" }), {
+    kind: "refused",
+    reason: "no local checkout of az-iar/elsewhere beside the session's checkout",
+  });
 });
 
 test("the scratch directory is under the agent's state, not under any repo", () => {
@@ -27,30 +33,15 @@ test("the scratch directory is under the agent's state, not under any repo", () 
   assert.ok(!dir.includes("/projects/"), dir);
 });
 
-test("the hc dispatch reads the task's repo", () => {
+test("both dispatch sites resolve the task's repo and call dispatchTarget", () => {
   // Source-level, because the bug was a dispatch site that never looked at
-  // task.repo at all (agent-office#556).
-  const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
-  assert.ok(source.includes("dispatchTarget("), "the hc dispatch does not call dispatchTarget");
-  // Source-level only: the plugin-level proof is the scratch dispatch test in
-  // plugin.test.mts, which asserts the launch and the pointer.
-  assert.ok(/task\?\.repo|task\.repo/.test(source), "nothing reads task.repo");
-});
-
-test("a task naming a different repository is refused, not dispatched here", () => {
-  // vinn's second point: falling back to the session's checkout is how a worker
-  // ends up in a repo nobody asked for.
-  const root = mkdtempSync(join(tmpdir(), "ao-repo-"));
-  const repo = join(root, "mine");
-  mkdirSync(repo);
-  spawnSync("git", ["-C", repo, "init", "-q"]);
-  spawnSync("git", ["-C", repo, "remote", "add", "origin", "git@github.com:az-iar/ao-opencode.git"]);
-  assert.equal(sameRepo(repo, "az-iar/ao-opencode"), true);
-  assert.equal(sameRepo(repo, "Az-Iar/AO-OpenCode.git"), true, "case and .git do not matter");
-  assert.equal(sameRepo(repo, "az-iar/agent-office"), false, "a different repo is not this one");
-  const bare = join(root, "no-origin");
-  mkdirSync(bare);
-  spawnSync("git", ["-C", bare, "init", "-q"]);
-  assert.equal(sameRepo(bare, "az-iar/anything"), true, "a checkout with no origin cannot disagree");
-  assert.equal(repoTitle(repo), "az-iar/ao-opencode");
+  // task.repo at all (agent-office#556), and ao-pi#18 found the second site still
+  // dispatching in the poller's checkout after the first was fixed.
+  for (const file of ["../index.ts", "../poll.ts"]) {
+    const source = readFileSync(new URL(file, import.meta.url), "utf8");
+    assert.ok(source.includes("dispatchTarget("), `${file} does not call dispatchTarget`);
+    assert.ok(source.includes("resolveDispatchRepo("), `${file} does not resolve the task's repo`);
+    assert.ok(/task\?\.repo|task\.repo/.test(source), `${file} never reads task.repo`);
+    assert.ok(!/addWorktree\(repo,/.test(source), `${file} still dispatches in the session's checkout`);
+  }
 });
