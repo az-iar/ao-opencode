@@ -764,3 +764,46 @@ test("a pair that was cleared warns again once", () => {
   const silent = refused(() => lib.sessionAgentOf(id))
   assert.deepEqual(silent.warnings, [], `the re-warned pair warned again on a repeat read: ${silent.warnings.join(" | ")}`)
 })
+
+// ao-opencode#48: the refusal above is final. A record refused because it names
+// another session must not be followed by a look at the legacy record, because
+// the legacy read promotes what it finds: it writes the shared record for this
+// session and retires the legacy file, so a fall-through turns a refusal into an
+// identity - the one thing fail-closed may not do - and destroys the evidence of
+// what was there (ao-pi#39/#40). The shared record is planted with a different
+// agent from the legacy one, so a fall-through is visible in the answer and in
+// both files at once.
+test("a refused current-session record does not fall through to the legacy record", () => {
+  const cases: [string, unknown][] = [
+    ["another-session", "session-48-owner"],
+    ["wrong-type", 123],
+  ]
+  for (const [label, stored] of cases) {
+    const id = `session-48-refused-${label}`
+    const legacy = lib.legacySessionPointerPath(id)
+    mkdirSync(dirname(legacy), { recursive: true })
+    // The legacy record names this session: a fall-through gated on the legacy
+    // record naming the requested session would never fire against a session-less
+    // fixture, and the gap would stay invisible.
+    writeFileSync(legacy, JSON.stringify({ agent: "legacy-agent", session: id }, null, 2) + "\n", { mode: 0o600 })
+    const legacyBefore = readFileSync(legacy, "utf8")
+    // This session's own record, refused because it does not name this session.
+    const record = lib.sessionPointerPath(id)
+    mkdirSync(dirname(record), { recursive: true })
+    const recordBytes = JSON.stringify({ agent: "planted-agent", session: stored, runtime: "opencode", at: 1 }, null, 2) + "\n"
+    writeFileSync(record, recordBytes, { mode: 0o600 })
+
+    const { result } = refused(() => lib.sessionAgentOf(id))
+    assert.equal(result, undefined, `(${label}) a refused record fell through to the legacy record's agent`)
+    // Not consulted means not promoted and not retired: the legacy file is still
+    // there, byte for byte, and the shared directory holds only what was planted.
+    assert.equal(existsSync(legacy), true, `(${label}) the legacy record was retired for a session whose record was refused`)
+    assert.equal(readFileSync(legacy, "utf8"), legacyBefore, `(${label}) the legacy record was rewritten`)
+    assert.equal(readFileSync(record, "utf8"), recordBytes, `(${label}) the refused record was overwritten`)
+    assert.deepEqual(
+      readdirSync(dirname(record)).filter((name) => name.startsWith(workspaceKey(id))),
+      [`${workspaceKey(id)}.json`],
+      `(${label}) a record or a temp file was written for the refused session`,
+    )
+  }
+})
