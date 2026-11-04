@@ -85,7 +85,7 @@ import {
   scratchPrompt,
 } from "./lib/office.ts"
 
-export { agentCredentialsPath, agentPointerPath, credentialsPath } from "./lib/office.ts"
+export { agentCredentialsPath, agentPointerPath, credentialsPath, workspacePointerPath } from "./lib/office.ts"
 
 const CALLBACK_BASE_PORT = Number(process.env.AGENT_OFFICE_CALLBACK_PORT ?? 41997)
 const CALLBACK_TRIES = 20
@@ -822,6 +822,10 @@ export default Plugin.define({
     // dispatchScratch runs a repo-less task in a directory that is not a git
     // checkout: no branch, no worktree, and a prompt that says so (agent-office#556).
     const dispatchScratch = async (id: string, task: any, dir: string, parent: string) => {
+      // The scratch dir needs the same Office identity the worktree path gives its
+      // worker: the prompt tells the worker to post_comment and set the task
+      // blocked, and without a pointer there is no agent to do it as (neo, #32).
+      adoptWorktree(dir, usingCredentialsOverride ? undefined : ownAgent?.slug)
       const name = `office-${taskShort(id)}-${randomBytes(2).toString("hex")}`
       const started = await run(
         hcBin(),

@@ -24,10 +24,12 @@ test("the scratch directory is under the agent's state, not under any repo", () 
   assert.ok(!dir.includes("/projects/"), dir);
 });
 
-test("both dispatch sites read the task's repo", () => {
+test("the hc dispatch reads the task's repo", () => {
   // Source-level, because the bug was a dispatch site that never looked at
   // task.repo at all (agent-office#556).
   const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
   assert.ok(source.includes("dispatchTarget("), "the hc dispatch does not call dispatchTarget");
+  // Source-level only: the plugin-level proof is the scratch dispatch test in
+  // plugin.test.mts, which asserts the launch and the pointer.
   assert.ok(/task\?\.repo|task\.repo/.test(source), "nothing reads task.repo");
 });
