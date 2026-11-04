@@ -51,7 +51,8 @@ const { adoptWorktree, agentCredentialsPath, agentPointerPath, loadAgentPointer,
 const { default: plugin } = await import("../index.ts")
 
 // The per-session approval record, at the path the plugin writes it to.
-const sessionPointer = (sessionID: string) => join(home, ".config", "agent-office", "opencode", "sessions", `${workspaceKey(sessionID)}.json`)
+// agent-office#560: session approvals are host-wide, not under the runtime.
+const sessionPointer = (sessionID: string) => join(home, ".config", "agent-office", "sessions", `${workspaceKey(sessionID)}.json`)
 const approveSession = (sessionID: string, agent: string) => {
   mkdirSync(dirname(sessionPointer(sessionID)), { recursive: true })
   writeFileSync(sessionPointer(sessionID), JSON.stringify({ agent }, null, 2) + "\n", { mode: 0o600 })

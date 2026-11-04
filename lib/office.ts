@@ -7,7 +7,7 @@
 
 import { spawn, spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { renameSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { basename, dirname, join, resolve, sep } from "node:path"
 
@@ -90,7 +90,58 @@ export function agentPointerPath(directory: string): string {
 // pointer only pre-fills an approval. A child session has its own id and no
 // file here, so it cannot speak as the agent its host was approved as.
 export function sessionPointerPath(sessionID: string): string {
+  // One directory per HOST, not per runtime (agent-office#560): a session id is
+  // globally unique and the identity travels with the session, so the three
+  // plugins agree on who a session is.
+  return join(dirname(CREDENTIALS_DIR), "sessions", `${workspaceKey(sessionID)}.json`)
+}
+
+// saveSessionAgent writes an approval into the host-wide directory atomically (temp
+// plus rename): three plugins can write it concurrently, and a half-written record
+// would read as "no identity" for a session that has one (agent-office#560).
+export function saveSessionAgent(sessionID: string, slug: string) {
+  const path = sessionPointerPath(sessionID)
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+  const tmp = `${path}.${process.pid}.tmp`
+  writeFileSync(tmp, JSON.stringify({ agent: slug, runtime: "opencode", at: Date.now() }, null, 2) + "\n", { mode: 0o600 })
+  renameSync(tmp, path)
+}
+
+// Where the previous version kept it, read once so a live session keeps its
+// identity across the move, and copied forward by the writer below.
+export function legacySessionPointerPath(sessionID: string): string {
   return join(CREDENTIALS_DIR, "sessions", `${workspaceKey(sessionID)}.json`)
+}
+
+// sessionAgentOf reads a session's agent: the host-wide record, else the legacy one
+// copied forward. The pointer is never consulted here - only an approval is.
+export function sessionAgentOf(sessionID: string | undefined): string | undefined {
+  if (!sessionID) return undefined
+  const current = readAgentPointer(sessionPointerPath(sessionID))?.agent
+  if (current) return current
+  const legacyPath = legacySessionPointerPath(sessionID)
+  const legacy = readAgentPointer(legacyPath)?.agent
+  if (!legacy) return undefined
+  try {
+    saveSessionAgent(sessionID, legacy)
+  } catch (err) {
+    const code = (err as { code?: string }).code
+    if (code !== "EROFS" && code !== "EACCES") {
+      console.warn(`[agent-office] could not copy session ${sessionID}'s legacy approval forward: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    return legacy
+  }
+  try {
+    // One-way: deleting the new record is the only revoke, so the old file must
+    // not survive the copy or the next load resurrects the agent (bruno's must-fix
+    // on ao-claude#14, the same pattern here).
+    unlinkSync(legacyPath)
+  } catch (err) {
+    // A copy that worked and a retire that did not leaves the zombie identity
+    // behind, so this is never benign - warn whatever the reason (neo on #35).
+    console.warn(`[agent-office] could not retire session ${sessionID}'s legacy approval: ${err instanceof Error ? err.message : String(err)}`)
+  }
+  return legacy
 }
 
 // A pointer written on purpose: `/office` in that workspace, or a dispatcher
