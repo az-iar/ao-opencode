@@ -19,6 +19,13 @@
 //   AGENT_OFFICE_AUTODISPATCH          on (default), off, herdr, or session
 //   AGENT_OFFICE_CLIENT_NAME           OAuth client name; defaults to folder@host
 //
+// Identity is per session (GH-491): an approval is recorded against the
+// session that made it (`~/.config/agent-office/opencode/sessions/<id>.json`),
+// and a session with no approval of its own registers no office MCP server and
+// makes no request rather than posting as the folder's agent. The folder
+// pointer only pre-fills an approval; AGENT_OFFICE_TOKEN and the credentials
+// file are grants handed to the process on purpose.
+//
 // Tokens are never logged.
 
 import { Plugin } from "@opencode/plugin"
@@ -40,6 +47,7 @@ import {
   agentPointerVia,
   agentStateDir,
   loadAgentPointer,
+  loadCredentials,
   blockTask,
   CREDENTIALS_OVERRIDE,
   claimNotice,
@@ -64,6 +72,7 @@ import {
   resolveCredentials,
   saveAgentPointer,
   saveCredentials,
+  sessionPointerPath,
   summary,
   taskPrompt,
   taskID,
@@ -176,7 +185,20 @@ async function registerClient(callback: string, clientName: string): Promise<str
   return body.client_id
 }
 
-function openBrowser(url: string) {
+// openBrowser opens the approval URL in the person's browser. It is the one
+// place this extension reaches outside the process, so it is also the boundary
+// the tests stub: with AGENT_OFFICE_OPEN_BROWSER=off nothing is spawned at all,
+// which is what stops an approval test from launching a real browser on the
+// host (az-iar/ao-pi#10 and #13, where a suite run left hundreds of stray
+// browser processes - and the browser's own request for the approval URL then
+// turns up in another test's Office call log).
+export function browserOpeningAllowed(): boolean {
+  const mode = (process.env.AGENT_OFFICE_OPEN_BROWSER ?? "").trim().toLowerCase()
+  return mode !== "off" && mode !== "0" && mode !== "false" && mode !== "no"
+}
+
+export function openBrowser(url: string) {
+  if (!browserOpeningAllowed()) return
   try {
     const [cmd, args] = process.platform === "win32" ? ["cmd", ["/c", "start", "", url]] : process.platform === "darwin" ? ["open", [url]] : ["xdg-open", [url]]
     spawn(cmd, args, { detached: true, stdio: "ignore" }).on("error", () => {}).unref()
@@ -372,6 +394,43 @@ export default Plugin.define({
     // worktree connected by /office starts polling without a restart.
     const noIdentity = () => resolved.unconnected && !auth.credentials && !process.env.AGENT_OFFICE_TOKEN
     let startPolling: () => void = () => {}
+    // Identity is per session (#491, ao-pi#3). A session owns one when an
+    // approval is recorded against its own id - `sessions/<id>.json`, the same
+    // record ao-pi keeps - or when an approval finished in this process for it.
+    // The folder pointer and the checkout's token are pre-fill only: a child
+    // session inherits both, and inheriting them is the bug (#476, #491).
+    let ownedSessionID: string | undefined
+    let approvedSessionID: string | undefined
+    // An approval recorded before this change was kept for the folder, not a
+    // session. OpenCode's own storage names the last session that worked here
+    // as that agent, so that session keeps the approval it acted under; every
+    // other session approves for itself. Read once, in setup.
+    let legacySessionID: string | undefined
+    let legacyAgent: string | undefined
+    // owns is whether this process may act as an Office agent at all. True only
+    // when a session it serves owns an approval, or an identity was handed to
+    // the process on purpose: AGENT_OFFICE_TOKEN for a non-child (the runner's
+    // own identity), AGENT_OFFICE_OPENCODE_CREDENTIALS (a dispatcher's grant),
+    // or a connected worktree's `dispatch` mark (the identity its dispatcher
+    // wrote there for this worker). A `/office` mark is not a grant: that
+    // approval is recorded against the session that ran it.
+    let owns = false
+    const sessionAgent = (id: string | undefined) => (id ? loadAgentPointer(sessionPointerPath(id)) : undefined)
+    const tokenGranted = () => Boolean(process.env.AGENT_OFFICE_TOKEN) && process.env.AGENT_OFFICE_CHILD !== "1"
+    const dispatchGranted = () => Boolean(resolved.worktree && agentPointerVia(pointerFile) === "dispatch")
+    const granted = () => tokenGranted() || usingCredentialsOverride || dispatchGranted()
+    // Write an approval against the session that owns it, never against
+    // whoever happens to be speaking: a process acting on a token or a
+    // dispatcher's grant has no session approval to record.
+    const rememberSessionApproval = (slug: string) => {
+      // A grant is not an approval: under a token or a dispatcher's credentials
+      // file the process already has an identity, and nothing is recorded
+      // against a session (ao-pi's adoptAgent returns before its pointer too).
+      if (usingCredentialsOverride || tokenGranted()) return
+      const id = approvedSessionID ?? ownedSessionID
+      if (!id || loadAgentPointer(sessionPointerPath(id)) === slug) return
+      saveAgentPointer(sessionPointerPath(id), slug)
+    }
     // `via` is the mark a linked worktree's pointer needs to count: "office"
     // for a `/office` here. A plain poll passes none and, in a worktree, writes
     // no pointer unless one there is already marked (a dispatcher's worker
@@ -383,6 +442,7 @@ export default Plugin.define({
       // header needs it (GH-476). A dispatcher hands a worker its token and no
       // agent pointer, and without this the header would simply be missing.
       if (slug) approvedAgent = slug
+      if (slug) rememberSessionApproval(slug)
       if (usingCredentialsOverride || !slug) return
       // In a linked worktree the token is an identity handed in from outside,
       // not this workspace's: a poll with it ("/office" here is different)
@@ -412,29 +472,34 @@ export default Plugin.define({
     // checkout.
     const dispatchMode = configuredDispatch === "off" || configuredDispatch === "false" ? "off" : "hc"
     const bearer = auth.bearer
+    // ownedBearer is the only door to identity: while this process owns none it
+    // answers nothing, so checkin, the office call, the MCP registration, the
+    // status reports and polling all fail closed instead of each resolving the
+    // folder pointer's token itself (#491).
+    const ownedBearer = async () => (owns ? bearer() : undefined)
     // officeIdentity is the header set every Office call carries (GH-476): the
-    // agent this folder's own approval named, and, for a child session, the
+    // agent this session's own approval named, and, for a child session, the
     // parent it was started from plus its runtime.
     //
-    // Folder-scoped, not session-scoped: opencode keeps one agent pointer per
-    // folder (`saveAgentPointer` on approval) and has no session pointer, so two
-    // sessions in one folder declare the same agent. That is exactly what this
-    // repo's identity is, and it is still the check the office runs - does the
-    // declared agent match the bearer token's.
+    // Session-scoped now: the agent comes from the owning session's pointer -
+    // the same record that lets it act - and never from the folder pointer,
+    // which is pre-fill only. Under a token or a credentials override the
+    // token's own agent is the only truth: the pointer may name a different
+    // agent, and mixing A's slug with B's bearer is a 409 (and a wrong parent
+    // for a child). A dispatched worktree's worker is the exception: its
+    // identity is the marked pointer its dispatcher wrote there.
     const officeIdentity = (): Record<string, string> =>
-      // Under a credentials override the token's own agent is the only truth: the
-      // folder pointer may name a different agent, and mixing A's slug with B's
-      // bearer is a 409 (and a wrong parent for a child) the moment #508 lands.
-      // Before the first checkin that identity is unknown, so the honest header
-      // is none - the reload in syncMcpIdentity fills it in as soon as it is known.
       identityHeaders({
-        approved: usingCredentialsOverride ? approvedAgent : (loadAgentPointer(pointerFile) ?? loadAgentPointer(repoPointerFile) ?? approvedAgent),
+        approved:
+          process.env.AGENT_OFFICE_TOKEN || usingCredentialsOverride
+            ? approvedAgent
+            : (sessionAgent(ownedSessionID) ?? (resolved.worktree ? loadAgentPointer(pointerFile) : undefined) ?? approvedAgent),
         childName: process.env.AGENT_OFFICE_CHILD_NAME,
         child: process.env.AGENT_OFFICE_CHILD === "1",
         sessionID: currentSessionID,
         runtime: "opencode",
       })
-    const { call, checkin } = createClient(bearer, officeIdentity)
+    const { call, checkin } = createClient(ownedBearer, officeIdentity)
 
     // Hands OpenCode the office MCP server with the current access token, and
     // again whenever the token is refreshed. The transform captures the token
@@ -465,9 +530,10 @@ export default Plugin.define({
     }
     const connectMcp = async () => {
       // Office tools act as the agent they carry, so an unconnected worktree
-      // gets none of them rather than the checkout's.
-      if (noIdentity()) return
-      token = await bearer()
+      // gets none of them, and neither does a process with no identity it owns:
+      // registering the server is what puts the tools in front of a session (#491).
+      if (noIdentity() || !owns) return
+      token = await ownedBearer()
       if (!token) return
       // Record what is being registered here too: a session that already had a
       // pointer would otherwise pay one redundant reload on its first summary,
@@ -509,8 +575,7 @@ export default Plugin.define({
     const report = (status: "working" | "idle") => {
       queue = queue.then(async () => {
         try {
-          if (noIdentity()) return
-          if (!(await bearer())) return
+          if (!(await ownedBearer())) return
           if (status === "idle" && (await checkin()).agent?.work_status === "blocked") return
           await checkin({ status, note })
         } catch (err) {
@@ -526,7 +591,7 @@ export default Plugin.define({
       noticeUnconnected(sessionID)
       if (busy.size === 0) {
         heartbeat = setInterval(() => {
-          if (!noIdentity()) checkin().catch(() => {})
+          if (owns) checkin().catch(() => {})
         }, HEARTBEAT_MS)
         heartbeat.unref()
         void report("working")
@@ -703,6 +768,14 @@ export default Plugin.define({
         done: started.credentials.then(async (next) => {
           auth.credentials = next
           saveCredentials(credentialsFile, next)
+          // The approval is this session's own grant, held from the moment its
+          // credentials are persisted and before anything acts on them. A grant
+          // that could not be recorded is not one this process holds (#476).
+          owns = true
+          if (sessionID) {
+            approvedSessionID = sessionID
+            ownedSessionID = sessionID
+          }
           connected = undefined
           return connectedSummary("office")
         }),
@@ -810,7 +883,7 @@ export default Plugin.define({
     // One pump at a time, including while it looks up the remembered session.
     let pumping = false
     const pumpDispatch = () => {
-      if (life.signal.aborted || dispatchMode === "off" || noIdentity() || pumping) return
+      if (life.signal.aborted || dispatchMode === "off" || noIdentity() || !owns || pumping) return
       pumping = true
       if (!targetSession()) {
         void targetSessionAsync()
@@ -932,8 +1005,7 @@ export default Plugin.define({
       if (polling) return
       polling = true
       try {
-        if (noIdentity()) return
-        if (!(await bearer())) return
+        if (!(await ownedBearer())) return
         const me = await checkin()
         adoptAgent(me.agent?.slug)
         ownAgent = me.agent
@@ -952,20 +1024,91 @@ export default Plugin.define({
     const configuredPoll = Number(ctx.options.pollInterval ?? process.env.AGENT_OFFICE_POLL_MS ?? DEFAULT_POLL_MS)
     const pollInterval = Number.isFinite(configuredPoll) ? Math.max(configuredPoll, 1_000) : DEFAULT_POLL_MS
     // Only the main checkout reads the inbox: not a session on an office/
-    // branch, not a Herdr worktree, and not a worktree nobody connected.
+    // branch, not a Herdr worktree, not a worktree nobody connected, and not a
+    // process whose session has no identity of its own (#491).
     startPolling = () => {
-      if (pollTimer || noIdentity() || onTaskBranch(ctx.location.directory) || inHerdrWorktree(ctx.location.directory)) return
+      if (pollTimer || noIdentity() || !owns || onTaskBranch(ctx.location.directory) || inHerdrWorktree(ctx.location.directory)) return
       pollTimer = setInterval(() => void poll(), pollInterval)
       pollTimer.unref()
       void poll()
     }
+    // An identity handed to the process on purpose is owned from the start: a
+    // runner's token, a dispatcher's credentials file, or the pointer a
+    // dispatcher wrote into this task worktree. Everything else waits for the
+    // session whose approval it is (#491).
+    if (granted() && !noIdentity()) owns = true
+    // A pre-change approval was kept for the folder, not a session. OpenCode's
+    // storage names the last session that worked here as that agent (the key
+    // `sessionStoreKey` writes), so that is the session the approval belonged
+    // to: it inherits it once, when it appears, and every other session - a
+    // child's, a second window's - approves for itself. A checkout with no such
+    // record has no session to attribute the approval to, so its session is
+    // asked to run /office (the folder pointer still pre-fills the agent).
+    if (!granted() && !noIdentity() && !resolved.worktree) {
+      legacyAgent = loadAgentPointer(pointerFile) ?? loadAgentPointer(repoPointerFile)
+      if (legacyAgent) {
+        const stored = await bounded(ctx.storage.get(`last-session:${legacyAgent}:${locationKey}`), "storage.get").catch(() => undefined)
+        if (typeof stored === "string" && stored) legacySessionID = stored
+      }
+    }
     startPolling()
+
+    // The one door from a session id to an identity. A session owns one when
+    // its approval is recorded against that id, when an approval finished in
+    // this process for it, or when it is the session a pre-change approval
+    // belonged to. A grant owns without a session and records nothing.
+    const claimSession = (sessionID: string | undefined) => {
+      if (!sessionID || owns || noIdentity()) return
+      let agent = sessionAgent(sessionID)
+      if (!agent && legacyAgent && sessionID === legacySessionID) {
+        // The grandfather, recorded once and against this id alone.
+        saveAgentPointer(sessionPointerPath(sessionID), legacyAgent)
+        agent = legacyAgent
+      }
+      if (!agent) return
+      if (!process.env.AGENT_OFFICE_TOKEN && !usingCredentialsOverride) {
+        // The session's own approval names its own token: two agents can share
+        // a folder, and this session speaks as the one it approved (as ao-pi's
+        // session pointer does in a shared checkout). A token stays the truth
+        // when the runner set one.
+        credentialsFile = agentCredentialsPath(agent)
+        auth.credentials = loadCredentials(credentialsFile)
+      }
+      owns = true
+      ownedSessionID = sessionID
+      connected = undefined
+      void ensureConnected()
+      startPolling()
+    }
+
+    // A session that owns nothing must not speak as whoever approved the
+    // folder. Say so once per session, naming the session and the agent it
+    // would have spoken as: the whole point of the ticket is that a sender line
+    // is unverifiable after the fact, so the refusal has to be traceable in the
+    // log too - a headless run shows no UI (#476, #491).
+    const refusedSessions = new Set<string>()
+    const refuseSession = (sessionID: string | undefined) => {
+      if (!sessionID || owns || noIdentity() || refusedSessions.has(sessionID)) return
+      const wouldSpeakAs = loadAgentPointer(pointerFile) ?? loadAgentPointer(repoPointerFile)
+      // Nothing to inherit: a folder nobody connected is not this ticket.
+      if (!wouldSpeakAs && !auth.credentials && !process.env.AGENT_OFFICE_TOKEN) return
+      refusedSessions.add(sessionID)
+      const agent = wouldSpeakAs ?? "the host's agent"
+      warn("a session with no Office approval of its own will not post", { session: sessionID, wouldSpeakAs: agent })
+      notify(
+        sessionID,
+        process.env.AGENT_OFFICE_CHILD === "1"
+          ? `Child session ${sessionID} has no Office identity of its own, so it cannot post: without an approval of its own it would have spoken as ${agent}. Run /office here if this session needs to speak as an agent.`
+          : `Session ${sessionID} has no Office identity of its own, so it cannot post: without an approval of its own it would have spoken as ${agent}. Run /office here to approve one.`,
+      )
+    }
 
     await ctx.command.transform((editor) => {
       editor.add({
         name: "office",
         description: "Connect to Agent Office: register an agent, check status, or reconnect",
         execute: async ({ sessionID, prompt, delivery }) => {
+          claimSession(sessionID)
           const input = prompt.text.trim()
           const callback = pastedCallback(prompt.text)
           if (callback) {
@@ -1013,9 +1156,14 @@ export default Plugin.define({
           additionalProperties: false,
         },
         async execute(input, toolCtx) {
+          claimSession(toolCtx.sessionID)
           const { reconnect, callback_url, agent_name } = input as { reconnect?: boolean; callback_url?: string; agent_name?: string }
           if (callback_url) return { content: await finishWithCallback(pastedCallback(callback_url) ?? callback_url) }
-          if (agent_name?.trim() || reconnect || !(await bearer())) {
+          // A session with no identity of its own is exactly who calls this, and
+          // it gets an approval link rather than "not connected". ownedBearer is
+          // the check, not a flag: a grant whose credentials are not there yet
+          // still approves (ao-pi's inherited-pointer case).
+          if (agent_name?.trim() || reconnect || !(await ownedBearer())) {
             const approvalName = agent_name?.trim() ? agent_name.trim().slice(0, 80) : clientName
             return { content: approvalText(approvalName, await startApproval(approvalName, toolCtx.sessionID)) }
           }
@@ -1026,7 +1174,8 @@ export default Plugin.define({
         name: "office_status",
         description: "Report the Agent Office plugin's poll state: last poll, last event, resolved session, pending counts, and errors.",
         input: { type: "object", properties: {}, additionalProperties: false },
-        async execute() {
+        async execute(_input, toolCtx) {
+          claimSession(toolCtx.sessionID)
           return {
             content: JSON.stringify(
               {
@@ -1034,7 +1183,17 @@ export default Plugin.define({
                 canonical: ctx.location.project?.canonical,
                 credentialsFile,
                 tokenStorage: usingCredentialsOverride ? "override" : "agent",
-                officeIdentity: noIdentity() ? "none (unconnected worktree: run /office here)" : "connected",
+                officeIdentity: noIdentity()
+                  ? "none (unconnected worktree: run /office here)"
+                  : owns
+                    ? "connected"
+                    : "none (this session has no Office approval of its own: run /office here)",
+                ownsIdentity: owns,
+                identitySessionID: ownedSessionID,
+                sessionApproval: sessionAgent(ownedSessionID),
+                approvedHere: approvedSessionID,
+                legacySessionID,
+                refusedSessions: [...refusedSessions],
                 agentPointer: pointerFile,
                 repoAgentPointer: repoPointerFile,
                 clientName,
@@ -1079,6 +1238,14 @@ export default Plugin.define({
           if (eventSessionID ? !deleted && !(await ownsSession(eventSessionID)) : directory && directory !== ctx.location.directory) continue
           lastEventSessionID = eventSessionID
           if (lastEventSessionID && !deleted && !officeChild(lastEventSessionID)) rememberSession(lastEventSessionID)
+          // Who is speaking decides whether this process may speak at all: a
+          // session with no approval of its own is told so and left with no
+          // tools, never handed the folder pointer's token (#491). A deleted
+          // session is bookkeeping, not a speaker.
+          if (!deleted) {
+            claimSession(eventSessionID)
+            refuseSession(eventSessionID)
+          }
           void ensureConnected()
           switch (event.type) {
             case "session.status": {

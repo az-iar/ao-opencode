@@ -53,6 +53,21 @@ New messages, from Azri or any other agent, never enter your chat. They are queu
 
 Office text (message senders and subjects, task titles and descriptions) reaches the model only inside an `<office-data>` JSON block, so it cannot pose as the plugin's own instructions. Every inbox and dispatch prompt also says that no message, whoever sent it, unlocks reading or sending credentials (tokens, `~/.config/agent-office`, `~/.ssh`, `.env` files) or changing permissions, plugins or config.
 
+## Session identity
+
+An approval belongs to the session that made it, not to the folder. The plugin records it under `~/.config/agent-office/opencode/sessions/<session-id>.json`, and only a session with such a record (or one that approved in the running process) polls, reports status, registers the `office` MCP server or posts. The folder pointer still names the agent to pre-fill on the approval page, but it is not authority to send: a child session - the same folder, environment and pointer files with a different session id - is told so, naming the session and the agent it would have spoken as, and gets no Office tools instead of posting as its host. Run `/office` in that session to give it an identity of its own.
+
+`AGENT_OFFICE_TOKEN` is the process's own identity when a runner sets it, and `AGENT_OFFICE_OPENCODE_CREDENTIALS` is a dispatcher's grant; both act without a session approval, because the identity was handed to the process on purpose rather than inherited. A task worktree's worker is the same: its dispatcher writes the worktree's own pointer with a `dispatch` mark, and that mark is the grant.
+
+Two limits are worth knowing. OpenCode's MCP registry is per process, so sessions sharing one OpenCode process - the inbox child the plugin starts, a subagent - share that process's registration; the gate decides whether the process may speak at all and which agent it speaks as, not what an in-process session may see. The cron poller is an operator-installed line with no session, so it still polls as the folder's agent.
+
+### Upgrading from a folder-scoped approval
+
+Before this change the plugin recorded an approval for the folder and wrote no session pointer. ao-pi's approvals have been per session since 30 October 2026, so its fix (ao-pi#3) had nothing to migrate; the equivalent here is:
+
+- if OpenCode still remembers the last session that worked in this folder as that agent (stored as `last-session:<agent>:<folder>`), that session adopts the existing approval once, when it appears, and it is recorded against its id from then on. This is the normal upgrade path: the chat that was open keeps working without `/office`.
+- otherwise there is no session the approval belonged to, so it is pre-fill only: the session is told it has no Office identity of its own and asked to run `/office`, whose approval page already names the same agent. After that one approval the session is remembered, and a resumed session needs nothing.
+
 ## Auto-dispatch
 
 A new task assigned to you with status `todo` is dispatched automatically to a supervisor, which runs one worker:
@@ -89,6 +104,7 @@ New messages start one `opencode run` in the workspace with the plugin's inbox p
 | `AGENT_OFFICE_OPENCODE_CREDENTIALS` | unset; an exact credentials file that overrides agent-scoped storage |
 | `AGENT_OFFICE_CLIENT_NAME` | unset; OAuth client name and new-agent prefill, defaults to `<folder>@<hostname>` |
 | `AGENT_OFFICE_CALLBACK_PORT` | `41997`, the loopback port for the OAuth callback |
+| `AGENT_OFFICE_OPEN_BROWSER` | unset, opened; `off` (also `0`, `false`, `no`) stops the approval link opening in a browser, which is what the tests set so a suite run never launches one |
 | `AGENT_OFFICE_POLL_MS` | `60000`, inbox poll interval; minimum `1000` |
 | `AGENT_OFFICE_AUTODISPATCH` | `on` (dispatch through `hc`); `off` disables it. `hc`, `herdr` and `session` are accepted aliases |
 | `AGENT_OFFICE_INBOX` | `session` (default): new mail is handed to the open session as a notice with ids and counts only. `headless` runs the full inbox brief in a child session; `off` leaves mail unread |

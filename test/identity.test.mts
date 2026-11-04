@@ -12,6 +12,10 @@ import { fileURLToPath } from "node:url"
 import { fakeOffice } from "./fake-office.mts"
 
 const pollScript = fileURLToPath(new URL("../poll.ts", import.meta.url))
+// Never open a real browser from a test: `/office` here reaches the approval
+// flow, whose opener would launch one and then pollute another test's Office
+// call log (az-iar/ao-pi#10, #13).
+process.env.AGENT_OFFICE_OPEN_BROWSER = "off"
 
 const office = fakeOffice()
 const tick = () => new Promise((r) => setTimeout(r, 20))
@@ -51,6 +55,7 @@ const {
   resolveCredentials,
   saveAgentPointer,
   saveCredentials,
+  sessionPointerPath,
   worktreeTop,
 } = lib
 const { default: plugin } = await import("../index.ts")
@@ -404,9 +409,12 @@ test("a dispatched task worktree resolves as the agent that dispatched it", asyn
   const harness = makeContext(r, r, { pollInterval: 1_000 })
   let cleanup: (() => Promise<void>) | undefined
   try {
+    // Identity is per session now (GH-491): a session with no approval of its
+    // own does not act, so this one approves first, as it would have before.
+    saveAgentPointer(sessionPointerPath("parent"), "agent-a")
     cleanup = await plugin.setup(harness.ctx)
-    await until(() => mcpCalls().length > 0, "the baseline poll")
     harness.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+    await until(() => mcpCalls().length > 0, "the parent's first checkin")
     await until(() => office.calls.some((c) => c.body?.params?.name === "checkin"), "the working report")
     office.state.openTasks = [...office.state.openTasks, { id: "task-identity", title: "Fix it", status: "todo" }]
     await until(() => existsSync(log) && readFileSync(log, "utf8").includes("run --bg"), "the hc launch")
@@ -580,6 +588,10 @@ test("the main checkout, its subdirectories and plain directories are unchanged"
   office.state.agent = { slug: "agent-a", name: "Agent A" }
   office.calls.length = 0
   const harness = makeContext(r, r, { pollInterval: 1_000 })
+  // The checkout's session approved before identity became per session (that
+  // is what its pointer file records now), so it is the one that owns the
+  // folder's agent here; nothing else in this folder does (GH-491).
+  saveAgentPointer(sessionPointerPath("main"), "agent-a")
   const cleanup = await plugin.setup(harness.ctx)
   try {
     // The checkout polls and registers its own agent as it always has.
