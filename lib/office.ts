@@ -122,9 +122,9 @@ function ensurePrivateDir(dir: string) {
 // would read as "no identity" for a session that has one (agent-office#560).
 // `runtime` is the one that last wrote the record, not the one that approved the
 // session: a re-approval by another plugin overwrites it (ao-pi#40).
-// `session` is the id itself: the file is named sha256(id)[:16], so the name cannot
-// be read back and a record that did not name its own session could not be checked
-// against the session it approves (ao-pi#40).
+// `session` is the id itself, stored for audit only: the file is named sha256(id)[:16]
+// so the name cannot be read back, and this field is what tells a human reading the
+// record which session it belongs to. Nothing compares it on read (ao-opencode#39).
 export function saveSessionAgent(sessionID: string, slug: string) {
   const path = sessionPointerPath(sessionID)
   ensurePrivateDir(dirname(path))
