@@ -843,8 +843,29 @@ export function scratchPrompt(id: string, task: any, dir: string): string {
     officeData(taskData(id, task)),
     NOTE_FIRST,
     "1. Do the work the task asks for in this directory. If it needs a repository, say so on the task and block it rather than picking one.",
+    `Write only inside ${dir}: it is the only directory this task owns, and nothing outside it is yours to change.`,
     "2. Ask Azri with ask, then await_answer, only for decisions that are Azri's.",
     "3. Post your result with post_comment and leave the task in_progress for review; if you cannot finish, set it blocked with a reason.",
     SAFETY_RULES,
   ].join("\n")
+}
+
+// repoTitle is a checkout's owner/name from its origin, lowercased, for comparing
+// a task's repo field with the checkout a session is in. It deliberately does not
+// resolve other checkouts: a task naming a different repository is refused rather
+// than chased (agent-office#556, vinn's review of ao-opencode#32).
+export function repoTitle(directory: string): string {
+  const r = spawnSync("git", ["-C", directory, "remote", "get-url", "origin"], { encoding: "utf8" })
+  const raw = r.status === 0 ? r.stdout.trim().toLowerCase().replace(/\.git$/, "") : ""
+  const m = raw.match(/([a-z0-9_.-]+)\/([a-z0-9_.-]+)$/)
+  return m ? `${m[1]}/${m[2]}` : ""
+}
+
+export function sameRepo(directory: string, wanted: string): boolean {
+  const mine = repoTitle(directory)
+  // A checkout with no origin cannot disagree with the task: there is nothing to
+  // compare, and refusing every dispatch in a remote-less repo would be worse than
+  // the mismatch this guards.
+  if (mine === "") return true
+  return mine === wanted.trim().toLowerCase().replace(/\.git$/, "")
 }
