@@ -28,6 +28,7 @@ import {
   claimNotice,
   claimTask,
   dispatchRefusal,
+  dispatchTarget,
   createBearer,
   createClient,
   DISPATCH_STALE_MS,
@@ -37,6 +38,7 @@ import {
   releaseDispatch,
   releaseNotice,
   resolveCredentials,
+  resolveDispatchRepo,
   taskPrompt,
   taskID,
   workspaceKey,
@@ -188,7 +190,17 @@ async function main(): Promise<number> {
             }
             await claimTask(call, id)
             claimed = true
-            const { path, branch } = await addWorktree(canonicalRoot(directory), id, String(task?.title ?? id))
+            // The cron path has the same rule as the session path: a named repo
+            // resolves to a local checkout by git remote, and is refused rather than
+            // dispatched in the poller's checkout (agent-office#558).
+            let dispatchRepo = canonicalRoot(directory)
+            const wantedRepo = String(task?.repo ?? "").trim()
+            if (wantedRepo) {
+              const target = dispatchTarget(wantedRepo, resolveDispatchRepo(dispatchRepo, wantedRepo))
+              if (target.kind === "refused") throw new Error(target.reason)
+              if (target.kind === "worktree") dispatchRepo = target.repo
+            }
+            const { path, branch } = await addWorktree(dispatchRepo, id, String(task?.title ?? id))
             // The worker's OpenCode opens in a linked worktree, which has no
             // Office identity unless it is given one: it gets this agent's.
             adoptWorktree(path, me.agent?.slug)

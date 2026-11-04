@@ -82,8 +82,7 @@ import {
   workspaceKey,
   dispatchTarget,
   needsCheckin,
-  repoTitle,
-  sameRepo,
+  resolveDispatchRepo,
   scratchTaskDir,
   scratchPrompt,
 } from "./lib/office.ts"
@@ -871,12 +870,12 @@ export default Plugin.define({
       // scratch directory with no repository, and the prompt says so, rather than
       // borrowing this session's checkout (agent-office#556).
       const wantedRepo = String(task?.repo ?? "").trim()
-      const target = dispatchTarget(repo, wantedRepo)
-      // A task naming a different repository is refused rather than silently
-      // dispatched here: this session's checkout is not the task's (vinn, #32).
-      if (target.kind === "worktree" && wantedRepo && !sameRepo(repo, wantedRepo)) {
-        throw new Error(`task ${id} names ${wantedRepo}, which this session's checkout (${repoTitle(repo)}) is not`)
-      }
+      // A named repo resolves to a local checkout by git remote, the session's own
+      // first and then the checkouts beside it (agent-office#558). No match, or
+      // more than one, is refused here and blocks the task with the reason; it is
+      // never dispatched in this session's checkout instead.
+      const target = dispatchTarget(wantedRepo, wantedRepo ? resolveDispatchRepo(repo, wantedRepo) : undefined)
+      if (target.kind === "refused") throw new Error(target.reason)
       if (target.kind === "scratch") {
         // Keyed by task id with no cleanup: a retry of the same task reuses the
         // directory on purpose, so an interrupted run picks up its own scratch

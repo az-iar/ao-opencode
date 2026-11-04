@@ -484,6 +484,8 @@ test("dispatches a new assigned todo task to one hc worker in its worktree", asy
   mkdirSync(repo)
   execFileSync("git", ["-C", repo, "init", "-q"])
   execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  // A named repo is resolved by origin, so the session's checkout needs one.
+  execFileSync("git", ["-C", repo, "remote", "add", "origin", "git@github.com:az-iar/ao-opencode.git"])
   // A fake hc records the argv it is given; the plugin never starts a real one.
   const bin = join(mkdtempSync(join(tmpdir(), "ao-hc-")), "hc")
   const log = `${bin}.log`
@@ -510,6 +512,117 @@ test("dispatches a new assigned todo task to one hc worker in its worktree", asy
     assert.equal(worker.created.length, 0, "no child session is created")
     assert.equal(execFileSync("git", ["-C", worktree, "branch", "--show-current"], { encoding: "utf8" }).trim(), `office/${short}`)
     assert.ok(office.calls.some((c) => c.body?.params?.name === "update_task" && c.body.params.arguments?.status === "in_progress"))
+    await cleanup()
+  } finally {
+    delete process.env.AGENT_OFFICE_HC_BIN
+    office.calls.length = 0
+  }
+})
+
+// A checkout with an origin, named as `owner/name`: what a task's repo resolves
+// against. Its parent directory is where the sibling scan looks.
+function checkout(root: string, name: string, remote: string) {
+  const path = join(root, name)
+  mkdirSync(path)
+  execFileSync("git", ["-C", path, "init", "-q"])
+  execFileSync("git", ["-C", path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  execFileSync("git", ["-C", path, "remote", "add", "origin", remote])
+  return path
+}
+
+// A fake hc that records the argv it is given and reports no live terminals.
+function recordingHc() {
+  const bin = join(mkdtempSync(join(tmpdir(), "ao-hc-")), "hc")
+  const log = `${bin}.log`
+  writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n[ "$1" = ls ] && echo '{"terminals":[]}'\nexit 0\n`, { mode: 0o755 })
+  return { bin, log }
+}
+
+test("a task naming another local checkout is dispatched in that checkout's worktree", async () => {
+  // agent-office#558: on main this is refused, and that is the bug - the other
+  // checkout is right there, and the task names it.
+  office.calls.length = 0
+  const root = mkdtempSync(join(tmpdir(), "ao-other-"))
+  const session = checkout(root, "ao-opencode", "git@github.com:az-iar/ao-opencode.git")
+  const other = checkout(root, "agent-office", "https://github.com/az-iar/agent-office.git")
+  const hc = recordingHc()
+  process.env.AGENT_OFFICE_HC_BIN = hc.bin
+  try {
+    const worker = makeContext(session, { pollInterval: 1_000 })
+    const cleanup = await plugin.setup(worker.ctx)
+    await until(() => mcpCalls().length > 0, "the baseline poll")
+    worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+    await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
+    office.state.openTasks = [...office.state.openTasks, { id: "task-other", title: "Fix it", status: "todo", repo: "az-iar/agent-office" }]
+    await until(() => existsSync(hc.log) && /^run /m.test(readFileSync(hc.log, "utf8")), "the hc launch")
+    const argv = readFileSync(hc.log, "utf8")
+    const short = createHash("sha256").update("task-other").digest("hex").slice(0, 8)
+    // The AO_HOME layout, keyed by the repo the task named.
+    const worktree = join(process.env.AO_HOME!, "worktrees", "agent-office", `${short}-fix-it`)
+    assert.ok(argv.includes(`--cwd ${worktree}`), argv)
+    assert.ok(argv.includes("--label ao.task=task-other"))
+    // A worktree of THAT checkout: its git dir is the other checkout's, not the
+    // session's.
+    assert.equal(
+      execFileSync("git", ["-C", worktree, "rev-parse", "--path-format=absolute", "--git-common-dir"], { encoding: "utf8" }).trim(),
+      join(other, ".git"),
+    )
+    assert.equal(execFileSync("git", ["-C", worktree, "branch", "--show-current"], { encoding: "utf8" }).trim(), `office/${short}`)
+    await cleanup()
+  } finally {
+    delete process.env.AGENT_OFFICE_HC_BIN
+    office.calls.length = 0
+  }
+})
+
+test("a task naming a repo with no local checkout is refused, naming the repo", async () => {
+  office.calls.length = 0
+  const root = mkdtempSync(join(tmpdir(), "ao-none-"))
+  const session = checkout(root, "ao-opencode", "git@github.com:az-iar/ao-opencode.git")
+  const hc = recordingHc()
+  process.env.AGENT_OFFICE_HC_BIN = hc.bin
+  try {
+    const worker = makeContext(session, { pollInterval: 1_000 })
+    const cleanup = await plugin.setup(worker.ctx)
+    await until(() => mcpCalls().length > 0, "the baseline poll")
+    worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+    await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
+    office.state.openTasks = [...office.state.openTasks, { id: "task-none", title: "Fix it", status: "todo", repo: "az-iar/elsewhere" }]
+    await until(() => taskUpdates("task-none").some((args) => args.status === "blocked"), "the refusal")
+    const reason = String(taskUpdates("task-none").find((args) => args.status === "blocked")?.reason ?? "")
+    assert.match(reason, /no local checkout of az-iar\/elsewhere/)
+    // Not silently dispatched in the session's checkout either.
+    const launched = existsSync(hc.log) ? readFileSync(hc.log, "utf8") : ""
+    assert.doesNotMatch(launched, /^run /m, launched)
+    await cleanup()
+  } finally {
+    delete process.env.AGENT_OFFICE_HC_BIN
+    office.calls.length = 0
+  }
+})
+
+test("a task naming a repo with two local checkouts is refused, naming both", async () => {
+  office.calls.length = 0
+  const root = mkdtempSync(join(tmpdir(), "ao-two-"))
+  const session = checkout(root, "ao-opencode", "git@github.com:az-iar/ao-opencode.git")
+  checkout(root, "agent-office-a", "git@github.com:az-iar/agent-office.git")
+  checkout(root, "agent-office-b", "https://github.com/az-iar/agent-office.git")
+  const hc = recordingHc()
+  process.env.AGENT_OFFICE_HC_BIN = hc.bin
+  try {
+    const worker = makeContext(session, { pollInterval: 1_000 })
+    const cleanup = await plugin.setup(worker.ctx)
+    await until(() => mcpCalls().length > 0, "the baseline poll")
+    worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+    await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
+    office.state.openTasks = [...office.state.openTasks, { id: "task-two", title: "Fix it", status: "todo", repo: "az-iar/agent-office" }]
+    await until(() => taskUpdates("task-two").some((args) => args.status === "blocked"), "the refusal")
+    const reason = String(taskUpdates("task-two").find((args) => args.status === "blocked")?.reason ?? "")
+    assert.match(reason, /2 checkouts of az-iar\/agent-office/)
+    assert.match(reason, /agent-office-a/)
+    assert.match(reason, /agent-office-b/)
+    const launched = existsSync(hc.log) ? readFileSync(hc.log, "utf8") : ""
+    assert.doesNotMatch(launched, /^run /m, launched)
     await cleanup()
   } finally {
     delete process.env.AGENT_OFFICE_HC_BIN
@@ -561,6 +674,7 @@ test("a labelled terminal whose agent is done does not block a retry", async () 
   mkdirSync(repo)
   execFileSync("git", ["-C", repo, "init", "-q"])
   execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  execFileSync("git", ["-C", repo, "remote", "add", "origin", "git@github.com:az-iar/ao-opencode.git"])
   // hc still lists the old worker as live, but its agent finished an hour ago.
   const bin = join(mkdtempSync(join(tmpdir(), "ao-hc-")), "hc")
   const log = `${bin}.log`
