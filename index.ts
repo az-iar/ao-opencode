@@ -831,7 +831,12 @@ export default Plugin.define({
     // identity is what the pointer is written from (agent-office#557).
     const ensureIdentity = async () => {
       if (!needsCheckin(usingCredentialsOverride, ownAgent?.slug)) return
-      if (!(await ownedBearer())) return
+      if (!(await ownedBearer())) {
+        // No bearer means no identity to fetch: as audible as a failed checkin, and
+        // it does not fail the dispatch either (neo on #33).
+        warn("dispatching with no Office bearer: the worker will have no identity")
+        return
+      }
       // A failed checkin must not kill the dispatch: the pointer is missing either
       // way, and blocking the launch is worse than a worker with no identity -
       // which is the whole point of not refusing here (neo on #33).
