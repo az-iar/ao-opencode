@@ -704,3 +704,63 @@ test("a session field of the wrong type is refused, and the warning is JSON-quot
     assert.deepEqual(again.warnings, [], `the same pair warned again: ${again.warnings.join(" | ")}`)
   })
 })
+
+// ao-opencode#41: the set of pairs already warned about was unbounded, and a
+// record whose `session` keeps changing is a new pair on every read, so a
+// long-lived poller held one string per pair it ever saw. 150 distinct pairs is
+// more than the cap, so a set that grew to 150 fails here; the count is the whole
+// of the surface the bound needs, because nothing else about the cap is visible
+// from outside. A test that repeated one pair would pass with no cap at all.
+const warnOnce = (what: string, value: string) => {
+  mkdirSync(dirname(lib.sessionPointerPath(what)), { recursive: true })
+  writeFileSync(lib.sessionPointerPath(what), JSON.stringify({ agent: "host", session: value }, null, 2) + "\n", { mode: 0o600 })
+}
+const mismatches = (seen: string[]) => seen.filter((warning) => warning.includes("ignoring it"))
+
+test("the warned pairs are bounded", () => {
+  const cap = 100
+  const sizes: number[] = []
+  let warned = 0
+  for (let i = 0; i < 150; i++) {
+    // A distinct (requested, stored) pair per read, through the path the poll
+    // takes: a record on disk that names another session.
+    const id = `bounded-session-${i}`
+    warnOnce(id, `bounded-owner-${i}`)
+    const { result, warnings: seen } = refused(() => lib.sessionAgentOf(id))
+    assert.equal(result, undefined, `pair ${i} honoured a record naming another session`)
+    warned += mismatches(seen).length
+    sizes.push(lib.refusedSessionPairCount())
+  }
+  // Every distinct pair is reported when it is first read, capped or not.
+  assert.equal(warned, 150, `the 150 distinct pairs did not each warn once: ${warned}`)
+  const largest = Math.max(...sizes)
+  assert.ok(largest <= cap, `the warned pairs set held ${largest} pairs, past the cap of ${cap}`)
+})
+
+// The consequence of clearing rather than evicting: a pair lost to the clear is
+// refused and warned about again, once, and then stays quiet - a fresh process
+// reading the same bad record. 101 distinct pairs overflow any starting state,
+// because a clear is what an add at the cap does.
+test("a pair that was cleared warns again once", () => {
+  const id = "cleared-session"
+  warnOnce(id, "cleared-owner")
+  const first = refused(() => lib.sessionAgentOf(id))
+  assert.equal(first.result, undefined, "fixture: a record naming another session was honoured")
+  assert.equal(mismatches(first.warnings).length, 1, `fixture: the pair was not warned about: ${first.warnings.join(" | ")}`)
+  const quiet = refused(() => lib.sessionAgentOf(id))
+  assert.deepEqual(quiet.warnings, [], `fixture: the same pair warned twice with no clear between: ${quiet.warnings.join(" | ")}`)
+
+  for (let i = 0; i < 101; i++) {
+    const other = `cleared-overflow-${i}`
+    warnOnce(other, `cleared-overflow-owner-${i}`)
+    refused(() => lib.sessionAgentOf(other))
+  }
+
+  // The cleared pair is still refused, so the clear costs a repeat of the
+  // warning and nothing else.
+  const again = refused(() => [lib.sessionAgentOf(id), lib.sessionAgentOf(id)])
+  assert.deepEqual(again.result, [undefined, undefined], "a cleared pair's record was honoured after the clear")
+  assert.equal(mismatches(again.warnings).length, 1, `a cleared pair did not warn exactly once after the clear: ${again.warnings.join(" | ")}`)
+  const silent = refused(() => lib.sessionAgentOf(id))
+  assert.deepEqual(silent.warnings, [], `the re-warned pair warned again on a repeat read: ${silent.warnings.join(" | ")}`)
+})

@@ -142,8 +142,18 @@ export function legacySessionPointerPath(sessionID: string): string {
 }
 
 // The pairs already refused, so each one is reported once: the poll repeats the
-// same read on a timer, and a warning per tick is noise nobody reads.
+// same read on a timer, and a warning per tick is noise nobody reads. A record
+// whose `session` keeps changing is a new pair on every read, so the set is
+// capped: unbounded, a long-lived poller held one string per pair it ever saw
+// for the life of the process (ao-opencode#41).
+const REFUSED_SESSION_PAIRS_MAX = 100
 const refusedSessionPairs = new Set<string>()
+
+// How many pairs are held, so the cap above can be asserted from outside: the
+// set itself stays private, and this is the whole of the surface the bound needs.
+export function refusedSessionPairCount(): number {
+  return refusedSessionPairs.size
+}
 
 // sessionRecordNames enforces that a record names the session it was fetched by.
 // The id has to be stored because the filename is sha256(id)[:16]: a record copied
@@ -166,6 +176,12 @@ function sessionRecordNames(record: { session?: unknown }, requested: string): b
   const shown = JSON.stringify(named) ?? String(named)
   const pair = `${requested}\u0000${shown}`
   if (!refusedSessionPairs.has(pair)) {
+    // Cleared, not evicted: this set exists only to stop a warning on every poll
+    // tick, so after a clear a pair that is still bad warns once per cycle, which
+    // is what a fresh process does. Eviction order buys nothing here - the pair
+    // evicted is no more or less stale than the one that stays, and whichever
+    // order is chosen, a still-bad pair is back to one warning a cycle anyway.
+    if (refusedSessionPairs.size >= REFUSED_SESSION_PAIRS_MAX) refusedSessionPairs.clear()
     refusedSessionPairs.add(pair)
     console.warn('[agent-office] session record for ' + requested + ' names ' + shown + ': ignoring it')
   }
