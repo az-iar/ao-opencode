@@ -671,7 +671,11 @@ test("a task naming a repo an origin-less checkout cannot match is dispatched he
     assert.ok(readFileSync(hc.log, "utf8").includes(`--cwd ${worktree}`), "the session's checkout, as before")
     assert.equal(execFileSync("git", ["-C", worktree, "rev-parse", "--path-format=absolute", "--git-common-dir"], { encoding: "utf8" }).trim(), join(session, ".git"))
     // And it is not silent about it: the fallback is announced (the new half, red on main).
-    const notice = worker.synthetics.map((m) => String(m.text)).find((text) => text.includes(`Office task ${id} dispatched`))
+    // The stub hc logs the run before it exits, and the plugin announces the
+    // dispatch only after that exit: wait for the notice, not for the log line.
+    const dispatched = () => worker.synthetics.map((m) => String(m.text)).find((text) => text.includes(`Office task ${id} dispatched`))
+    await until(() => dispatched() !== undefined, "the dispatch notice")
+    const notice = dispatched()
     assert.match(String(notice), /No checkout matched az-iar\/elsewhere and this checkout has no origin/)
   } finally {
     await cleanup?.()
@@ -702,7 +706,11 @@ test("a sibling that matches still wins over an origin-less checkout", async () 
     const worktree = join(process.env.AO_HOME!, "worktrees", "agent-office", `${short}-fix-it`)
     assert.ok(readFileSync(hc.log, "utf8").includes(`--cwd ${worktree}`), "the matching checkout, not the session's")
     assert.equal(execFileSync("git", ["-C", worktree, "rev-parse", "--path-format=absolute", "--git-common-dir"], { encoding: "utf8" }).trim(), join(other, ".git"))
-    const notice = worker.synthetics.map((m) => String(m.text)).find((text) => text.includes(`Office task ${id} dispatched`))
+    // The stub hc logs the run before it exits, and the plugin announces the
+    // dispatch only after that exit: wait for the notice, not for the log line.
+    const dispatched = () => worker.synthetics.map((m) => String(m.text)).find((text) => text.includes(`Office task ${id} dispatched`))
+    await until(() => dispatched() !== undefined, "the dispatch notice")
+    const notice = dispatched()
     assert.doesNotMatch(String(notice), /no origin/)
   } finally {
     await cleanup?.()
