@@ -495,7 +495,7 @@ test("dispatches a new assigned todo task to one hc worker in its worktree", asy
     await until(() => mcpCalls().length > 0, "the baseline poll")
     worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
     await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
-    office.state.openTasks = [...office.state.openTasks, { id: "task-dispatch", title: "Fix it", status: "todo" }]
+    office.state.openTasks = [...office.state.openTasks, { id: "task-dispatch", title: "Fix it", status: "todo", repo: "az-iar/ao-opencode" }]
     await until(() => existsSync(log) && readFileSync(log, "utf8").includes("run --bg"), "the hc launch")
     const argv = readFileSync(log, "utf8")
     const short = createHash("sha256").update("task-dispatch").digest("hex").slice(0, 8)
@@ -541,7 +541,7 @@ for (const [name, detail, ls] of [
       await until(() => mcpCalls().length > 0, "the baseline poll")
       worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
       await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
-      office.state.openTasks = [...office.state.openTasks, { id, title: "Taken", status: "todo" }]
+      office.state.openTasks = [...office.state.openTasks, { id, title: "Taken", status: "todo", repo: "az-iar/ao-opencode" }]
       await until(() => worker.synthetics.some((m) => String(m.text).includes(`Not dispatching Office task ${id}`)), "the skip notice")
       const argv = existsSync(log) ? readFileSync(log, "utf8") : ""
       assert.doesNotMatch(argv, /^run /m, "no worker is launched")
@@ -573,7 +573,7 @@ test("a labelled terminal whose agent is done does not block a retry", async () 
     await until(() => mcpCalls().length > 0, "the baseline poll")
     worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
     await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
-    office.state.openTasks = [...office.state.openTasks, { id: "task-retry", title: "Retry", status: "todo" }]
+    office.state.openTasks = [...office.state.openTasks, { id: "task-retry", title: "Retry", status: "todo", repo: "az-iar/ao-opencode" }]
     await until(() => existsSync(log) && /^run --bg/m.test(readFileSync(log, "utf8")), "the hc launch")
     assert.match(readFileSync(log, "utf8"), /--label ao\.task=task-retry/)
     await cleanup()

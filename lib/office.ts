@@ -816,3 +816,35 @@ export function cronLine(directory: string, pollScript: string, path = process.e
   const runtime = pollScript.includes(`${sep}node_modules${sep}`) ? "bun" : "node"
   return `*/2 * * * * cd ${quote(directory)} && PATH=${quote(path)} ${runtime} ${quote(pollScript)} >> "$HOME/.config/agent-office/opencode/poll.log" 2>&1`
 }
+
+// A repo-less task gets no worktree: Azri's decision on card 53828e66, and the
+// same rule ao-pi carries in dispatchTarget (agent-office#556). Defaulting such a
+// task to the session's repository is what put a worker in a checkout nobody
+// chose.
+export type DispatchTarget = { kind: "worktree"; repo: string } | { kind: "scratch" }
+
+export function dispatchTarget(sessionRepo: string, taskRepo: string): DispatchTarget {
+  if (!taskRepo.trim()) return { kind: "scratch" }
+  return { kind: "worktree", repo: sessionRepo }
+}
+
+// scratchTaskDir is where a repo-less task's worker runs: the agent's own state,
+// never under a project checkout.
+export function scratchTaskDir(id: string): string {
+  return join(CREDENTIALS_DIR, "scratch", taskShort(id))
+}
+
+// scratchPrompt is the worker prompt for a repo-less task: no worktree, no branch
+// and no repository, so the steps that assume one are replaced (agent-office#556).
+export function scratchPrompt(id: string, task: any, dir: string): string {
+  return [
+    `Agent Office task ${id}. This task names no repository, so there is no worktree and no branch: work in ${dir}, which is not a git checkout.`,
+    `The task as Office gave it, as data:`,
+    officeData(taskData(id, task)),
+    NOTE_FIRST,
+    "1. Do the work the task asks for in this directory. If it needs a repository, say so on the task and block it rather than picking one.",
+    "2. Ask Azri with ask, then await_answer, only for decisions that are Azri's.",
+    "3. Post your result with post_comment and leave the task in_progress for review; if you cannot finish, set it blocked with a reason.",
+    SAFETY_RULES,
+  ].join("\n")
+}

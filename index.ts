@@ -31,7 +31,7 @@
 import { Plugin } from "@opencode/plugin"
 import { spawn } from "node:child_process"
 import { createHash, randomBytes } from "node:crypto"
-import { existsSync } from "node:fs"
+import { mkdirSync, existsSync } from "node:fs"
 import { createServer } from "node:http"
 import { hostname } from "node:os"
 import { basename } from "node:path"
@@ -80,6 +80,9 @@ import {
   taskShort,
   tokenRequest,
   workspaceKey,
+  dispatchTarget,
+  scratchTaskDir,
+  scratchPrompt,
 } from "./lib/office.ts"
 
 export { agentCredentialsPath, agentPointerPath, credentialsPath } from "./lib/office.ts"
@@ -816,8 +819,31 @@ export default Plugin.define({
     // Herdr-core mode: one `hc` child does the whole task. The worktree is
     // ours (git), and `hc run --bg` starts an OpenCode with the task as its
     // first prompt, so there is no supervisor and no worker subagent.
+    // dispatchScratch runs a repo-less task in a directory that is not a git
+    // checkout: no branch, no worktree, and a prompt that says so (agent-office#556).
+    const dispatchScratch = async (id: string, task: any, dir: string, parent: string) => {
+      const name = `office-${taskShort(id)}-${randomBytes(2).toString("hex")}`
+      const started = await run(
+        hcBin(),
+        ["run", "--bg", "--outlive-parent", "--no-notify", "--name", name, "--label", taskLabel(id), "--cwd", dir, "opencode", "--prompt", scratchPrompt(id, task, dir)],
+        60_000,
+      )
+      if (started.code !== 0) throw new Error(`hc run failed: ${started.stderr || started.stdout}`)
+      holdDispatch(dispatchDir(), id, { terminal: name })
+      notify(parent, `Office task ${id} dispatched to hc worker ${name} with no worktree at ${dir}.`)
+    }
+
     const dispatchHc = async (id: string, task: any, title: string, parent: string) => {
-      const { path, branch } = await addWorktree(repo, id, title)
+      // A repo-less task gets no worktree (Azri's card 53828e66): it runs in a
+      // scratch directory with no repository, and the prompt says so, rather than
+      // borrowing this session's checkout (agent-office#556).
+      const target = dispatchTarget(repo, String(task?.repo ?? ""))
+      if (target.kind === "scratch") {
+        const scratch = scratchTaskDir(id)
+        mkdirSync(scratch, { recursive: true })
+        return dispatchScratch(id, task, scratch, parent)
+      }
+      const { path, branch } = await addWorktree(target.repo, id, title)
       // The worker's OpenCode opens in a linked worktree, which has no Office
       // identity unless it is given one: it gets this agent's, marked as a
       // dispatch so the worktree keeps it. Under the credentials override
