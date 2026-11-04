@@ -1,0 +1,42 @@
+name: ci
+
+# The repo had no workflow, so every pull request in ao-opencode was merged on
+# whoever ran the suite locally (az-iar/ao-opencode#25). This is the same shape
+# as ao-pi's .github/workflows/ci.yaml and ao-runner's: the checks a reviewer
+# would run by hand, on push and on every pull request.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run per branch: a force-push or a second push cancels the older run
+  # rather than paying for it twice.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # GitHub-hosted, because this repo has no self-hosted runner registered: the
+    # ai-om runners in this account belong to agent-office. The tests need
+    # nothing a hosted image lacks: they are Node, and the only network they
+    # touch is a loopback fake office (test/fake-office.mts).
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # package.json's test script passes --experimental-strip-types, which
+          # needs 22.18 or newer.
+          node-version: ">=22.18"
+          cache: npm
+      - run: npm ci
+      - name: typecheck
+        run: npm run typecheck
+      - name: test
+        run: npm test
