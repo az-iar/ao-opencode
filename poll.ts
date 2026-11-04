@@ -192,19 +192,24 @@ async function main(): Promise<number> {
             claimed = true
             // The cron path has the same rule as the session path: a named repo
             // resolves to a local checkout by git remote, and is refused rather than
-            // dispatched in the poller's checkout (agent-office#558).
+            // dispatched in the poller's checkout - except that a poller checkout
+            // with no origin at all runs the task and says so (agent-office#558).
             let dispatchRepo = canonicalRoot(directory)
+            let note = ""
             const wantedRepo = String(task?.repo ?? "").trim()
             if (wantedRepo) {
               const target = dispatchTarget(wantedRepo, resolveDispatchRepo(dispatchRepo, wantedRepo))
               if (target.kind === "refused") throw new Error(target.reason)
-              if (target.kind === "worktree") dispatchRepo = target.repo
+              if (target.kind === "worktree") {
+                dispatchRepo = target.repo
+                note = target.note ? ` ${target.note}` : ""
+              }
             }
             const { path, branch } = await addWorktree(dispatchRepo, id, String(task?.title ?? id))
             // The worker's OpenCode opens in a linked worktree, which has no
             // Office identity unless it is given one: it gets this agent's.
             adoptWorktree(path, me.agent?.slug)
-            log(`dispatching task ${id} to ${path}`)
+            log(`dispatching task ${id} to ${path}${note}`)
             log(`task ${id} run exited ${await runOpencode(path, `Office task ${id}`, taskPrompt(id, detail?.task ?? detail, path, branch), DISPATCH_STALE_MS)}`)
           } catch (err) {
             log(`could not dispatch task ${id}: ${String(err)}`)

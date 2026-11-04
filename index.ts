@@ -872,8 +872,9 @@ export default Plugin.define({
       const wantedRepo = String(task?.repo ?? "").trim()
       // A named repo resolves to a local checkout by git remote, the session's own
       // first and then the checkouts beside it (agent-office#558). No match, or
-      // more than one, is refused here and blocks the task with the reason; it is
-      // never dispatched in this session's checkout instead.
+      // more than one, is refused here and blocks the task with the reason. The one
+      // fallback, kept from #32, is a session checkout with no origin at all: it
+      // cannot disagree with the task, so it runs it - and the notice says so.
       const target = dispatchTarget(wantedRepo, wantedRepo ? resolveDispatchRepo(repo, wantedRepo) : undefined)
       if (target.kind === "refused") throw new Error(target.reason)
       if (target.kind === "scratch") {
@@ -905,7 +906,8 @@ export default Plugin.define({
       // The slot outlives this process: the lock names the terminal, and the
       // next acquire frees it once hc says it is finished or gone.
       holdDispatch(dispatchDir(), id, { terminal: name })
-      notify(parent, `Office task ${id} dispatched to hc worker ${name} (${branch}) at ${path}.`)
+      const note = target.kind === "worktree" && target.note ? ` ${target.note}` : ""
+      notify(parent, `Office task ${id} dispatched to hc worker ${name} (${branch}) at ${path}.${note}`)
     }
 
     const dispatchTask = async (id: string) => {

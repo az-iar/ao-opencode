@@ -519,14 +519,14 @@ test("dispatches a new assigned todo task to one hc worker in its worktree", asy
   }
 })
 
-// A checkout with an origin, named as `owner/name`: what a task's repo resolves
-// against. Its parent directory is where the sibling scan looks.
-function checkout(root: string, name: string, remote: string) {
+// A checkout, with an origin when named as `owner/name`: what a task's repo
+// resolves against. Its parent directory is where the sibling scan looks.
+function checkout(root: string, name: string, remote?: string) {
   const path = join(root, name)
   mkdirSync(path)
   execFileSync("git", ["-C", path, "init", "-q"])
   execFileSync("git", ["-C", path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
-  execFileSync("git", ["-C", path, "remote", "add", "origin", remote])
+  if (remote) execFileSync("git", ["-C", path, "remote", "add", "origin", remote])
   return path
 }
 
@@ -640,6 +640,73 @@ test("a task naming a repo with two local checkouts is refused, naming both", as
   } finally {
     await cleanup?.()
     office.state.openTasks = office.state.openTasks.filter((task) => task.id !== "task-two-checkouts")
+    delete process.env.AGENT_OFFICE_HC_BIN
+    office.calls.length = 0
+  }
+})
+
+// vinn's rule in ao-opencode#32, kept by Azri on #558: "A checkout with no origin
+// cannot disagree with the task: there is nothing to compare, and refusing every
+// dispatch in a remote-less repo would be worse than the mismatch." So this one
+// still dispatches where main does - the regression guard - and the two tests
+// after it are the part that is new.
+test("a task naming a repo an origin-less checkout cannot match is dispatched here anyway", async () => {
+  office.calls.length = 0
+  const root = mkdtempSync(join(tmpdir(), "ao-noorigin-"))
+  const session = checkout(root, "repo")
+  const hc = recordingHc()
+  process.env.AGENT_OFFICE_HC_BIN = hc.bin
+  let cleanup: (() => Promise<void>) | undefined
+  const id = "task-noorigin"
+  try {
+    const worker = makeContext(session, { pollInterval: 1_000 })
+    cleanup = await plugin.setup(worker.ctx)
+    await until(() => mcpCalls().length > 0, "the baseline poll")
+    worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+    await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
+    office.state.openTasks = [...office.state.openTasks, { id, title: "Fix it", status: "todo", repo: "az-iar/elsewhere" }]
+    await until(() => existsSync(hc.log) && /^run /m.test(readFileSync(hc.log, "utf8")), "the hc launch")
+    const short = createHash("sha256").update(id).digest("hex").slice(0, 8)
+    const worktree = join(process.env.AO_HOME!, "worktrees", "repo", `${short}-fix-it`)
+    assert.ok(readFileSync(hc.log, "utf8").includes(`--cwd ${worktree}`), "the session's checkout, as before")
+    assert.equal(execFileSync("git", ["-C", worktree, "rev-parse", "--path-format=absolute", "--git-common-dir"], { encoding: "utf8" }).trim(), join(session, ".git"))
+    // And it is not silent about it: the fallback is announced (the new half, red on main).
+    const notice = worker.synthetics.map((m) => String(m.text)).find((text) => text.includes(`Office task ${id} dispatched`))
+    assert.match(String(notice), /No checkout matched az-iar\/elsewhere and this checkout has no origin/)
+  } finally {
+    await cleanup?.()
+    office.state.openTasks = office.state.openTasks.filter((task) => task.id !== id)
+    delete process.env.AGENT_OFFICE_HC_BIN
+    office.calls.length = 0
+  }
+})
+
+test("a sibling that matches still wins over an origin-less checkout", async () => {
+  office.calls.length = 0
+  const root = mkdtempSync(join(tmpdir(), "ao-noorigin-sibling-"))
+  const session = checkout(root, "repo")
+  const other = checkout(root, "agent-office", "git@github.com:az-iar/agent-office.git")
+  const hc = recordingHc()
+  process.env.AGENT_OFFICE_HC_BIN = hc.bin
+  let cleanup: (() => Promise<void>) | undefined
+  const id = "task-noorigin-sibling"
+  try {
+    const worker = makeContext(session, { pollInterval: 1_000 })
+    cleanup = await plugin.setup(worker.ctx)
+    await until(() => mcpCalls().length > 0, "the baseline poll")
+    worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+    await until(() => office.calls.some((c) => c.path === "/mcp"), "the working report")
+    office.state.openTasks = [...office.state.openTasks, { id, title: "Fix it", status: "todo", repo: "az-iar/agent-office" }]
+    await until(() => existsSync(hc.log) && /^run /m.test(readFileSync(hc.log, "utf8")), "the hc launch")
+    const short = createHash("sha256").update(id).digest("hex").slice(0, 8)
+    const worktree = join(process.env.AO_HOME!, "worktrees", "agent-office", `${short}-fix-it`)
+    assert.ok(readFileSync(hc.log, "utf8").includes(`--cwd ${worktree}`), "the matching checkout, not the session's")
+    assert.equal(execFileSync("git", ["-C", worktree, "rev-parse", "--path-format=absolute", "--git-common-dir"], { encoding: "utf8" }).trim(), join(other, ".git"))
+    const notice = worker.synthetics.map((m) => String(m.text)).find((text) => text.includes(`Office task ${id} dispatched`))
+    assert.doesNotMatch(String(notice), /no origin/)
+  } finally {
+    await cleanup?.()
+    office.state.openTasks = office.state.openTasks.filter((task) => task.id !== id)
     delete process.env.AGENT_OFFICE_HC_BIN
     office.calls.length = 0
   }

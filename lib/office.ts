@@ -824,14 +824,15 @@ export function cronLine(directory: string, pollScript: string, path = process.e
 //
 // A task that NAMES a repo is resolved to a local checkout first, never assumed
 // to be the session's (agent-office#558): `resolved` is that lookup's answer, so
-// this stays the only place where scratch, worktree and refusal are decided.
-export type DispatchTarget = { kind: "worktree"; repo: string } | { kind: "scratch" } | { kind: "refused"; reason: string }
+// this stays the only place where scratch, worktree and refusal are decided. A
+// resolution that carries a note is one dispatch has to say out loud.
+export type DispatchTarget = { kind: "worktree"; repo: string; note?: string } | { kind: "scratch" } | { kind: "refused"; reason: string }
 
 export function dispatchTarget(taskRepo: string, resolved?: RepoChoice): DispatchTarget {
   if (!taskRepo.trim()) return { kind: "scratch" }
   if (!resolved) return { kind: "refused", reason: `no checkout was looked up for ${taskRepo.trim()}` }
   if ("error" in resolved) return { kind: "refused", reason: resolved.error }
-  return { kind: "worktree", repo: resolved.path }
+  return { kind: "worktree", repo: resolved.path, ...(resolved.note ? { note: resolved.note } : {}) }
 }
 
 // scratchTaskDir is where a repo-less task's worker runs: the agent's own state,
@@ -876,15 +877,24 @@ export function repoFromRemote(remote: string): string | undefined {
   return match ? `${match[1]}/${match[2]}` : undefined
 }
 
-export type RepoChoice = { path: string } | { error: string }
+// RepoChoice is a checkout, optionally with a note the notice has to carry, or the
+// reason there is none.
+export type RepoChoice = { path: string; note?: string } | { error: string }
+
+// matchingCheckouts is every candidate whose origin is the task's repo: the match
+// key for dispatch, so a directory name never stands in for a remote.
+function matchingCheckouts(wanted: string, candidates: { path: string; remote?: string }[]) {
+  // Accept `owner/name` or a remote URL, compared the way repoFromRemote reads it.
+  const normalised = repoFromRemote(wanted) ?? wanted.trim().toLowerCase()
+  const matches = candidates.filter((candidate) => candidate.remote && repoFromRemote(candidate.remote) === normalised)
+  return { normalised, matches }
+}
 
 // chooseRepo picks the checkout for a task's repo from the candidates it was
 // given. It refuses rather than guesses: no match, or more than one, is an error
 // naming the repo and what was found.
 export function chooseRepo(wanted: string, candidates: { path: string; remote?: string }[]): RepoChoice {
-  // Accept `owner/name` or a remote URL, compared the way repoFromRemote reads it.
-  const normalised = repoFromRemote(wanted) ?? wanted.trim().toLowerCase()
-  const matches = candidates.filter((candidate) => candidate.remote && repoFromRemote(candidate.remote) === normalised)
+  const { normalised, matches } = matchingCheckouts(wanted, candidates)
   if (matches.length === 1) return { path: matches[0].path }
   if (matches.length === 0) {
     return { error: `no local checkout of ${normalised} beside the session's checkout; clone it there or clear the task's repo` }
@@ -913,7 +923,11 @@ export function dedupeCandidates<T extends { path: string; commonDir?: string }>
 }
 
 // resolveDispatchRepo answers which checkout a dispatch for this task should use:
-// a named repo is matched by remote, and never falls back to the session's.
+// a named repo is matched by remote, and never silently falls back to the
+// session's - the one exception is a session checkout with no origin at all, which
+// vinn's rule in ao-opencode#32 keeps: it cannot disagree with the task, and
+// refusing every dispatch in a remote-less workspace would be worse than the
+// mismatch. That fallback carries a note, so the dispatch says what it did.
 export function resolveDispatchRepo(
   sessionRepo: string,
   taskRepo: string,
@@ -921,7 +935,19 @@ export function resolveDispatchRepo(
 ): RepoChoice {
   const wanted = taskRepo.trim().toLowerCase()
   if (!wanted) return { path: sessionRepo }
-  return chooseRepo(wanted, dedupeCandidates(list(sessionRepo)))
+  // The session's own entry is read before the dedupe, which keeps the main checkout
+  // of a repository and would otherwise drop the session when it is a linked
+  // worktree of it.
+  const listed = list(sessionRepo)
+  const session = listed.find((candidate) => candidate.path === sessionRepo)
+  const candidates = dedupeCandidates(listed)
+  const { normalised, matches } = matchingCheckouts(wanted, candidates)
+  // Zero matches and a remote-less session checkout: it is the only checkout that
+  // could not disagree with the task, so it runs the task and the notice says why.
+  if (matches.length === 0 && session && !session.remote) {
+    return { path: sessionRepo, note: `No checkout matched ${normalised} and this checkout has no origin to match against, so the task runs here.` }
+  }
+  return chooseRepo(wanted, candidates)
 }
 
 // siblingCheckouts lists the checkouts beside a repository: the repository itself

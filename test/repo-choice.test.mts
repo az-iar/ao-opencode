@@ -58,6 +58,42 @@ test("resolveDispatchRepo looks at the session's own checkout first", () => {
   assert.deepEqual(resolveDispatchRepo("/work/ao-opencode", "", () => candidates), { path: "/work/ao-opencode" });
 });
 
+// vinn's rule in ao-opencode#32, kept by Azri on #558: a checkout with no origin
+// cannot disagree with the task, so it still runs a task naming another repo -
+// but says so, and a matching sibling still wins.
+test("a named repo in an origin-less checkout runs there, with a note saying why", () => {
+  const chosen = resolveDispatchRepo("/work/repo", "az-iar/elsewhere", () => [{ path: "/work/repo" }]);
+  assert.ok("path" in chosen);
+  assert.equal(chosen.path, "/work/repo");
+  assert.match(String(chosen.note), /No checkout matched az-iar\/elsewhere and this checkout has no origin/);
+  // dispatchTarget carries the note to the dispatch notice, so it is not silent.
+  assert.deepEqual(dispatchTarget("az-iar/elsewhere", chosen), { kind: "worktree", repo: "/work/repo", note: chosen.note });
+});
+
+test("a matching sibling wins over the origin-less checkout", () => {
+  const candidates = [{ path: "/work/repo" }, { path: "/work/agent-office", remote: "git@github.com:az-iar/agent-office.git" }];
+  assert.deepEqual(resolveDispatchRepo("/work/repo", "az-iar/agent-office", () => candidates), { path: "/work/agent-office" });
+});
+
+test("two matches are still refused when the session checkout has no origin", () => {
+  const candidates = [
+    { path: "/work/repo" },
+    { path: "/work/a", remote: "git@github.com:az-iar/agent-office.git" },
+    { path: "/work/b", remote: "https://github.com/az-iar/agent-office.git" },
+  ];
+  const chosen = resolveDispatchRepo("/work/repo", "az-iar/agent-office", () => candidates);
+  assert.ok("error" in chosen);
+  assert.match(chosen.error, /^2 checkouts of az-iar\/agent-office/);
+});
+
+test("an origin-less checkout does not absorb a task whose checkout is elsewhere with an origin of its own", () => {
+  // The fallback is only for zero matches; a session WITH an origin refuses instead.
+  const candidates = [{ path: "/work/repo", remote: "git@github.com:az-iar/ao-opencode.git" }];
+  const chosen = resolveDispatchRepo("/work/repo", "az-iar/elsewhere", () => candidates);
+  assert.ok("error" in chosen);
+  assert.match(chosen.error, /no local checkout of az-iar\/elsewhere/);
+});
+
 test("siblingCheckouts finds the session's checkout and the ones beside it, and counts a worktree once", () => {
   const root = mkdtempSync(join(tmpdir(), "ao-siblings-"));
   const session = join(root, "ao-opencode");
