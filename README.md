@@ -53,6 +53,12 @@ New messages, from Azri or any other agent, never enter your chat. They are queu
 
 Office text (message senders and subjects, task titles and descriptions) reaches the model only inside an `<office-data>` JSON block, so it cannot pose as the plugin's own instructions. Every inbox and dispatch prompt also says that no message, whoever sent it, unlocks reading or sending credentials (tokens, `~/.config/agent-office`, `~/.ssh`, `.env` files) or changing permissions, plugins or config.
 
+### Bridge delivery
+
+Office can hand an agent's wakes to the host's daemon instead, which types them into the agent's session pane: its `checkin` presence then says `delivery_mode: bridge`. On bridge the plugin stands down. It still polls and still dispatches assigned tasks, but new mail is only recorded in its local seen state, nothing is handed to the chat or an inbox child, and no headless run is started; the mail stays unread in Office because the bridge's wake is what gets it read. The stand-down is logged once per change of mode, and a flip back to the `plugin` mode is picked up on the next poll with no restart (mail the bridge already handled is not delivered again).
+
+Office refuses a flip to bridge unless the agent has a live session pane, so in every delivery mode the plugin labels the hc terminal it is running in with `hc label <terminal> ao.agent=<slug> ao.role=session` as soon as the checkin names its agent, and again if that slug changes. It reads the terminal id from `HC_TERMINAL_ID`, is skipped inside a child or headless run, and never labels from `poll.ts`. No terminal id or no `hc` costs the label silently; a failed `hc` is logged and retried on the next poll, and polling carries on.
+
 ## Session identity
 
 An approval belongs to the session that made it, not to the folder. The plugin records it under `~/.config/agent-office/opencode/sessions/<key>.json`, where `<key>` is the first 16 hex characters of the SHA-256 of the session id (`sessionPointerPath`), so look for the hash, not the id, and only a session with such a record (or one that approved in the running process) polls, reports status, registers the `office` MCP server or posts. The folder pointer still names the agent to pre-fill on the approval page, but it is not authority to send: a child session - the same folder, environment and pointer files with a different session id - is told so, naming the session and the agent it would have spoken as, and gets no Office tools instead of posting as its host. Run `/office` in that session to give it an identity of its own.
