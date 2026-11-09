@@ -59,6 +59,8 @@ import {
   createBearer,
   createClient,
   cronLine,
+  deliveredByBridge,
+  deliveryModeOf,
   DISPATCH_STALE_MS,
   fromOthers,
   inboxNotice,
@@ -77,6 +79,7 @@ import {
   saveCredentials,
   sessionPointerPath,
   summary,
+  sessionLabels,
   taskPrompt,
   taskID,
   taskLabel,
@@ -585,6 +588,50 @@ export default Plugin.define({
     let lastPromptError: string | undefined
     let lastPending: Record<string, number> | undefined
     let ownAgent: { id?: string; slug?: string } | undefined
+    // The delivery mode the last checkin reported (Bridge M3). Read fresh from
+    // every poll, so a flip back resumes delivery on the next one. A mode this
+    // plugin does not know is not "bridge": it falls through to today's path.
+    let lastDeliveryMode: string | undefined
+    const noteDeliveryMode = (mode: string) => {
+      if (mode === lastDeliveryMode) return
+      const was = lastDeliveryMode
+      lastDeliveryMode = mode
+      if (deliveredByBridge(mode)) warn("Office delivers this agent by the bridge: this poller stands down until the mode changes")
+      else if (deliveredByBridge(was ?? "")) warn("Office no longer delivers this agent by the bridge: this poller is delivering again")
+    }
+    // This process's pane, as hc names it. Office refuses a flip to bridge while
+    // the agent has no live session pane, so the label must exist before the
+    // flip, in every delivery mode. Only a person's session may claim the role:
+    // an inbox child or a headless run labelled as a session would take the
+    // agent's wakes. A terminal id or hc that is not there costs the label, and
+    // the failure is logged, never thrown into connecting or polling.
+    let labelledSlug: string | undefined
+    let labelFailureWarned: string | undefined
+    const labelSession = (slug: string | undefined) => {
+      if (!slug || process.env.AGENT_OFFICE_CHILD === "1" || labelledSlug === slug) return
+      const terminal = process.env.HC_TERMINAL_ID
+      if (!terminal) return
+      void run(hcBin(), ["label", terminal, ...sessionLabels(slug)], 10_000).then(
+        (got) => {
+          if (got.code === 0) {
+            labelledSlug = slug
+            return
+          }
+          // Retried on the next poll, but said once per slug.
+          if (labelFailureWarned === slug) return
+          labelFailureWarned = slug
+          warn("could not label this terminal as an Office session", { terminal, slug, exit: got.code, error: got.stderr.trim().slice(0, 200) })
+        },
+        (err) => {
+          // No hc on this machine is not a failure worth a line: the label is
+          // presence only, and this plugin never labelled a terminal before.
+          if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return
+          if (labelFailureWarned === slug) return
+          labelFailureWarned = slug
+          warn("could not run hc to label this terminal as an Office session", { terminal, slug, error: String(err) })
+        },
+      )
+    }
 
     // Reports run one after another so a short turn cannot land idle before working.
     const report = (status: "working" | "idle") => {
@@ -762,7 +809,11 @@ export default Plugin.define({
       adoptAgent(me.agent?.slug, via)
       ownAgent = me.agent
       await syncMcpIdentity()
-      await observePending(me.pending, false)
+      noteDeliveryMode(deliveryModeOf(me))
+      // The label is presence for a bridge flip, not a delivery path: set it
+      // here and on every poll, in every delivery mode.
+      labelSession(me.agent?.slug)
+      await observePending(me.pending, false, deliveryModeOf(me))
       const pending = me.pending ?? {}
       const summary = `Connected to Agent Office as @${me.agent?.slug} (${me.agent?.name}). Open tasks: ${pending.open_tasks?.length ?? 0}, unclaimed team tasks: ${pending.unclaimed_team_tasks?.length ?? 0}, unread messages: ${pending.unread_messages?.length ?? 0}. The office MCP tools are available; call checkin first.`
       if (!existsSync(POLL_SCRIPT)) return summary
@@ -997,7 +1048,13 @@ export default Plugin.define({
 
     // Polling reports only new items. The first successful checkin is a
     // baseline: existing unread mail is already visible through checkin.
-    const observePending = async (pending: any, live: boolean) => {
+    // `mode` is the delivery mode that same checkin reported. On "bridge" the
+    // host's daemon types the wake and is what marks the mail read, so this
+    // poller records the mail as handled in its own seen state, hands nothing
+    // to a session and starts no run. Tasks are not mail: dispatch below is
+    // unchanged. Any other mode, and a missing one, is the path it always was.
+    const observePending = async (pending: any, live: boolean, mode: string) => {
+      const bridge = deliveredByBridge(mode)
       const messages: any[] = (Array.isArray(pending?.unread_messages) ? pending.unread_messages : []).filter((item: any) => fromOthers(item, ownAgent))
       const tasks: any[] = Array.isArray(pending?.unclaimed_team_tasks) ? pending.unclaimed_team_tasks : []
       const assigned: any[] = Array.isArray(pending?.open_tasks) ? pending.open_tasks : []
@@ -1013,6 +1070,9 @@ export default Plugin.define({
         freshAssigned.length = 0
         pollPrimed = true
       }
+      // A bridge poll still consumes mail, even when no session is known yet:
+      // the wake, not this poller, is what marks it read on the server.
+      if (live && bridge) for (const item of freshMessages) seenMessages.add(itemKey(item, "message"))
       if (!live || (freshMessages.length === 0 && freshTasks.length === 0 && freshAssigned.length === 0)) return
 
       const sessionID = await targetSessionAsync()
@@ -1025,7 +1085,10 @@ export default Plugin.define({
         if (String(item?.status ?? "todo").toLowerCase() === "todo") backlog.add(taskID(item))
       }
 
-      if (freshMessages.length > 0 && inboxMode === "off") {
+      if (bridge) {
+        // Already recorded as handled above. Never marked read on the server:
+        // the bridge's wake is what gets it read.
+      } else if (freshMessages.length > 0 && inboxMode === "off") {
         // Left unread on purpose: the ids stay seen so one batch is not
         // announced on every poll, and a human sees them in Office.
         for (const item of freshMessages) seenMessages.add(itemKey(item, "message"))
@@ -1093,7 +1156,9 @@ export default Plugin.define({
         await syncMcpIdentity()
         lastPollAt = Date.now()
         lastPollError = undefined
-        await observePending(me.pending, true)
+        noteDeliveryMode(deliveryModeOf(me))
+        labelSession(me.agent?.slug)
+        await observePending(me.pending, true, deliveryModeOf(me))
       } catch (err) {
         lastPollError = String(err)
         warn("could not poll the Office inbox", { error: String(err) })
@@ -1294,6 +1359,7 @@ export default Plugin.define({
                 lastPromptAt: lastPromptAt ? new Date(lastPromptAt).toISOString() : undefined,
                 lastPromptError,
                 lastPending,
+                lastDeliveryMode,
                 seen: { messages: seenMessages.size, unclaimed: seenTasks.size, assigned: seenAssigned.size },
                 backlog: [...backlog],
                 dispatching: [...dispatching],

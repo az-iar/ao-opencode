@@ -543,6 +543,18 @@ export function fromOthers(item: any, ownAgent?: { id?: string; slug?: string })
   return true
 }
 
+// Who delivers this agent's wakes (Bridge M3): "bridge" means the host's
+// daemon types them into its session pane, so a poller must stand down and let
+// the wake be what marks the mail read. An Office older than the field sends
+// none, and that behaves exactly as it did. Only the exact value "bridge"
+// stands a poller down; anything else stays the plugin's own delivery.
+export const deliveryModeOf = (me: any): string => (typeof me?.agent?.delivery_mode === "string" ? me.agent.delivery_mode : "")
+export const deliveredByBridge = (mode: string) => mode === "bridge"
+
+// The labels that mark a pane as an agent's session (Bridge M3). Office picks a
+// bridge wake's pane by them, so only a person's session may carry the role.
+export const sessionLabels = (slug: string) => [`ao.agent=${slug}`, "ao.role=session"]
+
 const sender = (item: any) => {
   const from = item?.from ?? item?.sender
   return String((typeof from === "string" ? from : from?.slug ?? from?.name) ?? item?.agent?.slug ?? "")

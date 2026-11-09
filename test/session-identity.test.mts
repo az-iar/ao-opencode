@@ -38,6 +38,8 @@ delete process.env.AGENT_OFFICE_TOKEN
 delete process.env.AGENT_OFFICE_OPENCODE_CREDENTIALS
 delete process.env.AGENT_OFFICE_CHILD
 delete process.env.AGENT_OFFICE_CHILD_NAME
+// A real terminal id in the developer's shell must not make a test label it.
+delete process.env.HC_TERMINAL_ID
 // Never open a real browser from a test: the approval in the first case reaches
 // the opener, and a real browser's own request for the approval URL lands in
 // the next case's Office call log (az-iar/ao-pi#10, #13).

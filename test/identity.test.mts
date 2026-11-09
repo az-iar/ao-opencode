@@ -39,6 +39,7 @@ delete process.env.AGENT_OFFICE_OPENCODE_CREDENTIALS
 delete process.env.AGENT_OFFICE_TOKEN_SCOPE
 delete process.env.AGENT_OFFICE_HC_BIN
 delete process.env.HERDR_ENV
+delete process.env.HC_TERMINAL_ID
 
 const lib = await import("../lib/office.ts")
 const {

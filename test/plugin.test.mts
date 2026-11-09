@@ -39,6 +39,10 @@ process.env.AGENT_OFFICE_OPEN_BROWSER = "off"
 // Task worktrees go under a temp AO_HOME, never the real ~/.ao.
 process.env.AO_HOME = join(dir, "ao-home")
 delete process.env.AGENT_OFFICE_TOKEN
+// A real terminal id in the developer's shell would make the label tests (and
+// every connect here) label that terminal with a real hc: each test that wants
+// a label sets a fake one and a recording hc instead.
+delete process.env.HC_TERMINAL_ID
 
 const tick = () => new Promise((r) => setTimeout(r, 20))
 const until = async (check: () => boolean, what: string) => {
