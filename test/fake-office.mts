@@ -18,8 +18,10 @@ export function fakeOffice() {
     // other test's are.
     issuedToken: undefined as string | undefined,
     workStatus: "working",
-    // Who this Office says the caller is; a test sets another agent.
-    agent: { slug: "opencode", name: "OpenCode" },
+    // Who this Office says the caller is; a test sets another agent. The
+    // delivery mode is what the poller reads on every checkin (Bridge M3):
+    // undefined is an Office older than the field.
+    agent: { slug: "opencode", name: "OpenCode", delivery_mode: undefined as string | undefined },
     tokens: 0,
     openTasks: [{ id: "task-open-1", title: "Open task" }],
     unclaimedTasks: [] as any[],
