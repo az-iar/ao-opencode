@@ -59,6 +59,8 @@ import {
   createBearer,
   createClient,
   cronLine,
+  deliveredByBridge,
+  deliveryModeOf,
   DISPATCH_STALE_MS,
   fromOthers,
   inboxNotice,
@@ -68,6 +70,7 @@ import {
   OFFICE,
   officeData,
   inHerdrWorktree,
+  inScratchRoot,
   onTaskBranch,
   REFRESH_EARLY_MS,
   releaseDispatch,
@@ -77,6 +80,7 @@ import {
   saveCredentials,
   sessionPointerPath,
   summary,
+  sessionLabels,
   taskPrompt,
   taskID,
   taskLabel,
@@ -585,6 +589,84 @@ export default Plugin.define({
     let lastPromptError: string | undefined
     let lastPending: Record<string, number> | undefined
     let ownAgent: { id?: string; slug?: string } | undefined
+    // The delivery mode the last checkin reported (Bridge M3). Read fresh from
+    // every poll, so a flip back resumes delivery on the next one. A mode this
+    // plugin does not know is not "bridge": it falls through to today's path.
+    let lastDeliveryMode: string | undefined
+    const noteDeliveryMode = (mode: string) => {
+      if (mode === lastDeliveryMode) return
+      const was = lastDeliveryMode
+      lastDeliveryMode = mode
+      if (deliveredByBridge(mode)) warn("Office delivers this agent by the bridge: this poller stands down until the mode changes")
+      else if (deliveredByBridge(was ?? "")) warn("Office no longer delivers this agent by the bridge: this poller is delivering again")
+    }
+    // True only for a person's session, the one pane a bridge wake may be
+    // typed into. A worker this plugin dispatched also runs the plugin - in a
+    // task worktree on an office/ branch, in a scratch directory with no
+    // repository, or with a pointer its dispatcher marked "dispatch" - and
+    // must never carry ao.role=session: Office picks the newest session pane,
+    // so a mislabelled worker would take the agent's wakes. The same checks
+    // the poll gate uses, so the two agree, plus the scratch root a poll gate
+    // has no reason to name.
+    const isSessionProcess = () =>
+      process.env.AGENT_OFFICE_CHILD !== "1" &&
+      agentPointerVia(pointerFile) !== "dispatch" &&
+      !onTaskBranch(ctx.location.directory) &&
+      !inHerdrWorktree(ctx.location.directory) &&
+      !inScratchRoot(ctx.location.directory)
+    // This process's pane, as hc names it. Office refuses a flip to bridge while
+    // the agent has no live session pane, so the label must exist before the
+    // flip, in every delivery mode. Only a person's session may claim the role:
+    // an inbox child or a headless run labelled as a session would take the
+    // agent's wakes. A terminal id or hc that is not there costs the label, and
+    // the failure is logged, never thrown into connecting or polling.
+    //
+    // The slug is remembered only for a final outcome - labelled, refused as a
+    // worker, no terminal id, or no hc - so a live session cannot stay
+    // unlabelled for its whole life after one transient failure: a failed
+    // attempt is retried on the next poll. The warning is said once per run of
+    // identical failures, and again when the error text changes (or after a
+    // success, which starts a new run).
+    let labelledSlug: string | undefined
+    let labelLastError: string | undefined
+    const labelSession = (slug: string | undefined) => {
+      if (!slug || process.env.AGENT_OFFICE_CHILD === "1" || labelledSlug === slug) return
+      // A worker settles here: its directory, pointer and branch do not change
+      // into a person's session, so no later route labels it either.
+      if (!isSessionProcess()) {
+        labelledSlug = slug
+        return
+      }
+      const terminal = process.env.HC_TERMINAL_ID
+      if (!terminal) {
+        labelledSlug = slug
+        return
+      }
+      const failed = (error: string, extra: Record<string, unknown>) => {
+        if (labelLastError === error) return
+        labelLastError = error
+        warn("could not label this terminal as an Office session", extra)
+      }
+      void run(hcBin(), ["label", terminal, ...sessionLabels(slug)], 5_000).then(
+        (got) => {
+          if (got.code === 0) {
+            labelledSlug = slug
+            labelLastError = undefined
+            return
+          }
+          failed((got.stderr.trim() || `hc label exited ${got.code}`).slice(0, 200), { terminal, slug, exit: got.code })
+        },
+        (err) => {
+          // No hc on this machine is final, not a failure worth a line: the
+          // label is presence only, and this plugin never labelled before.
+          if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+            labelledSlug = slug
+            return
+          }
+          failed(String(err).slice(0, 200), { terminal, slug })
+        },
+      )
+    }
 
     // Reports run one after another so a short turn cannot land idle before working.
     const report = (status: "working" | "idle") => {
@@ -762,7 +844,11 @@ export default Plugin.define({
       adoptAgent(me.agent?.slug, via)
       ownAgent = me.agent
       await syncMcpIdentity()
-      await observePending(me.pending, false)
+      noteDeliveryMode(deliveryModeOf(me))
+      // The label is presence for a bridge flip, not a delivery path: set it
+      // here and on every poll, in every delivery mode.
+      labelSession(me.agent?.slug)
+      await observePending(me.pending, false, deliveryModeOf(me))
       const pending = me.pending ?? {}
       const summary = `Connected to Agent Office as @${me.agent?.slug} (${me.agent?.name}). Open tasks: ${pending.open_tasks?.length ?? 0}, unclaimed team tasks: ${pending.unclaimed_team_tasks?.length ?? 0}, unread messages: ${pending.unread_messages?.length ?? 0}. The office MCP tools are available; call checkin first.`
       if (!existsSync(POLL_SCRIPT)) return summary
@@ -997,7 +1083,13 @@ export default Plugin.define({
 
     // Polling reports only new items. The first successful checkin is a
     // baseline: existing unread mail is already visible through checkin.
-    const observePending = async (pending: any, live: boolean) => {
+    // `mode` is the delivery mode that same checkin reported. On "bridge" the
+    // host's daemon types the wake and is what marks the mail read, so this
+    // poller records the mail as handled in its own seen state, hands nothing
+    // to a session and starts no run. Tasks are not mail: dispatch below is
+    // unchanged. Any other mode, and a missing one, is the path it always was.
+    const observePending = async (pending: any, live: boolean, mode: string) => {
+      const bridge = deliveredByBridge(mode)
       const messages: any[] = (Array.isArray(pending?.unread_messages) ? pending.unread_messages : []).filter((item: any) => fromOthers(item, ownAgent))
       const tasks: any[] = Array.isArray(pending?.unclaimed_team_tasks) ? pending.unclaimed_team_tasks : []
       const assigned: any[] = Array.isArray(pending?.open_tasks) ? pending.open_tasks : []
@@ -1013,6 +1105,9 @@ export default Plugin.define({
         freshAssigned.length = 0
         pollPrimed = true
       }
+      // A bridge poll still consumes mail, even when no session is known yet:
+      // the wake, not this poller, is what marks it read on the server.
+      if (live && bridge) for (const item of freshMessages) seenMessages.add(itemKey(item, "message"))
       if (!live || (freshMessages.length === 0 && freshTasks.length === 0 && freshAssigned.length === 0)) return
 
       const sessionID = await targetSessionAsync()
@@ -1025,7 +1120,10 @@ export default Plugin.define({
         if (String(item?.status ?? "todo").toLowerCase() === "todo") backlog.add(taskID(item))
       }
 
-      if (freshMessages.length > 0 && inboxMode === "off") {
+      if (bridge) {
+        // Already recorded as handled above. Never marked read on the server:
+        // the bridge's wake is what gets it read.
+      } else if (freshMessages.length > 0 && inboxMode === "off") {
         // Left unread on purpose: the ids stay seen so one batch is not
         // announced on every poll, and a human sees them in Office.
         for (const item of freshMessages) seenMessages.add(itemKey(item, "message"))
@@ -1093,7 +1191,9 @@ export default Plugin.define({
         await syncMcpIdentity()
         lastPollAt = Date.now()
         lastPollError = undefined
-        await observePending(me.pending, true)
+        noteDeliveryMode(deliveryModeOf(me))
+        labelSession(me.agent?.slug)
+        await observePending(me.pending, true, deliveryModeOf(me))
       } catch (err) {
         lastPollError = String(err)
         warn("could not poll the Office inbox", { error: String(err) })
@@ -1294,6 +1394,7 @@ export default Plugin.define({
                 lastPromptAt: lastPromptAt ? new Date(lastPromptAt).toISOString() : undefined,
                 lastPromptError,
                 lastPending,
+                lastDeliveryMode,
                 seen: { messages: seenMessages.size, unclaimed: seenTasks.size, assigned: seenAssigned.size },
                 backlog: [...backlog],
                 dispatching: [...dispatching],

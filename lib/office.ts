@@ -543,6 +543,18 @@ export function fromOthers(item: any, ownAgent?: { id?: string; slug?: string })
   return true
 }
 
+// Who delivers this agent's wakes (Bridge M3): "bridge" means the host's
+// daemon types them into its session pane, so a poller must stand down and let
+// the wake be what marks the mail read. An Office older than the field sends
+// none, and that behaves exactly as it did. Only the exact value "bridge"
+// stands a poller down; anything else stays the plugin's own delivery.
+export const deliveryModeOf = (me: any): string => (typeof me?.agent?.delivery_mode === "string" ? me.agent.delivery_mode : "")
+export const deliveredByBridge = (mode: string) => mode === "bridge"
+
+// The labels that mark a pane as an agent's session (Bridge M3). Office picks a
+// bridge wake's pane by them, so only a person's session may carry the role.
+export const sessionLabels = (slug: string) => [`ao.agent=${slug}`, "ao.role=session"]
+
 const sender = (item: any) => {
   const from = item?.from ?? item?.sender
   return String((typeof from === "string" ? from : from?.slug ?? from?.name) ?? item?.agent?.slug ?? "")
@@ -983,7 +995,16 @@ export function dispatchTarget(taskRepo: string, resolved?: RepoChoice): Dispatc
 // scratchTaskDir is where a repo-less task's worker runs: the agent's own state,
 // never under a project checkout.
 export function scratchTaskDir(id: string): string {
-  return join(CREDENTIALS_DIR, "scratch", taskShort(id))
+  return join(SCRATCH_ROOT, taskShort(id))
+}
+
+// Every repo-less task worker runs under this root. Nothing here is a person's
+// session: it is a worker this plugin dispatched, whatever its pointer says.
+export const SCRATCH_ROOT = join(CREDENTIALS_DIR, "scratch")
+export function inScratchRoot(directory: string) {
+  const root = resolve(SCRATCH_ROOT)
+  const path = resolve(directory)
+  return path === root || path.startsWith(root + sep)
 }
 
 // scratchPrompt is the worker prompt for a repo-less task: no worktree, no branch

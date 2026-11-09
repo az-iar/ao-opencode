@@ -314,3 +314,79 @@ test("an HTTP error on the blocked update is logged, not retried on Azri, and a 
   assert.deepEqual(taskUpdates("task-taken").map((update) => update.status), ["in_progress"])
   assert.deepEqual(readdirSync(ws.state("dispatch")), [])
 })
+
+test("a bridge agent starts no inbox run, records the mail as handled and marks nothing read", async () => {
+  reset()
+  office.state.agent = { ...office.state.agent, delivery_mode: "bridge" }
+  const ws = workspace()
+  try {
+    const first = await ws.poll()
+    assert.equal(first.code, 0, first.stderr)
+    assert.match(first.stderr, /stands down/)
+    assert.deepEqual(ws.recorded(), [], "no headless inbox run")
+    assert.ok(!toolCalls().includes("mark_read"), "nothing is marked read on the server")
+    const seen = JSON.parse(readFileSync(join(ws.state("poll"), "seen.json"), "utf8"))
+    assert.deepEqual(seen.messages.sort(), ["message:message-old-1", "message:message-old-2"].sort())
+    // Once per change of mode, not on every run.
+    const second = await ws.poll()
+    assert.equal(second.code, 0, second.stderr)
+    assert.doesNotMatch(second.stderr, /stands down/)
+    assert.deepEqual(ws.recorded(), [])
+  } finally {
+    office.state.agent = { slug: "opencode", name: "OpenCode" }
+  }
+})
+
+test("a bridge agent still dispatches an assigned todo task", async () => {
+  reset()
+  office.state.agent = { ...office.state.agent, delivery_mode: "bridge" }
+  const ws = workspace()
+  try {
+    await ws.poll() // the task baseline
+    office.state.openTasks = [...office.state.openTasks, { id: "task-bridge-poll", title: "Fix it", status: "todo" }]
+    const result = await ws.poll()
+    assert.equal(result.code, 0, result.stderr)
+    const runs = ws.recorded()
+    assert.equal(runs.length, 1, "one task run and no inbox run")
+    assert.deepEqual(runs[0].argv.slice(0, 5), ["run", "--dir", ws.worktreeFor("task-bridge-poll", "fix-it"), "--title", "Office task task-bridge-poll"])
+  } finally {
+    office.state.agent = { slug: "opencode", name: "OpenCode" }
+  }
+})
+
+test("flipping a bridge agent back to poll delivers a message arriving after the flip", async () => {
+  reset()
+  office.state.agent = { ...office.state.agent, delivery_mode: "bridge" }
+  const ws = workspace()
+  try {
+    await ws.poll() // bridge records the unread mail as handled
+    assert.deepEqual(ws.recorded(), [])
+    office.state.agent = { ...office.state.agent, delivery_mode: "poll" }
+    office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-after-flip", from: "azri", subject: "After" }]
+    const result = await ws.poll()
+    assert.equal(result.code, 0, result.stderr)
+    assert.match(result.stderr, /handles mail again/)
+    assert.equal(ws.recorded().length, 1)
+    const prompt = ws.recorded()[0].argv[5]
+    assert.match(prompt, /message-after-flip/)
+    assert.doesNotMatch(prompt, /message-old-1/, "mail the bridge handled is not delivered again")
+  } finally {
+    office.state.agent = { slug: "opencode", name: "OpenCode" }
+  }
+})
+
+for (const mode of [undefined, "poll", "webhook", "agent37"] as const) {
+  test(`delivery mode ${mode ?? "(missing)"} keeps today's inbox run`, async () => {
+    reset()
+    office.state.agent = { slug: "opencode", name: "OpenCode", delivery_mode: mode }
+    const ws = workspace()
+    try {
+      const result = await ws.poll()
+      assert.equal(result.code, 0, result.stderr)
+      assert.equal(ws.recorded().length, 1, "the inbox run happens as before")
+      assert.match(ws.recorded()[0].argv[5], /^Agent Office inbox: 2 new message\(s\)/)
+    } finally {
+      office.state.agent = { slug: "opencode", name: "OpenCode" }
+    }
+  })
+}

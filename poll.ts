@@ -31,6 +31,8 @@ import {
   dispatchTarget,
   createBearer,
   createClient,
+  deliveredByBridge,
+  deliveryModeOf,
   DISPATCH_STALE_MS,
   fromOthers,
   inboxPrompt,
@@ -47,7 +49,7 @@ import {
 const OPENCODE = process.env.AGENT_OFFICE_OPENCODE_BIN || "opencode"
 const INBOX_TIMEOUT_MS = 60 * 60_000
 
-type Seen = { messages: string[]; assigned: string[]; unclaimed: string[] }
+type Seen = { messages: string[]; assigned: string[]; unclaimed: string[]; deliveryMode?: string }
 
 const log = (line: string) => process.stderr.write(`[agent-office poll] ${line}\n`)
 const list = (value: unknown): any[] => (Array.isArray(value) ? value : [])
@@ -62,7 +64,12 @@ function canonicalRoot(directory: string) {
 function loadSeen(path: string): Seen | undefined {
   try {
     const value = JSON.parse(readFileSync(path, "utf8"))
-    return { messages: list(value.messages), assigned: list(value.assigned), unclaimed: list(value.unclaimed) }
+    return {
+      messages: list(value.messages),
+      assigned: list(value.assigned),
+      unclaimed: list(value.unclaimed),
+      deliveryMode: typeof value.deliveryMode === "string" ? value.deliveryMode : undefined,
+    }
   } catch {
     return undefined
   }
@@ -153,6 +160,13 @@ async function main(): Promise<number> {
     const freshMessages = messages.filter((item) => !seenMessages.has(itemKey(item, "message")))
     const freshAssigned = saved ? assigned.filter((item) => !saved.assigned.includes(itemKey(item, "task"))) : []
     const freshUnclaimed = saved ? unclaimed.filter((item) => !saved.unclaimed.includes(itemKey(item, "task"))) : []
+    // Bridge M3: on "bridge" the host's daemon types the wake into the session
+    // pane, so this run records fresh mail as handled below and starts no run.
+    // The mode is read from this checkin, and logged only when it changes.
+    const deliveryMode = deliveryModeOf(me)
+    const bridge = deliveredByBridge(deliveryMode)
+    if (bridge && saved?.deliveryMode !== "bridge") log("the Office delivers this agent's wakes by the bridge: this poll stands down")
+    else if (!bridge && saved?.deliveryMode === "bridge") log("the Office no longer delivers this agent by the bridge: this poll handles mail again")
     log(`@${agent}: ${freshMessages.length} new message(s), ${freshAssigned.length} new assigned task(s), ${freshUnclaimed.length} new unclaimed task(s)${saved ? "" : " (task baseline)"}`)
 
     // A task the cap holds back stays unseen, so the next run tries it again.
@@ -227,6 +241,11 @@ async function main(): Promise<number> {
       const ids = freshMessages.map((item) => itemKey(item, "message"))
       if (dryRun) {
         log(`would handle message(s) ${ids.join(", ")}`)
+      } else if (bridge) {
+        // Recorded as handled here only: the bridge's wake is what marks the
+        // mail read, and this poller calls no read on the server.
+        log(`standing down for ${ids.length} message(s) delivered by the bridge`)
+        for (const id of ids) handled.add(id)
       } else if (!claimNotice(noticeDir, ids)) {
         log("another OpenCode is handling these messages")
         for (const id of ids) handled.add(id)
@@ -250,6 +269,7 @@ async function main(): Promise<number> {
         messages: messages.map((item) => itemKey(item, "message")).filter((id) => seenMessages.has(id) || handled.has(id)),
         assigned: assigned.map((item) => itemKey(item, "task")).filter((id) => !retry.has(id)),
         unclaimed: unclaimed.map((item) => itemKey(item, "task")),
+        deliveryMode,
       })
     }
   } finally {

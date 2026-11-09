@@ -10,6 +10,11 @@ import { fakeOffice } from "./fake-office.mts"
 
 const office = fakeOffice()
 const dir = mkdtempSync(join(tmpdir(), "ao-opencode-"))
+// Credentials, pointers, session records and the scratch root live under
+// $HOME, so this suite gets a home of its own. It has to be set before
+// index.ts loads (the before hook imports it): the credential paths and the
+// scratch root are module constants.
+process.env.HOME = dir
 const credentials = join(dir, "opencode.json")
 process.env.AGENT_OFFICE_OPENCODE_CREDENTIALS = credentials
 // The plugin reads its preferred callback port once, at import, so the base has
@@ -39,6 +44,13 @@ process.env.AGENT_OFFICE_OPEN_BROWSER = "off"
 // Task worktrees go under a temp AO_HOME, never the real ~/.ao.
 process.env.AO_HOME = join(dir, "ao-home")
 delete process.env.AGENT_OFFICE_TOKEN
+// Inside Herdr a linked worktree does not poll; the label tests here need a
+// person's marked worktree to poll, so the ambient flag goes.
+delete process.env.HERDR_ENV
+// A real terminal id in the developer's shell would make the label tests (and
+// every connect here) label that terminal with a real hc: each test that wants
+// a label sets a fake one and a recording hc instead.
+delete process.env.HC_TERMINAL_ID
 
 const tick = () => new Promise((r) => setTimeout(r, 20))
 const until = async (check: () => boolean, what: string) => {
@@ -48,6 +60,17 @@ const until = async (check: () => boolean, what: string) => {
   }
   assert.fail(`timed out waiting for ${what}`)
 }
+const untilAsync = async (check: () => Promise<boolean>, what: string) => {
+  for (let i = 0; i < 150; i++) {
+    if (await check()) return
+    await tick()
+  }
+  assert.fail(`timed out waiting for ${what}`)
+}
+// The argv lines a recording hc wrote for one terminal, so a label assertion
+// names both the pane and the labels it was given.
+const labelLines = (log: string, terminal: string) =>
+  existsSync(log) ? readFileSync(log, "utf8").split("\n").filter((line) => line.startsWith(`label ${terminal} `)) : []
 const mcpCalls = () => office.calls.filter((c) => c.path === "/mcp").map((c) => `${c.auth} ${c.body.params.name} ${JSON.stringify(c.body.params.arguments)}`)
 const taskUpdates = (id: string) => office.calls.filter((c) => c.body?.params?.name === "update_task" && c.body.params.arguments?.task_id === id).map((c) => c.body.params.arguments)
 
@@ -877,6 +900,360 @@ test("a new approval frees the earlier one's callback port", async () => {
   const back = await fetch(new URL(second.content.match(/^(http\S+\/oauth\/authorize\?\S+)$/m)![1]), { redirect: "manual" })
   await fetch(back.headers.get("location")!)
   await until(() => harness.synthetics.some((m) => m.sessionID === "q1" && /^Connected to Agent Office/.test(m.text)), "the second approval finishing")
+})
+
+test("a bridge agent gets no inbox hand-off, records the mail as handled and marks nothing read", async () => {
+  office.calls.length = 0
+  office.state.agent = { ...office.state.agent, delivery_mode: "bridge" }
+  const worker = makeContext("/bridge-session", { pollInterval: 1_000 })
+  const status = async () => JSON.parse((await worker.tools.find((tool) => tool.name === "office_status").execute({}, {})).content)
+  let cleanup: (() => Promise<void>) | undefined
+  try {
+    office.state.unreadMessages = [
+      { id: "message-old-1", from: "azri", subject: "Old one" },
+      { id: "message-old-2", from: "azri", subject: "Old two" },
+    ]
+    cleanup = await plugin.setup(worker.ctx)
+    await until(() => mcpCalls().length > 0, "the baseline poll")
+    await untilAsync(async () => (await status()).seen.messages >= 2, "the bridge poll to record the old mail")
+    office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-bridge", from: "azri", subject: "Bridge" }]
+    await untilAsync(async () => (await status()).seen.messages >= 3, "the bridge poll to record the new mail")
+    const state = await status()
+    assert.equal(state.lastDeliveryMode, "bridge")
+    assert.ok(state.seen.messages >= 1, "the bridge mail is in this poller's seen state")
+    assert.equal(worker.prompts.length, 0, "no notice and no child prompt")
+    assert.equal(worker.created.length, 0, "no inbox child session")
+    assert.ok(!office.calls.some((call) => call.body?.params?.name === "mark_read"), "nothing is marked read on the server")
+    assert.ok(warnings.some((warning) => warning.includes("delivers this agent by the bridge")), "the stand-down is logged")
+  } finally {
+    await cleanup?.()
+    office.state.agent = { slug: "opencode", name: "OpenCode" }
+    office.calls.length = 0
+  }
+})
+
+test("a bridge agent in headless mode starts no inbox child", async () => {
+  office.calls.length = 0
+  office.state.agent = { ...office.state.agent, delivery_mode: "bridge" }
+  const worker = makeContext("/bridge-headless", { pollInterval: 1_000, inbox: "headless" })
+  const status = async () => JSON.parse((await worker.tools.find((tool) => tool.name === "office_status").execute({}, {})).content)
+  let cleanup: (() => Promise<void>) | undefined
+  try {
+    office.state.unreadMessages = [
+      { id: "message-old-1", from: "azri", subject: "Old one" },
+      { id: "message-old-2", from: "azri", subject: "Old two" },
+    ]
+    cleanup = await plugin.setup(worker.ctx)
+    await until(() => mcpCalls().length > 0, "the baseline poll")
+    await untilAsync(async () => (await status()).seen.messages >= 2, "the bridge poll to record the old mail")
+    office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-bridge-headless", from: "azri", subject: "Bridge" }]
+    await untilAsync(async () => (await status()).seen.messages >= 3, "the bridge poll to record the new mail")
+    assert.equal(worker.created.length, 0, "no inbox child session")
+    assert.equal(worker.prompts.length, 0, "no prompt was queued")
+    assert.ok(!office.calls.some((call) => call.body?.params?.name === "mark_read"), "nothing is marked read on the server")
+  } finally {
+    await cleanup?.()
+    office.state.agent = { slug: "opencode", name: "OpenCode" }
+    office.calls.length = 0
+  }
+})
+
+test("flipping a bridge agent back to poll delivers the next message and not the bridge-handled one", async () => {
+  office.calls.length = 0
+  office.state.agent = { ...office.state.agent, delivery_mode: "bridge" }
+  const worker = makeContext("/bridge-flip", { pollInterval: 1_000 })
+  const status = async () => JSON.parse((await worker.tools.find((tool) => tool.name === "office_status").execute({}, {})).content)
+  let cleanup: (() => Promise<void>) | undefined
+  try {
+    office.state.unreadMessages = [
+      { id: "message-old-1", from: "azri", subject: "Old one" },
+      { id: "message-old-2", from: "azri", subject: "Old two" },
+    ]
+    cleanup = await plugin.setup(worker.ctx)
+    await until(() => mcpCalls().length > 0, "the baseline poll")
+    // The hand-off after the flip needs a session to land in.
+    worker.push({ type: "session.status", data: { sessionID: "target", status: { type: "busy" } } })
+    await untilAsync(async () => (await status()).seen.messages >= 2, "the bridge poll to record the old mail")
+    office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-bridge-flip", from: "azri", subject: "Bridge" }]
+    await untilAsync(async () => (await status()).seen.messages >= 3, "the bridge poll to record the new mail")
+    assert.equal(worker.prompts.length, 0, "the bridge handed nothing to the session")
+    office.state.agent = { ...office.state.agent, delivery_mode: "poll" }
+    office.state.unreadMessages = [...office.state.unreadMessages, { id: "message-after-bridge", from: "azri", subject: "After" }]
+    await until(() => worker.prompts.some((prompt) => prompt.text.includes("message-after-bridge")), "the notice after the flip")
+    const prompt = worker.prompts.find((item) => item.text.includes("message-after-bridge"))!
+    assert.doesNotMatch(prompt.text, /message-bridge-flip/, "mail the bridge handled is not delivered again")
+    await untilAsync(async () => (await status()).lastDeliveryMode === "poll", "the poll to read the new mode")
+  } finally {
+    await cleanup?.()
+    office.state.agent = { slug: "opencode", name: "OpenCode" }
+    office.calls.length = 0
+  }
+})
+
+for (const mode of ["poll", "webhook", "agent37"] as const) {
+  test(`delivery mode ${mode} hands new mail to the session as before`, async () => {
+    office.calls.length = 0
+    office.state.agent = { ...office.state.agent, delivery_mode: mode }
+    const worker = makeContext(`/mode-${mode}`, { pollInterval: 1_000 })
+    let cleanup: (() => Promise<void>) | undefined
+    try {
+      cleanup = await plugin.setup(worker.ctx)
+      await until(() => mcpCalls().length > 0, "the baseline poll")
+      // A target session has to exist: a hand-off is queued into the chat.
+      worker.push({ type: "session.status", data: { sessionID: "target", status: { type: "busy" } } })
+      await until(() => office.calls.some((call) => call.path === "/mcp"), "the working report")
+      office.state.unreadMessages = [
+        { id: "message-old-1", from: "azri", subject: "Old one" },
+        { id: "message-old-2", from: "azri", subject: "Old two" },
+        { id: `message-mode-${mode}`, from: "azri", subject: mode },
+      ]
+      await until(() => worker.prompts.some((prompt) => prompt.text.includes(`message-mode-${mode}`)), "the inbox notice")
+      assert.equal(worker.prompts.find((prompt) => prompt.text.includes(`message-mode-${mode}`))!.sessionID, "target")
+    } finally {
+      await cleanup?.()
+      office.state.agent = { slug: "opencode", name: "OpenCode" }
+      office.calls.length = 0
+    }
+  })
+}
+
+test("a bridge agent still dispatches an assigned todo task", async () => {
+  office.calls.length = 0
+  const repo = join(mkdtempSync(join(tmpdir(), "ao-bridge-dispatch-")), "repo")
+  mkdirSync(repo)
+  execFileSync("git", ["-C", repo, "init", "-q"])
+  execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
+  execFileSync("git", ["-C", repo, "remote", "add", "origin", "git@github.com:az-iar/ao-opencode.git"])
+  const hc = recordingHc()
+  process.env.AGENT_OFFICE_HC_BIN = hc.bin
+  office.state.agent = { ...office.state.agent, delivery_mode: "bridge" }
+  const id = "task-bridge-dispatch"
+  let cleanup: (() => Promise<void>) | undefined
+  try {
+    const worker = makeContext(repo, { pollInterval: 1_000 })
+    cleanup = await plugin.setup(worker.ctx)
+    await until(() => mcpCalls().length > 0, "the baseline poll")
+    worker.push({ type: "session.status", data: { sessionID: "parent", status: { type: "busy" } } })
+    await until(() => office.calls.some((call) => call.path === "/mcp"), "the working report")
+    office.state.openTasks = [...office.state.openTasks, { id, title: "Fix it", status: "todo", repo: "az-iar/ao-opencode" }]
+    await until(() => existsSync(hc.log) && /^run /m.test(readFileSync(hc.log, "utf8")), "the hc launch")
+    assert.ok(readFileSync(hc.log, "utf8").includes(`--label ao.task=${id}`))
+    assert.equal(worker.prompts.length, 0, "no mail hand-off")
+  } finally {
+    await cleanup?.()
+    office.state.openTasks = office.state.openTasks.filter((task) => task.id !== id)
+    office.state.agent = { slug: "opencode", name: "OpenCode" }
+    delete process.env.AGENT_OFFICE_HC_BIN
+    office.calls.length = 0
+  }
+})
+
+test("labels this terminal as the agent's session in every delivery mode, and again when the slug changes", async () => {
+  const hc = recordingHc()
+  process.env.AGENT_OFFICE_HC_BIN = hc.bin
+  let cleanup: (() => Promise<void>) | undefined
+  try {
+    for (const [index, mode] of ([undefined, "poll", "webhook", "agent37", "bridge"] as const).entries()) {
+      const terminal = `t-label-mode-${index}`
+      process.env.HC_TERMINAL_ID = terminal
+      office.state.agent = { slug: "opencode", name: "OpenCode", delivery_mode: mode }
+      cleanup = await plugin.setup(makeContext(`/label-mode-${index}`, { pollInterval: 1_000 }).ctx)
+      await until(() => labelLines(hc.log, terminal).includes(`label ${terminal} ao.agent=opencode ao.role=session`), `the label for ${mode ?? "a missing mode"}`)
+      await cleanup()
+      cleanup = undefined
+    }
+    process.env.HC_TERMINAL_ID = "t-label-rename"
+    office.state.agent = { slug: "opencode", name: "OpenCode", delivery_mode: undefined }
+    cleanup = await plugin.setup(makeContext("/label-rename", { pollInterval: 1_000 }).ctx)
+    await until(() => labelLines(hc.log, "t-label-rename").length === 1, "the first label")
+    office.state.agent = { ...office.state.agent, slug: "renamed" }
+    await until(() => labelLines(hc.log, "t-label-rename").includes("label t-label-rename ao.agent=renamed ao.role=session"), "the label for the new slug")
+  } finally {
+    await cleanup?.()
+    delete process.env.HC_TERMINAL_ID
+    delete process.env.AGENT_OFFICE_HC_BIN
+    office.state.agent = { slug: "opencode", name: "OpenCode" }
+  }
+})
+
+test("a child session never labels its pane as the agent's session", async () => {
+  const hc = recordingHc()
+  process.env.AGENT_OFFICE_HC_BIN = hc.bin
+  process.env.HC_TERMINAL_ID = "t-label-child"
+  process.env.AGENT_OFFICE_CHILD = "1"
+  let cleanup: (() => Promise<void>) | undefined
+  try {
+    cleanup = await plugin.setup(makeContext("/label-child", { pollInterval: 1_000 }).ctx)
+    const before = mcpCalls().length
+    await until(() => mcpCalls().length >= before + 2, "two polls")
+    assert.deepEqual(labelLines(hc.log, "t-label-child"), [])
+  } finally {
+    await cleanup?.()
+    delete process.env.AGENT_OFFICE_CHILD
+    delete process.env.HC_TERMINAL_ID
+    delete process.env.AGENT_OFFICE_HC_BIN
+  }
+})
+
+test("a failing hc logs the failed label and polling carries on", async () => {
+  const bin = join(mkdtempSync(join(tmpdir(), "ao-hc-fail-")), "hc")
+  writeFileSync(bin, "#!/bin/sh\nexit 1\n", { mode: 0o755 })
+  process.env.AGENT_OFFICE_HC_BIN = bin
+  process.env.HC_TERMINAL_ID = "t-label-fail"
+  const worker = makeContext("/label-fail", { pollInterval: 1_000 })
+  const status = async () => JSON.parse((await worker.tools.find((tool) => tool.name === "office_status").execute({}, {})).content)
+  let cleanup: (() => Promise<void>) | undefined
+  try {
+    cleanup = await plugin.setup(worker.ctx)
+    await until(
+      () => warnings.some((warning) => warning.includes("could not label this terminal as an Office session") && warning.includes("t-label-fail")),
+      "the label failure warning",
+    )
+    await untilAsync(async () => Boolean((await status()).lastPollAt), "polling to carry on")
+  } finally {
+    await cleanup?.()
+    delete process.env.HC_TERMINAL_ID
+    delete process.env.AGENT_OFFICE_HC_BIN
+  }
+})
+
+test("a label that fails twice and then succeeds is retried, with one warning", async () => {
+  const root = mkdtempSync(join(tmpdir(), "ao-hc-retry-"))
+  const bin = join(root, "hc")
+  const log = join(root, "calls.log")
+  const count = join(root, "count")
+  writeFileSync(
+    bin,
+    `#!/bin/sh\nn=0\n[ -f '${count}' ] && n=$(cat '${count}')\nn=$((n+1))\necho "$n" > '${count}'\nif [ "$n" -le 2 ]; then echo 'temporary hc failure' >&2; exit 1; fi\nprintf '%s\\n' "$*" >> '${log}'\nexit 0\n`,
+    { mode: 0o755 },
+  )
+  process.env.AGENT_OFFICE_HC_BIN = bin
+  process.env.HC_TERMINAL_ID = "t-label-retry"
+  let cleanup: (() => Promise<void>) | undefined
+  try {
+    cleanup = await plugin.setup(makeContext("/label-retry", { pollInterval: 1_000 }).ctx)
+    await until(() => labelLines(log, "t-label-retry").includes("label t-label-retry ao.agent=opencode ao.role=session"), "the label after the retries")
+    const said = warnings.filter((warning) => warning.includes("could not label this terminal") && warning.includes("t-label-retry"))
+    assert.equal(said.length, 1, "one run of identical failures is warned once")
+  } finally {
+    await cleanup?.()
+    delete process.env.HC_TERMINAL_ID
+    delete process.env.AGENT_OFFICE_HC_BIN
+  }
+})
+
+test("a label failure whose error text changes is warned again", async () => {
+  const root = mkdtempSync(join(tmpdir(), "ao-hc-retry-changed-"))
+  const bin = join(root, "hc")
+  const log = join(root, "calls.log")
+  const count = join(root, "count")
+  writeFileSync(
+    bin,
+    `#!/bin/sh\nn=0\n[ -f '${count}' ] && n=$(cat '${count}')\nn=$((n+1))\necho "$n" > '${count}'\nif [ "$n" -le 2 ]; then echo "temporary hc failure $n" >&2; exit 1; fi\nprintf '%s\\n' "$*" >> '${log}'\nexit 0\n`,
+    { mode: 0o755 },
+  )
+  process.env.AGENT_OFFICE_HC_BIN = bin
+  process.env.HC_TERMINAL_ID = "t-label-retry-changed"
+  let cleanup: (() => Promise<void>) | undefined
+  try {
+    cleanup = await plugin.setup(makeContext("/label-retry-changed", { pollInterval: 1_000 }).ctx)
+    await until(() => labelLines(log, "t-label-retry-changed").includes("label t-label-retry-changed ao.agent=opencode ao.role=session"), "the label after the retries")
+    const said = warnings.filter((warning) => warning.includes("could not label this terminal") && warning.includes("t-label-retry-changed"))
+    assert.equal(said.length, 2, "a changed error is said again")
+  } finally {
+    await cleanup?.()
+    delete process.env.HC_TERMINAL_ID
+    delete process.env.AGENT_OFFICE_HC_BIN
+  }
+})
+
+test("a missing hc is skipped silently", async () => {
+  process.env.AGENT_OFFICE_HC_BIN = join(mkdtempSync(join(tmpdir(), "ao-hc-missing-")), "no-hc")
+  process.env.HC_TERMINAL_ID = "t-label-missing"
+  let cleanup: (() => Promise<void>) | undefined
+  try {
+    cleanup = await plugin.setup(makeContext("/label-missing", { pollInterval: 1_000 }).ctx)
+    const before = mcpCalls().length
+    await until(() => mcpCalls().length >= before + 2, "two polls")
+    assert.ok(!warnings.some((warning) => warning.includes("t-label-missing")), "no line about the missing hc")
+  } finally {
+    await cleanup?.()
+    delete process.env.HC_TERMINAL_ID
+    delete process.env.AGENT_OFFICE_HC_BIN
+  }
+})
+
+test("a scratch task worker never labels itself, on the poll route or through /office", async () => {
+  const hc = recordingHc()
+  process.env.AGENT_OFFICE_HC_BIN = hc.bin
+  process.env.HC_TERMINAL_ID = "t-label-scratch"
+  const id = "task-scratch-label"
+  const scratch = join(dir, ".config", "agent-office", "opencode", "scratch", createHash("sha256").update(id).digest("hex").slice(0, 8))
+  mkdirSync(scratch, { recursive: true })
+  const worker = makeContext(scratch, { pollInterval: 1_000 })
+  let cleanup: (() => Promise<void>) | undefined
+  try {
+    cleanup = await plugin.setup(worker.ctx)
+    const before = mcpCalls().length
+    await until(() => mcpCalls().length >= before + 2, "two polls of the scratch worker")
+    await worker.tools.find((tool: any) => tool.name === "office_connect").execute({}, { sessionID: "scratch-worker", progress: async () => {} })
+    for (let i = 0; i < 5; i++) await tick()
+    assert.deepEqual(labelLines(hc.log, "t-label-scratch"), [])
+  } finally {
+    await cleanup?.()
+    delete process.env.HC_TERMINAL_ID
+    delete process.env.AGENT_OFFICE_HC_BIN
+  }
+})
+
+test("a task-worktree worker never labels itself through /office", async () => {
+  const hc = recordingHc()
+  process.env.AGENT_OFFICE_HC_BIN = hc.bin
+  process.env.HC_TERMINAL_ID = "t-label-worktree"
+  const root = mkdtempSync(join(tmpdir(), "ao-label-wt-"))
+  const repo = checkout(root, "repo", "git@github.com:az-iar/ao-opencode.git")
+  const path = join(root, "worker")
+  execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "office/deadbeef", path])
+  const lib = await import("../lib/office.ts")
+  lib.saveAgentPointer(lib.agentPointerPath(path), "opencode", "dispatch")
+  const worker = makeContext(path, { pollInterval: 1_000 })
+  let cleanup: (() => Promise<void>) | undefined
+  try {
+    cleanup = await plugin.setup(worker.ctx)
+    const connected = await worker.tools.find((tool: any) => tool.name === "office_connect").execute({}, { sessionID: "task-worker", progress: async () => {} })
+    assert.match(String(connected.content), /^Connected to Agent Office as @opencode/)
+    for (let i = 0; i < 5; i++) await tick()
+    assert.deepEqual(labelLines(hc.log, "t-label-worktree"), [])
+  } finally {
+    await cleanup?.()
+    delete process.env.HC_TERMINAL_ID
+    delete process.env.AGENT_OFFICE_HC_BIN
+  }
+})
+
+test("a person's session in a worktree marked office still labels", async () => {
+  const hc = recordingHc()
+  process.env.AGENT_OFFICE_HC_BIN = hc.bin
+  process.env.HC_TERMINAL_ID = "t-label-office-worktree"
+  const root = mkdtempSync(join(tmpdir(), "ao-label-office-"))
+  const repo = checkout(root, "repo", "git@github.com:az-iar/ao-opencode.git")
+  const path = join(root, "session")
+  execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "topic", path])
+  const lib = await import("../lib/office.ts")
+  lib.saveAgentPointer(lib.agentPointerPath(path), "opencode", "office")
+  const worker = makeContext(path, { pollInterval: 1_000 })
+  let cleanup: (() => Promise<void>) | undefined
+  try {
+    cleanup = await plugin.setup(worker.ctx)
+    await until(
+      () => labelLines(hc.log, "t-label-office-worktree").includes("label t-label-office-worktree ao.agent=opencode ao.role=session"),
+      "the label on a marked worktree",
+    )
+  } finally {
+    await cleanup?.()
+    delete process.env.HC_TERMINAL_ID
+    delete process.env.AGENT_OFFICE_HC_BIN
+  }
 })
 
 test("logs failures without the token", async () => {
