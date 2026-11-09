@@ -70,6 +70,7 @@ import {
   OFFICE,
   officeData,
   inHerdrWorktree,
+  inScratchRoot,
   onTaskBranch,
   REFRESH_EARLY_MS,
   releaseDispatch,
@@ -599,6 +600,20 @@ export default Plugin.define({
       if (deliveredByBridge(mode)) warn("Office delivers this agent by the bridge: this poller stands down until the mode changes")
       else if (deliveredByBridge(was ?? "")) warn("Office no longer delivers this agent by the bridge: this poller is delivering again")
     }
+    // True only for a person's session, the one pane a bridge wake may be
+    // typed into. A worker this plugin dispatched also runs the plugin - in a
+    // task worktree on an office/ branch, in a scratch directory with no
+    // repository, or with a pointer its dispatcher marked "dispatch" - and
+    // must never carry ao.role=session: Office picks the newest session pane,
+    // so a mislabelled worker would take the agent's wakes. The same checks
+    // the poll gate uses, so the two agree, plus the scratch root a poll gate
+    // has no reason to name.
+    const isSessionProcess = () =>
+      process.env.AGENT_OFFICE_CHILD !== "1" &&
+      agentPointerVia(pointerFile) !== "dispatch" &&
+      !onTaskBranch(ctx.location.directory) &&
+      !inHerdrWorktree(ctx.location.directory) &&
+      !inScratchRoot(ctx.location.directory)
     // This process's pane, as hc names it. Office refuses a flip to bridge while
     // the agent has no live session pane, so the label must exist before the
     // flip, in every delivery mode. Only a person's session may claim the role:
@@ -606,15 +621,22 @@ export default Plugin.define({
     // agent's wakes. A terminal id or hc that is not there costs the label, and
     // the failure is logged, never thrown into connecting or polling.
     //
-    // The slug is remembered only for a final outcome - labelled, no terminal
-    // id, or no hc - so a live session cannot stay unlabelled for its whole
-    // life after one transient failure: a failed attempt is retried on the next
-    // poll. The warning is said once per run of identical failures, and again
-    // when the error text changes (or after a success, which starts a new run).
+    // The slug is remembered only for a final outcome - labelled, refused as a
+    // worker, no terminal id, or no hc - so a live session cannot stay
+    // unlabelled for its whole life after one transient failure: a failed
+    // attempt is retried on the next poll. The warning is said once per run of
+    // identical failures, and again when the error text changes (or after a
+    // success, which starts a new run).
     let labelledSlug: string | undefined
     let labelLastError: string | undefined
     const labelSession = (slug: string | undefined) => {
       if (!slug || process.env.AGENT_OFFICE_CHILD === "1" || labelledSlug === slug) return
+      // A worker settles here: its directory, pointer and branch do not change
+      // into a person's session, so no later route labels it either.
+      if (!isSessionProcess()) {
+        labelledSlug = slug
+        return
+      }
       const terminal = process.env.HC_TERMINAL_ID
       if (!terminal) {
         labelledSlug = slug

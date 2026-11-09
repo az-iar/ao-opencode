@@ -10,6 +10,11 @@ import { fakeOffice } from "./fake-office.mts"
 
 const office = fakeOffice()
 const dir = mkdtempSync(join(tmpdir(), "ao-opencode-"))
+// Credentials, pointers, session records and the scratch root live under
+// $HOME, so this suite gets a home of its own. It has to be set before
+// index.ts loads (the before hook imports it): the credential paths and the
+// scratch root are module constants.
+process.env.HOME = dir
 const credentials = join(dir, "opencode.json")
 process.env.AGENT_OFFICE_OPENCODE_CREDENTIALS = credentials
 // The plugin reads its preferred callback port once, at import, so the base has
@@ -39,6 +44,9 @@ process.env.AGENT_OFFICE_OPEN_BROWSER = "off"
 // Task worktrees go under a temp AO_HOME, never the real ~/.ao.
 process.env.AO_HOME = join(dir, "ao-home")
 delete process.env.AGENT_OFFICE_TOKEN
+// Inside Herdr a linked worktree does not poll; the label tests here need a
+// person's marked worktree to poll, so the ambient flag goes.
+delete process.env.HERDR_ENV
 // A real terminal id in the developer's shell would make the label tests (and
 // every connect here) label that terminal with a real hc: each test that wants
 // a label sets a fake one and a recording hc instead.
@@ -1168,6 +1176,79 @@ test("a missing hc is skipped silently", async () => {
     const before = mcpCalls().length
     await until(() => mcpCalls().length >= before + 2, "two polls")
     assert.ok(!warnings.some((warning) => warning.includes("t-label-missing")), "no line about the missing hc")
+  } finally {
+    await cleanup?.()
+    delete process.env.HC_TERMINAL_ID
+    delete process.env.AGENT_OFFICE_HC_BIN
+  }
+})
+
+test("a scratch task worker never labels itself, on the poll route or through /office", async () => {
+  const hc = recordingHc()
+  process.env.AGENT_OFFICE_HC_BIN = hc.bin
+  process.env.HC_TERMINAL_ID = "t-label-scratch"
+  const id = "task-scratch-label"
+  const scratch = join(dir, ".config", "agent-office", "opencode", "scratch", createHash("sha256").update(id).digest("hex").slice(0, 8))
+  mkdirSync(scratch, { recursive: true })
+  const worker = makeContext(scratch, { pollInterval: 1_000 })
+  let cleanup: (() => Promise<void>) | undefined
+  try {
+    cleanup = await plugin.setup(worker.ctx)
+    const before = mcpCalls().length
+    await until(() => mcpCalls().length >= before + 2, "two polls of the scratch worker")
+    await worker.tools.find((tool: any) => tool.name === "office_connect").execute({}, { sessionID: "scratch-worker", progress: async () => {} })
+    for (let i = 0; i < 5; i++) await tick()
+    assert.deepEqual(labelLines(hc.log, "t-label-scratch"), [])
+  } finally {
+    await cleanup?.()
+    delete process.env.HC_TERMINAL_ID
+    delete process.env.AGENT_OFFICE_HC_BIN
+  }
+})
+
+test("a task-worktree worker never labels itself through /office", async () => {
+  const hc = recordingHc()
+  process.env.AGENT_OFFICE_HC_BIN = hc.bin
+  process.env.HC_TERMINAL_ID = "t-label-worktree"
+  const root = mkdtempSync(join(tmpdir(), "ao-label-wt-"))
+  const repo = checkout(root, "repo", "git@github.com:az-iar/ao-opencode.git")
+  const path = join(root, "worker")
+  execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "office/deadbeef", path])
+  const lib = await import("../lib/office.ts")
+  lib.saveAgentPointer(lib.agentPointerPath(path), "opencode", "dispatch")
+  const worker = makeContext(path, { pollInterval: 1_000 })
+  let cleanup: (() => Promise<void>) | undefined
+  try {
+    cleanup = await plugin.setup(worker.ctx)
+    const connected = await worker.tools.find((tool: any) => tool.name === "office_connect").execute({}, { sessionID: "task-worker", progress: async () => {} })
+    assert.match(String(connected.content), /^Connected to Agent Office as @opencode/)
+    for (let i = 0; i < 5; i++) await tick()
+    assert.deepEqual(labelLines(hc.log, "t-label-worktree"), [])
+  } finally {
+    await cleanup?.()
+    delete process.env.HC_TERMINAL_ID
+    delete process.env.AGENT_OFFICE_HC_BIN
+  }
+})
+
+test("a person's session in a worktree marked office still labels", async () => {
+  const hc = recordingHc()
+  process.env.AGENT_OFFICE_HC_BIN = hc.bin
+  process.env.HC_TERMINAL_ID = "t-label-office-worktree"
+  const root = mkdtempSync(join(tmpdir(), "ao-label-office-"))
+  const repo = checkout(root, "repo", "git@github.com:az-iar/ao-opencode.git")
+  const path = join(root, "session")
+  execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "topic", path])
+  const lib = await import("../lib/office.ts")
+  lib.saveAgentPointer(lib.agentPointerPath(path), "opencode", "office")
+  const worker = makeContext(path, { pollInterval: 1_000 })
+  let cleanup: (() => Promise<void>) | undefined
+  try {
+    cleanup = await plugin.setup(worker.ctx)
+    await until(
+      () => labelLines(hc.log, "t-label-office-worktree").includes("label t-label-office-worktree ao.agent=opencode ao.role=session"),
+      "the label on a marked worktree",
+    )
   } finally {
     await cleanup?.()
     delete process.env.HC_TERMINAL_ID

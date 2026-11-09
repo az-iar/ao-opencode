@@ -995,7 +995,16 @@ export function dispatchTarget(taskRepo: string, resolved?: RepoChoice): Dispatc
 // scratchTaskDir is where a repo-less task's worker runs: the agent's own state,
 // never under a project checkout.
 export function scratchTaskDir(id: string): string {
-  return join(CREDENTIALS_DIR, "scratch", taskShort(id))
+  return join(SCRATCH_ROOT, taskShort(id))
+}
+
+// Every repo-less task worker runs under this root. Nothing here is a person's
+// session: it is a worker this plugin dispatched, whatever its pointer says.
+export const SCRATCH_ROOT = join(CREDENTIALS_DIR, "scratch")
+export function inScratchRoot(directory: string) {
+  const root = resolve(SCRATCH_ROOT)
+  const path = resolve(directory)
+  return path === root || path.startsWith(root + sep)
 }
 
 // scratchPrompt is the worker prompt for a repo-less task: no worktree, no branch
