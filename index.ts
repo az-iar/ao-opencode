@@ -605,30 +605,43 @@ export default Plugin.define({
     // an inbox child or a headless run labelled as a session would take the
     // agent's wakes. A terminal id or hc that is not there costs the label, and
     // the failure is logged, never thrown into connecting or polling.
+    //
+    // The slug is remembered only for a final outcome - labelled, no terminal
+    // id, or no hc - so a live session cannot stay unlabelled for its whole
+    // life after one transient failure: a failed attempt is retried on the next
+    // poll. The warning is said once per run of identical failures, and again
+    // when the error text changes (or after a success, which starts a new run).
     let labelledSlug: string | undefined
-    let labelFailureWarned: string | undefined
+    let labelLastError: string | undefined
     const labelSession = (slug: string | undefined) => {
       if (!slug || process.env.AGENT_OFFICE_CHILD === "1" || labelledSlug === slug) return
       const terminal = process.env.HC_TERMINAL_ID
-      if (!terminal) return
-      void run(hcBin(), ["label", terminal, ...sessionLabels(slug)], 10_000).then(
+      if (!terminal) {
+        labelledSlug = slug
+        return
+      }
+      const failed = (error: string, extra: Record<string, unknown>) => {
+        if (labelLastError === error) return
+        labelLastError = error
+        warn("could not label this terminal as an Office session", extra)
+      }
+      void run(hcBin(), ["label", terminal, ...sessionLabels(slug)], 5_000).then(
         (got) => {
           if (got.code === 0) {
             labelledSlug = slug
+            labelLastError = undefined
             return
           }
-          // Retried on the next poll, but said once per slug.
-          if (labelFailureWarned === slug) return
-          labelFailureWarned = slug
-          warn("could not label this terminal as an Office session", { terminal, slug, exit: got.code, error: got.stderr.trim().slice(0, 200) })
+          failed((got.stderr.trim() || `hc label exited ${got.code}`).slice(0, 200), { terminal, slug, exit: got.code })
         },
         (err) => {
-          // No hc on this machine is not a failure worth a line: the label is
-          // presence only, and this plugin never labelled a terminal before.
-          if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return
-          if (labelFailureWarned === slug) return
-          labelFailureWarned = slug
-          warn("could not run hc to label this terminal as an Office session", { terminal, slug, error: String(err) })
+          // No hc on this machine is final, not a failure worth a line: the
+          // label is presence only, and this plugin never labelled before.
+          if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+            labelledSlug = slug
+            return
+          }
+          failed(String(err).slice(0, 200), { terminal, slug })
         },
       )
     }
