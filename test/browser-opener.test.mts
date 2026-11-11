@@ -1,10 +1,10 @@
 import assert from "node:assert/strict"
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
-import { test } from "node:test"
+import { after, test } from "node:test"
 
 import { browserOpeningAllowed, openBrowser } from "../index.ts"
+import { removeTempRoot, tempDir } from "./suite.mts"
 
 // az-iar/ao-pi#10/#13: the approval flow shells out to xdg-open, so a suite run
 // launched a real browser - hundreds of stray processes on the host, and the
@@ -21,7 +21,7 @@ import { browserOpeningAllowed, openBrowser } from "../index.ts"
 
 // A PATH entry whose xdg-open records that it ran, instead of opening anything.
 function fakeOpener(): { dir: string; marker: string } {
-  const dir = mkdtempSync(join(tmpdir(), "ao-opener-bin-"))
+  const dir = tempDir("ao-opener-bin-")
   const marker = join(dir, "launched")
   writeFileSync(join(dir, "xdg-open"), `#!/bin/sh\necho "$1" >> ${marker}\n`)
   chmodSync(join(dir, "xdg-open"), 0o755)
@@ -40,6 +40,19 @@ async function withOpener<T>(opener: { dir: string }, fn: () => Promise<T>): Pro
 
 // The opener spawns detached, so give it a moment to write its marker.
 const settle = () => new Promise((resolve) => setTimeout(resolve, 300))
+
+after(removeTempRoot)
+
+// The suite switches the opener off for the whole test process (test/suite.mts),
+// so a case that sets nothing - as every test file here does not - still cannot
+// launch a browser. The cases below then exercise the switch itself.
+test("an env this test never touches launches nothing", async () => {
+  const opener = fakeOpener()
+  assert.equal(process.env.AGENT_OFFICE_OPEN_BROWSER, "off", "the suite did not switch the opener off")
+  await withOpener(opener, async () => openBrowser("https://office.example/approve?x=0"))
+  await settle()
+  assert.equal(existsSync(opener.marker), false, "a real opener was attempted with the suite's own switch")
+})
 
 test("a switched-off opener launches nothing, even when xdg-open is on PATH", async () => {
   const opener = fakeOpener()
@@ -80,5 +93,6 @@ test("the switch understands the spellings a runner might use", () => {
     process.env.AGENT_OFFICE_OPEN_BROWSER = on
     assert.equal(browserOpeningAllowed(), true, `${JSON.stringify(on)} should leave it enabled`)
   }
-  delete process.env.AGENT_OFFICE_OPEN_BROWSER
+  // Back to the suite's switch, not deleted: a later case in this file relies on it.
+  process.env.AGENT_OFFICE_OPEN_BROWSER = "off"
 })

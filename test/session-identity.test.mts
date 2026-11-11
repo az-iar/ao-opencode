@@ -11,11 +11,11 @@
 // failing there (the child instance checks in from the folder pointer).
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { after, test } from "node:test"
 import { fakeOffice } from "./fake-office.mts"
+import { removeTempRoot, tempDir } from "./suite.mts"
 
 const office = fakeOffice()
 const tick = () => new Promise((r) => setTimeout(r, 20))
@@ -29,7 +29,7 @@ const until = async (check: () => boolean, what: string) => {
 
 // Credentials and pointers live under $HOME, so this suite gets a home of its
 // own; $HOME must be set before lib/office.ts loads.
-const home = mkdtempSync(join(tmpdir(), "ao-session-identity-"))
+const home = tempDir("ao-session-identity-")
 process.env.HOME = home
 process.env.AO_HOME = join(home, "ao-home")
 process.env.AGENT_OFFICE_CALLBACK_PORT = "45521"
@@ -40,10 +40,6 @@ delete process.env.AGENT_OFFICE_CHILD
 delete process.env.AGENT_OFFICE_CHILD_NAME
 // A real terminal id in the developer's shell must not make a test label it.
 delete process.env.HC_TERMINAL_ID
-// Never open a real browser from a test: the approval in the first case reaches
-// the opener, and a real browser's own request for the approval URL lands in
-// the next case's Office call log (az-iar/ao-pi#10, #13).
-process.env.AGENT_OFFICE_OPEN_BROWSER = "off"
 // Inside Herdr a linked worktree does not poll (only the main checkout does),
 // so the worktree case below needs the ambient flag gone.
 delete process.env.HERDR_ENV
@@ -119,7 +115,7 @@ const drained = async () => {
 }
 
 function repo() {
-  const path = join(mkdtempSync(join(tmpdir(), "ao-session-identity-repo-")), "repo")
+  const path = join(tempDir("ao-session-identity-repo-"), "repo")
   mkdirSync(path)
   execFileSync("git", ["init", "-q", path])
   execFileSync("git", ["-C", path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
@@ -250,6 +246,7 @@ function makeContext(directory: string, options: Record<string, unknown> = {}, s
 
 after(async () => {
   await office.close()
+  removeTempRoot()
 })
 
 test("a session that approves here owns an identity: it registers and posts, and the approval is recorded against its id", async () => {

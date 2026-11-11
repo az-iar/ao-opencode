@@ -2,6 +2,8 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import { identityHeaders, normaliseChildName } from "../index.ts"
+// The suite's own env: the browser opener stays off in this process too.
+import "./suite.mts"
 
 // The rules #512 answers 400 to, tested as rules: a launcher's name is normalised
 // before it reaches the office, because a name outside [a-z0-9._-], with leading
