@@ -7,7 +7,9 @@
 // mkdtemp goes under it; `removeTempRoot` runs in each file's `after` hook, so a
 // test that fails still cleans up, and again on process exit, so a run killed
 // mid-file or a hook that never got its turn does not leave the root behind.
-// test/tmp-guard.mts counts what a whole run leaves in /tmp.
+// test/tmp-guard.mts runs the suite in a temp directory of its own as TMPDIR
+// and asserts that directory is empty afterwards, so the whole namespace is
+// accounted for, not just this root.
 //
 // The opener switch is here because a suite run once launched a real browser
 // (az-iar/ao-pi#10, #13): hundreds of stray processes, and the browser's own
@@ -18,9 +20,10 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-// test/tmp-guard.mts runs the suite as a child with a prefix of its own, so the
-// entries it counts are only the ones that run made.
-export const TEMP_PREFIX = process.env.AO_OPENCODE_TEST_TMP_PREFIX ?? "ao-opencode-test-"
+// The suite's names in a temp directory, so a leftover says whose it is. The
+// guard isolates each measured run in a directory of its own; the name is for a
+// person reading that directory, not for deciding what to delete.
+const TEMP_PREFIX = "ao-opencode-test-"
 
 process.env.AGENT_OFFICE_OPEN_BROWSER = "off"
 

@@ -49,8 +49,10 @@ jobs:
       - name: test
         run: npm test
       - name: temp dirs
-        # The guard for the /tmp rule: it runs the suite once more as a child and
-        # counts top-level /tmp entries before and after. It cannot be one of the
+        # The guard for the /tmp rule: it runs the suite once more as a child with
+        # a temp directory of its own as TMPDIR, TMP and TEMP, and fails if that
+        # directory is not empty afterwards - so none of the run's own temp
+        # entries, whatever they are named, can leak. It cannot be one of the
         # files in the run above (it is test/tmp-guard.mts, outside the
         # *.test.mts glob), or two copies of the suite would bind the same fixed
         # callback ports at once.

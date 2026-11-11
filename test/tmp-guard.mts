@@ -1,17 +1,21 @@
-// The guard for the temp-dir rule: one run of the suite leaves no new top-level
-// /tmp entry of its own behind, and a run that fails still removes what it made.
+// The guard for the temp-dir rule: a run of the suite leaves its temp directory
+// as it found it, and a run that fails still removes what it made.
 //
 // Not named `*.test.mts` on purpose. It runs the suite itself, so the suite's
 // glob must not pick it up: two copies of the fixed callback ports some files
 // use (45321, 45521) would then be bound by the same run. CI runs it as its own
 // step after `npm test`; run it here as `npm run test:tmp`.
 //
-// It gives the child run a temp prefix of its own and counts /tmp entries
-// carrying that prefix before and after, so the assertion is about the entries
-// that run made - never about a directory another run (or a person) left there.
+// Each measured run gets a fresh, empty directory of its own as TMPDIR, TMP and
+// TEMP, and the assertion after it is that the directory is still empty. The
+// private namespace is what makes the count mean something: the shared temp
+// directory holds other runs' entries (and a person's), so counting it races
+// them, and matching a name prefix misses a leak that names itself something
+// else. Here `os.tmpdir()` resolves inside this directory for the run and every
+// process it starts, so anything left in it was left by that run.
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
-import { existsSync, readdirSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { test } from "node:test"
@@ -27,15 +31,41 @@ const suiteFiles = readdirSync(testDir)
   .sort()
   .map((file) => join(testDir, file))
 
-// The top-level entries of /tmp whose name starts with this run's prefix.
-const owned = (prefix: string) => readdirSync(tmpdir()).filter((name) => name.startsWith(prefix)).sort()
+// The guard's own directory in the system temp directory, removed when this
+// process ends. Only this exact path is ever removed - never an entry matched by
+// a name pattern in the shared directory, which could be another run's.
+const root = mkdtempSync(join(tmpdir(), `ao-opencode-guard-${process.pid}-`))
+process.once("exit", () => rmSync(root, { recursive: true, force: true }))
 
-const child = (args: string[], prefix: string) => {
-  const env: NodeJS.ProcessEnv = { ...process.env, AO_OPENCODE_TEST_TMP_PREFIX: prefix }
+let measured = 0
+
+// A fresh temp directory for one measured run, empty so that what is in it
+// afterwards belongs to that run alone.
+const runDir = (): string => {
+  const dir = join(root, `run-${++measured}`)
+  mkdirSync(dir)
+  return dir
+}
+
+const left = (dir: string) => readdirSync(dir).sort()
+
+const child = (args: string[], dir: string) => {
+  // A run's whole temp namespace is `dir`: the suite's own root (test/suite.mts)
+  // and every fixture, socket and git worktree it makes resolve there.
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    TMPDIR: dir,
+    TMP: dir,
+    TEMP: dir,
+    // The compile cache would put a directory of its own here, which is not the
+    // suite's entry to account for.
+    NODE_DISABLE_COMPILE_CACHE: "1",
+  }
   // The runner hands a test file's process NODE_TEST_CONTEXT; a nested
   // `node --test` that inherits it treats itself as inside a run and skips every
   // file it is given.
   delete env.NODE_TEST_CONTEXT
+  delete env.NODE_COMPILE_CACHE
   return spawnSync(process.execPath, [...nodeArgs, ...args], {
     cwd: repo,
     encoding: "utf8",
@@ -49,38 +79,37 @@ const child = (args: string[], prefix: string) => {
 const report = (run: ReturnType<typeof child>) =>
   `${run.error ? `error: ${run.error.message}\n` : ""}exit ${run.status}\n${run.stdout ?? ""}\n${run.stderr ?? ""}`
 
-test("a whole run leaves no new top-level /tmp entry it created", () => {
-  const prefix = `ao-opencode-test-guard-${process.pid}-`
+test("a whole run leaves its temp directory empty", () => {
   assert.ok(suiteFiles.length > 0, "no test files found to run")
-  const before = owned(prefix)
-  const run = child(["--test", ...suiteFiles], prefix)
-  const after = owned(prefix)
+  const dir = runDir()
+  assert.deepEqual(left(dir), [], "the measured run starts with an empty temp directory")
+  const run = child(["--test", ...suiteFiles], dir)
   // The child's verdict belongs to `npm test`; what this guard needs is that the
   // files really ran - a nested runner that inherits NODE_TEST_CONTEXT reports
   // success over zero tests - and left nothing behind. Both reporters count
   // tests: TAP says `# tests N`, the spec reporter `ℹ tests N`.
   assert.match(run.stdout ?? "", /(?:ℹ tests|# tests) [1-9]\d*/, `the child ran no tests:\n${report(run)}`)
-  assert.deepEqual(after, before, `the run left ${after.filter((name) => !before.includes(name)).join(", ")} in /tmp (child exit ${run.status})`)
+  assert.deepEqual(left(dir), [], `the run left ${left(dir).join(", ")} in its temp directory (child exit ${run.status})`)
 })
 
 test("a run that fails still removes the temp dirs it made", () => {
-  const prefix = `ao-opencode-test-guard-fail-${process.pid}-`
-  const before = owned(prefix)
-  const run = child(["--test", join(testDir, "fixtures", "failing.test.mts")], prefix)
-  const after = owned(prefix)
+  const dir = runDir()
+  const run = child(["--test", join(testDir, "fixtures", "failing.test.mts")], dir)
   assert.equal(run.status, 1, `the fixture was meant to fail:\n${report(run)}`)
   assert.match(run.stdout ?? "", /still leaves its temp dir to the after hook/, "the fixture failed for another reason")
-  assert.deepEqual(after, before, `the failed run left ${after.filter((name) => !before.includes(name)).join(", ")} in /tmp`)
+  assert.deepEqual(left(dir), [], `the failed run left ${left(dir).join(", ")} in its temp directory`)
 })
 
-test("the prefix the guard counts is the one the child uses, and exit alone removes the dir", () => {
+test("a child that exits without a hook leaves the temp directory empty", () => {
   // A process that makes a temp dir and ends without a hook: this is the sweep
   // the rule relies on when a file is killed before its after hook runs.
-  const prefix = `ao-opencode-test-guard-exit-${process.pid}-`
-  const run = child([join(testDir, "fixtures", "print-temp.mts")], prefix)
+  const dir = runDir()
+  const run = child([join(testDir, "fixtures", "print-temp.mts")], dir)
   assert.equal(run.status, 0, report(run))
   const path = (run.stdout ?? "").trim()
-  assert.ok(path.startsWith(join(tmpdir(), prefix)), `the child used ${path}, not the guard's prefix`)
+  // The path proves the run resolved `os.tmpdir()` inside this directory; an
+  // empty count alone would also pass a child that wrote somewhere else.
+  assert.ok(path.startsWith(dir), `the child used ${path}, not ${dir}`)
   assert.equal(existsSync(path), false, "the exit sweep left the child's temp dir behind")
-  assert.deepEqual(owned(prefix), [], "the child's temp dir is still in /tmp")
+  assert.deepEqual(left(dir), [], `the child's temp dir is still in its temp directory`)
 })
