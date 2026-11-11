@@ -1,14 +1,16 @@
 import assert from "node:assert/strict"
-import { mkdtempSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { writeFileSync } from "node:fs"
 import { join } from "node:path"
-import { test } from "node:test"
+import { after, test } from "node:test"
 import { acquireDispatch, holdDispatch } from "../lib/office.ts"
+import { removeTempRoot, tempDir } from "./suite.mts"
+
+after(removeTempRoot)
 
 // A fake hc whose terminal is already finished: hc get answers state finished
 // whatever the name, so a held lock is stale as soon as its worker is gone.
 function finishedHc() {
-  const dir = mkdtempSync(join(tmpdir(), "ao-hc-"))
+  const dir = tempDir("ao-hc-")
   const bin = join(dir, "hc")
   writeFileSync(bin, "#!/bin/sh\necho '{\"state\":\"finished\"}'\nexit 0\n", { mode: 0o755 })
   return bin
@@ -17,7 +19,7 @@ function finishedHc() {
 test("a finished terminal frees the slot even though the holding pid is alive", () => {
   process.env.AGENT_OFFICE_HC_BIN = finishedHc()
   try {
-    const dir = mkdtempSync(join(tmpdir(), "ao-locks-"))
+    const dir = tempDir("ao-locks-")
     assert.equal(acquireDispatch(dir, "task-a"), "ok")
     // The lock names the hc terminal; the pid would be this long-lived test
     // process, and must not keep the slot alive.
@@ -29,7 +31,7 @@ test("a finished terminal frees the slot even though the holding pid is alive", 
 })
 
 test("a working terminal keeps the slot, and a launch with no terminal yet keeps its pid slot", () => {
-  const dir = mkdtempSync(join(tmpdir(), "ao-locks-"))
+  const dir = tempDir("ao-locks-")
   const working = join(dir, "hc")
   writeFileSync(working, "#!/bin/sh\necho '{\"state\":\"live\",\"status\":{\"state\":\"working\"}}'\nexit 0\n", { mode: 0o755 })
   process.env.AGENT_OFFICE_HC_BIN = working
@@ -45,7 +47,7 @@ test("a working terminal keeps the slot, and a launch with no terminal yet keeps
 })
 
 test("a just-held lock that reads idle stays busy; a finished one is free", () => {
-  const dir = mkdtempSync(join(tmpdir(), "ao-locks-"))
+  const dir = tempDir("ao-locks-")
   const idle = join(dir, "hc-idle")
   writeFileSync(idle, "#!/bin/sh\necho '{\"state\":\"live\",\"status\":{\"state\":\"idle\"}}'\nexit 0\n", { mode: 0o755 })
   process.env.AGENT_OFFICE_HC_BIN = idle
@@ -62,7 +64,7 @@ test("a just-held lock that reads idle stays busy; a finished one is free", () =
   const finishedBin = finishedHc()
   process.env.AGENT_OFFICE_HC_BIN = finishedBin
   try {
-    const other = mkdtempSync(join(tmpdir(), "ao-locks-"))
+    const other = tempDir("ao-locks-")
     assert.equal(acquireDispatch(other, "task-a"), "ok")
     holdDispatch(other, "task-a", { terminal: "office-a" })
     assert.equal(acquireDispatch(other, "task-b"), "ok", "a finished young terminal is free")

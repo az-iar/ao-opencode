@@ -3,17 +3,19 @@
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
+import { mkdirSync, writeFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { join, resolve } from "node:path"
-import { test } from "node:test"
+import { after, test } from "node:test"
 import { addWorktree, aoHome, dispatchRefusal, hcTaskTerminals, hcTaskWorkers, taskLabel, taskWorktreePath } from "../lib/office.ts"
+import { removeTempRoot, tempDir } from "./suite.mts"
 
-process.env.AO_HOME = mkdtempSync(join(tmpdir(), "ao-home-"))
+process.env.AO_HOME = tempDir("ao-home-")
+after(removeTempRoot)
 const short = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 8)
 
 function repo() {
-  const path = join(mkdtempSync(join(tmpdir(), "ao-dispatch-")), "my-repo")
+  const path = join(tempDir("ao-dispatch-"), "my-repo")
   execFileSync("git", ["init", "-q", path])
   execFileSync("git", ["-C", path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
   return path
@@ -22,7 +24,7 @@ function repo() {
 // A fake hc: `ls` prints `out` and exits `code`, `get` prints `get` (one
 // answer for every terminal) and exits `getCode`.
 function fakeHc(out: string, code = 0, get = '{"state":"live","status":{"state":"working"}}', getCode = 0) {
-  const bin = join(mkdtempSync(join(tmpdir(), "ao-hc-")), "hc")
+  const bin = join(tempDir("ao-hc-"), "hc")
   writeFileSync(bin, `#!/bin/sh\ncase "$1" in\n  ls) printf '%s' '${out}'; exit ${code} ;;\n  get) printf '%s' '${get}'; exit ${getCode} ;;\nesac\nexit 0\n`, { mode: 0o755 })
   return bin
 }

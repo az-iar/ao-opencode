@@ -14,7 +14,8 @@
   "license": "MIT",
   "scripts": {
     "typecheck": "tsc -p .",
-    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test test/*.test.mts"
+    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test test/*.test.mts",
+    "test:tmp": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test test/tmp-guard.mts"
   },
   "dependencies": {
     "@opencode/plugin": "^2.0.32"

@@ -5,6 +5,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { needsCheckin } from "../lib/office.ts";
+// The suite's own env: the browser opener stays off in this process too.
+import "./suite.mts";
 
 test("no agent and no override means check in", () => {
   assert.equal(needsCheckin(false, undefined), true, "a dispatch with no identity must fetch one");

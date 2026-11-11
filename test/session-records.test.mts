@@ -2,14 +2,15 @@
 // runtime recorded, so two agents' sessions on one machine resolve their own
 // identity and three plugins agree on who a session is.
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
+import { removeTempRoot, tempDir } from "./suite.mts";
 
 // A HOME of its own: the records are host-wide now, so an unrestored real HOME
 // would make this file depend on what another test wrote there (#560).
-process.env.HOME = mkdtempSync(join(tmpdir(), "ao-sessions-"));
+process.env.HOME = tempDir("ao-sessions-");
+after(removeTempRoot);
 const { legacySessionPointerPath, saveSessionAgent, sessionAgentOf, sessionPointerPath } = await import("../lib/office.ts");
 
 test("the session record is host-wide and names the runtime", () => {

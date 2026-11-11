@@ -3,12 +3,14 @@
 // match is refused rather than guessed: the same rule ao-pi carries (ao-pi#17-#19).
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync } from "node:fs";
 import { basename, join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 
 import { chooseRepo, dedupeCandidates, dispatchTarget, repoFromRemote, resolveDispatchRepo, siblingCheckouts } from "../lib/office.ts";
+import { removeTempRoot, tempDir } from "./suite.mts";
+
+after(removeTempRoot);
 
 test("repoFromRemote reads owner/name out of a remote and normalises it", () => {
   assert.equal(repoFromRemote("https://github.com/az-iar/agent-office.git"), "az-iar/agent-office");
@@ -95,7 +97,7 @@ test("an origin-less checkout does not absorb a task whose checkout is elsewhere
 });
 
 test("siblingCheckouts finds the session's checkout and the ones beside it, and counts a worktree once", () => {
-  const root = mkdtempSync(join(tmpdir(), "ao-siblings-"));
+  const root = tempDir("ao-siblings-");
   const session = join(root, "ao-opencode");
   mkdirSync(session);
   const git = (path: string, ...args: string[]) => execFileSync("git", ["-C", path, ...args], { encoding: "utf8" });

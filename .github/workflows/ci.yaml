@@ -27,8 +27,8 @@ jobs:
     # touch is a loopback fake office (test/fake-office.mts).
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Every test file already sets this for itself. At job level it is the
-    # backstop for the file that forgets the line: a hosted image ships real
+    # Every test file gets this from test/suite.mts. At job level it is the
+    # backstop for the file that forgets that import: a hosted image ships real
     # browsers, and a stray one polls the approval URL and shows up in another
     # test's Office call log, which is agent-office#531's concern.
     env:
@@ -48,3 +48,10 @@ jobs:
         run: npm run typecheck
       - name: test
         run: npm test
+      - name: temp dirs
+        # The guard for the /tmp rule: it runs the suite once more as a child and
+        # counts top-level /tmp entries before and after. It cannot be one of the
+        # files in the run above (it is test/tmp-guard.mts, outside the
+        # *.test.mts glob), or two copies of the suite would bind the same fixed
+        # callback ports at once.
+        run: npm run test:tmp

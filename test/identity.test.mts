@@ -4,18 +4,14 @@
 // `/office` run there, or a task worktree its dispatcher adopted, connects it.
 import assert from "node:assert/strict"
 import { execFileSync, spawn } from "node:child_process"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { after, test } from "node:test"
 import { fileURLToPath } from "node:url"
 import { fakeOffice } from "./fake-office.mts"
+import { removeTempRoot, tempDir } from "./suite.mts"
 
 const pollScript = fileURLToPath(new URL("../poll.ts", import.meta.url))
-// Never open a real browser from a test: `/office` here reaches the approval
-// flow, whose opener would launch one and then pollute another test's Office
-// call log (az-iar/ao-pi#10, #13).
-process.env.AGENT_OFFICE_OPEN_BROWSER = "off"
 
 const office = fakeOffice()
 const tick = () => new Promise((r) => setTimeout(r, 20))
@@ -29,7 +25,7 @@ const until = async (check: () => boolean, what: string) => {
 
 // Credentials, agent pointers and dispatch state live under $HOME, so this
 // suite gets a home of its own; $HOME must be set before lib/office.ts loads.
-const home = mkdtempSync(join(tmpdir(), "ao-identity-"))
+const home = tempDir("ao-identity-")
 process.env.HOME = home
 process.env.AO_HOME = join(home, "ao-home")
 process.env.AGENT_OFFICE_CALLBACK_PORT = "45321"
@@ -64,7 +60,7 @@ const { default: plugin } = await import("../index.ts")
 const mcpCalls = () => office.calls.filter((c) => c.path === "/mcp").map((c) => `${c.body?.params?.name} ${JSON.stringify(c.body?.params?.arguments)}`)
 
 function repo() {
-  const path = join(mkdtempSync(join(tmpdir(), "ao-identity-")), "repo")
+  const path = join(tempDir("ao-identity-"), "repo")
   mkdirSync(path)
   execFileSync("git", ["init", "-q", path])
   execFileSync("git", ["-C", path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
@@ -196,6 +192,7 @@ const status = async (harness: ReturnType<typeof makeContext>) => JSON.parse((aw
 
 after(async () => {
   await office.close()
+  removeTempRoot()
 })
 
 test("a linked worktree nobody connected resolves no credentials of the checkout's", () => {
@@ -230,9 +227,9 @@ test("a linked worktree nobody connected resolves no credentials of the checkout
 test("worktreeTop answers once per directory, the negative answers included", () => {
   const r = repo()
   const wt = worktree(r)
-  const plain = join(mkdtempSync(join(tmpdir(), "ao-identity-plain-")), "notes")
+  const plain = join(tempDir("ao-identity-plain-"), "notes")
   mkdirSync(plain)
-  const trace = join(mkdtempSync(join(tmpdir(), "ao-identity-trace-")), "git.log")
+  const trace = join(tempDir("ao-identity-trace-"), "git.log")
   const spawned = () => (existsSync(trace) ? readFileSync(trace, "utf8").split("\n").filter((line) => line.includes("rev-parse")).length : 0)
   const cold = () => writeFileSync(trace, "")
   process.env.GIT_TRACE = trace
@@ -406,7 +403,7 @@ test("a dispatched task worktree resolves as the agent that dispatched it", asyn
   connect(r, "agent-a", "access-a")
   office.state.agent = { slug: "agent-a", name: "Agent A" }
   office.calls.length = 0
-  const bin = join(mkdtempSync(join(tmpdir(), "ao-identity-hc-")), "hc")
+  const bin = join(tempDir("ao-identity-hc-"), "hc")
   const log = `${bin}.log`
   writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n[ "$1" = ls ] && echo '{"terminals":[]}'\nexit 0\n`, { mode: 0o755 })
   process.env.AGENT_OFFICE_HC_BIN = bin
@@ -445,7 +442,7 @@ test("an explicit AGENT_OFFICE_TOKEN connects an unconnected worktree and adopts
   saveCredentials(credentialsPath(r, r, "", "repo"), credentials("legacy", "access-repo"))
   office.state.agent = { slug: "agent-token", name: "Token Agent" }
   process.env.AGENT_OFFICE_TOKEN = "branch-token"
-  const bin = join(mkdtempSync(join(tmpdir(), "ao-identity-hc-")), "hc")
+  const bin = join(tempDir("ao-identity-hc-"), "hc")
   const log = `${bin}.log`
   writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n[ "$1" = ls ] && echo '{"terminals":[]}'\nexit 0\n`, { mode: 0o755 })
   process.env.AGENT_OFFICE_HC_BIN = bin
@@ -586,7 +583,7 @@ test("the main checkout, its subdirectories and plain directories are unchanged"
   const wt = worktree(r)
   connect(r, "agent-a", "access-a")
   mkdirSync(join(r, "src"))
-  const plain = join(mkdtempSync(join(tmpdir(), "ao-identity-plain-")), "notes")
+  const plain = join(tempDir("ao-identity-plain-"), "notes")
   mkdirSync(plain)
   saveCredentials(credentialsPath(plain), credentials("plain", "access-plain"))
   office.state.agent = { slug: "agent-a", name: "Agent A" }
@@ -643,7 +640,7 @@ test("the cron poller in an unconnected worktree polls nothing and says why", as
   const wt = worktree(r)
   connect(r, "agent-a", "access-a")
   office.state.agent = { slug: "agent-a", name: "Agent A" }
-  const bin = join(mkdtempSync(join(tmpdir(), "ao-identity-opencode-")), "opencode")
+  const bin = join(tempDir("ao-identity-opencode-"), "opencode")
   writeFileSync(bin, "#!/bin/sh\nexit 0\n", { mode: 0o755 })
   office.calls.length = 0
   const polled = await poll(wt, bin)

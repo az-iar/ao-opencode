@@ -5,6 +5,8 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import { dispatchTarget, scratchTaskDir } from "../lib/office.ts";
+// The suite's own env: the browser opener stays off in this process too.
+import "./suite.mts";
 
 test("a repo-less task gets a scratch directory, never the session's repo", () => {
   assert.deepEqual(dispatchTarget(""), { kind: "scratch" });

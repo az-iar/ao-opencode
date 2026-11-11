@@ -1,15 +1,15 @@
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { createServer } from "node:http"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { after, before, test } from "node:test"
 import { fakeOffice } from "./fake-office.mts"
+import { removeTempRoot, tempDir } from "./suite.mts"
 
 const office = fakeOffice()
-const dir = mkdtempSync(join(tmpdir(), "ao-opencode-"))
+const dir = tempDir("ao-opencode-")
 // Credentials, pointers, session records and the scratch root live under
 // $HOME, so this suite gets a home of its own. It has to be set before
 // index.ts loads (the before hook imports it): the credential paths and the
@@ -37,10 +37,6 @@ while (held.port > 65535 - 20) {
 const blockedCallback = held.server
 const blockedPort = held.port
 process.env.AGENT_OFFICE_CALLBACK_PORT = String(blockedPort)
-// Never open a real browser from a test: the opener is the one boundary that
-// reaches outside this process, and the browser's own request for the approval
-// URL lands in another test's Office call log (az-iar/ao-pi#10, #13).
-process.env.AGENT_OFFICE_OPEN_BROWSER = "off"
 // Task worktrees go under a temp AO_HOME, never the real ~/.ao.
 process.env.AO_HOME = join(dir, "ao-home")
 delete process.env.AGENT_OFFICE_TOKEN
@@ -212,6 +208,7 @@ after(async () => {
   console.warn = originalWarn
   office.close()
   await new Promise<void>((resolve) => blockedCallback.close(() => resolve()))
+  removeTempRoot()
 })
 
 test("defines the agent-office plugin", () => {
@@ -503,14 +500,14 @@ test("two windows on one event stream track and wake only their own sessions", a
 
 test("dispatches a new assigned todo task to one hc worker in its worktree", async () => {
   office.calls.length = 0
-  const repo = join(mkdtempSync(join(tmpdir(), "ao-dispatch-")), "repo")
+  const repo = join(tempDir("ao-dispatch-"), "repo")
   mkdirSync(repo)
   execFileSync("git", ["-C", repo, "init", "-q"])
   execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
   // A named repo is resolved by origin, so the session's checkout needs one.
   execFileSync("git", ["-C", repo, "remote", "add", "origin", "git@github.com:az-iar/ao-opencode.git"])
   // A fake hc records the argv it is given; the plugin never starts a real one.
-  const bin = join(mkdtempSync(join(tmpdir(), "ao-hc-")), "hc")
+  const bin = join(tempDir("ao-hc-"), "hc")
   const log = `${bin}.log`
   writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n[ "$1" = ls ] && echo '{"terminals":[]}'\nexit 0\n`, { mode: 0o755 })
   process.env.AGENT_OFFICE_HC_BIN = bin
@@ -558,7 +555,7 @@ function checkout(root: string, name: string, remote?: string) {
 // lock behind would otherwise fill the two-task cap for every later test in this
 // file. The lock is freed by the next acquire, not by this test.
 function recordingHc() {
-  const bin = join(mkdtempSync(join(tmpdir(), "ao-hc-")), "hc")
+  const bin = join(tempDir("ao-hc-"), "hc")
   const log = `${bin}.log`
   writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n[ "$1" = ls ] && echo '{"terminals":[]}'\n[ "$1" = get ] && echo '{"state":"finished"}'\nexit 0\n`, { mode: 0o755 })
   return { bin, log }
@@ -568,7 +565,7 @@ test("a task naming another local checkout is dispatched in that checkout's work
   // agent-office#558: on main this is refused, and that is the bug - the other
   // checkout is right there, and the task names it.
   office.calls.length = 0
-  const root = mkdtempSync(join(tmpdir(), "ao-other-"))
+  const root = tempDir("ao-other-")
   const session = checkout(root, "ao-opencode", "git@github.com:az-iar/ao-opencode.git")
   const other = checkout(root, "agent-office", "https://github.com/az-iar/agent-office.git")
   const hc = recordingHc()
@@ -607,7 +604,7 @@ test("a task naming another local checkout is dispatched in that checkout's work
 
 test("a task naming a repo with no local checkout is refused, naming the repo", async () => {
   office.calls.length = 0
-  const root = mkdtempSync(join(tmpdir(), "ao-none-"))
+  const root = tempDir("ao-none-")
   const session = checkout(root, "ao-opencode", "git@github.com:az-iar/ao-opencode.git")
   const hc = recordingHc()
   process.env.AGENT_OFFICE_HC_BIN = hc.bin
@@ -637,7 +634,7 @@ test("a task naming a repo with no local checkout is refused, naming the repo", 
 
 test("a task naming a repo with two local checkouts is refused, naming both", async () => {
   office.calls.length = 0
-  const root = mkdtempSync(join(tmpdir(), "ao-two-"))
+  const root = tempDir("ao-two-")
   const session = checkout(root, "ao-opencode", "git@github.com:az-iar/ao-opencode.git")
   checkout(root, "agent-office-a", "git@github.com:az-iar/agent-office.git")
   checkout(root, "agent-office-b", "https://github.com/az-iar/agent-office.git")
@@ -675,7 +672,7 @@ test("a task naming a repo with two local checkouts is refused, naming both", as
 // after it are the part that is new.
 test("a task naming a repo an origin-less checkout cannot match is dispatched here anyway", async () => {
   office.calls.length = 0
-  const root = mkdtempSync(join(tmpdir(), "ao-noorigin-"))
+  const root = tempDir("ao-noorigin-")
   const session = checkout(root, "repo")
   const hc = recordingHc()
   process.env.AGENT_OFFICE_HC_BIN = hc.bin
@@ -710,7 +707,7 @@ test("a task naming a repo an origin-less checkout cannot match is dispatched he
 
 test("a sibling that matches still wins over an origin-less checkout", async () => {
   office.calls.length = 0
-  const root = mkdtempSync(join(tmpdir(), "ao-noorigin-sibling-"))
+  const root = tempDir("ao-noorigin-sibling-")
   const session = checkout(root, "repo")
   const other = checkout(root, "agent-office", "git@github.com:az-iar/agent-office.git")
   const hc = recordingHc()
@@ -751,11 +748,11 @@ for (const [name, detail, ls] of [
 ] as const) {
   test(`an assigned task that is ${name} is not claimed or launched`, async () => {
     office.calls.length = 0
-    const repo = join(mkdtempSync(join(tmpdir(), "ao-skip-")), "repo")
+    const repo = join(tempDir("ao-skip-"), "repo")
     mkdirSync(repo)
     execFileSync("git", ["-C", repo, "init", "-q"])
     execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
-    const bin = join(mkdtempSync(join(tmpdir(), "ao-hc-")), "hc")
+    const bin = join(tempDir("ao-hc-"), "hc")
     const log = `${bin}.log`
     writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n[ "$1" = ls ] && echo '${ls}'\n[ "$1" = get ] && echo '{"state":"live","status":{"state":"working"},"created_ms":1}'\nexit 0\n`, { mode: 0o755 })
     process.env.AGENT_OFFICE_HC_BIN = bin
@@ -783,13 +780,13 @@ for (const [name, detail, ls] of [
 
 test("a labelled terminal whose agent is done does not block a retry", async () => {
   office.calls.length = 0
-  const repo = join(mkdtempSync(join(tmpdir(), "ao-done-")), "repo")
+  const repo = join(tempDir("ao-done-"), "repo")
   mkdirSync(repo)
   execFileSync("git", ["-C", repo, "init", "-q"])
   execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
   execFileSync("git", ["-C", repo, "remote", "add", "origin", "git@github.com:az-iar/ao-opencode.git"])
   // hc still lists the old worker as live, but its agent finished an hour ago.
-  const bin = join(mkdtempSync(join(tmpdir(), "ao-hc-")), "hc")
+  const bin = join(tempDir("ao-hc-"), "hc")
   const log = `${bin}.log`
   const created = Date.now() - 60 * 60_000
   writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n[ "$1" = ls ] && echo '{"terminals":[{"address":"t8","state":"live"}]}'\n[ "$1" = get ] && echo '{"state":"live","status":{"state":"done"},"created_ms":${created}}'\nexit 0\n`, { mode: 0o755 })
@@ -812,11 +809,11 @@ test("a labelled terminal whose agent is done does not block a retry", async () 
 
 test("a third task dispatches after two held workers finish", async () => {
   office.calls.length = 0
-  const repo = join(mkdtempSync(join(tmpdir(), "ao-cap-")), "repo")
+  const repo = join(tempDir("ao-cap-"), "repo")
   mkdirSync(repo)
   execFileSync("git", ["-C", repo, "init", "-q"])
   execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
-  const bin = join(mkdtempSync(join(tmpdir(), "ao-hc-")), "hc")
+  const bin = join(tempDir("ao-hc-"), "hc")
   const log = `${bin}.log`
   // run logs a launch; get says the terminals are already finished, so each
   // held slot frees as soon as it is looked at.
@@ -1019,7 +1016,7 @@ for (const mode of ["poll", "webhook", "agent37"] as const) {
 
 test("a bridge agent still dispatches an assigned todo task", async () => {
   office.calls.length = 0
-  const repo = join(mkdtempSync(join(tmpdir(), "ao-bridge-dispatch-")), "repo")
+  const repo = join(tempDir("ao-bridge-dispatch-"), "repo")
   mkdirSync(repo)
   execFileSync("git", ["-C", repo, "init", "-q"])
   execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])
@@ -1096,7 +1093,7 @@ test("a child session never labels its pane as the agent's session", async () =>
 })
 
 test("a failing hc logs the failed label and polling carries on", async () => {
-  const bin = join(mkdtempSync(join(tmpdir(), "ao-hc-fail-")), "hc")
+  const bin = join(tempDir("ao-hc-fail-"), "hc")
   writeFileSync(bin, "#!/bin/sh\nexit 1\n", { mode: 0o755 })
   process.env.AGENT_OFFICE_HC_BIN = bin
   process.env.HC_TERMINAL_ID = "t-label-fail"
@@ -1118,7 +1115,7 @@ test("a failing hc logs the failed label and polling carries on", async () => {
 })
 
 test("a label that fails twice and then succeeds is retried, with one warning", async () => {
-  const root = mkdtempSync(join(tmpdir(), "ao-hc-retry-"))
+  const root = tempDir("ao-hc-retry-")
   const bin = join(root, "hc")
   const log = join(root, "calls.log")
   const count = join(root, "count")
@@ -1143,7 +1140,7 @@ test("a label that fails twice and then succeeds is retried, with one warning", 
 })
 
 test("a label failure whose error text changes is warned again", async () => {
-  const root = mkdtempSync(join(tmpdir(), "ao-hc-retry-changed-"))
+  const root = tempDir("ao-hc-retry-changed-")
   const bin = join(root, "hc")
   const log = join(root, "calls.log")
   const count = join(root, "count")
@@ -1168,7 +1165,7 @@ test("a label failure whose error text changes is warned again", async () => {
 })
 
 test("a missing hc is skipped silently", async () => {
-  process.env.AGENT_OFFICE_HC_BIN = join(mkdtempSync(join(tmpdir(), "ao-hc-missing-")), "no-hc")
+  process.env.AGENT_OFFICE_HC_BIN = join(tempDir("ao-hc-missing-"), "no-hc")
   process.env.HC_TERMINAL_ID = "t-label-missing"
   let cleanup: (() => Promise<void>) | undefined
   try {
@@ -1210,7 +1207,7 @@ test("a task-worktree worker never labels itself through /office", async () => {
   const hc = recordingHc()
   process.env.AGENT_OFFICE_HC_BIN = hc.bin
   process.env.HC_TERMINAL_ID = "t-label-worktree"
-  const root = mkdtempSync(join(tmpdir(), "ao-label-wt-"))
+  const root = tempDir("ao-label-wt-")
   const repo = checkout(root, "repo", "git@github.com:az-iar/ao-opencode.git")
   const path = join(root, "worker")
   execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "office/deadbeef", path])
@@ -1235,7 +1232,7 @@ test("a person's session in a worktree marked office still labels", async () => 
   const hc = recordingHc()
   process.env.AGENT_OFFICE_HC_BIN = hc.bin
   process.env.HC_TERMINAL_ID = "t-label-office-worktree"
-  const root = mkdtempSync(join(tmpdir(), "ao-label-office-"))
+  const root = tempDir("ao-label-office-")
   const repo = checkout(root, "repo", "git@github.com:az-iar/ao-opencode.git")
   const path = join(root, "session")
   execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "topic", path])

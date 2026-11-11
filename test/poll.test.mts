@@ -1,12 +1,12 @@
 import assert from "node:assert/strict"
 import { execFileSync, spawn } from "node:child_process"
 import { createHash } from "node:crypto"
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join, dirname } from "node:path"
 import { after, before, test } from "node:test"
 import { fileURLToPath } from "node:url"
 import { fakeOffice } from "./fake-office.mts"
+import { removeTempRoot, tempDir } from "./suite.mts"
 
 const office = fakeOffice()
 const pollScript = fileURLToPath(new URL("../poll.ts", import.meta.url))
@@ -15,12 +15,15 @@ let url = ""
 before(async () => {
   url = await office.listen()
 })
-after(() => office.close())
+after(() => {
+  office.close()
+  removeTempRoot()
+})
 
 // A git workspace with its own credentials, claim and state directories, and
 // an `opencode` stub that records each run's cwd and argv as JSON.
 function workspace() {
-  const root = mkdtempSync(join(tmpdir(), "ao-poll-"))
+  const root = tempDir("ao-poll-")
   const dir = join(root, "repo")
   const runs = join(root, "runs")
   mkdirSync(dir)
